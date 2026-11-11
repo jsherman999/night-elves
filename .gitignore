@@ -1,0 +1,12 @@
+__pycache__/
+*.egg-info/
+build/
+dist/
+.venv/
+config.toml
+env
+*.db
+*.db-wal
+*.db-shm
+results/
+*.lock

@@ -1,0 +1,114 @@
+"""The nightly run: drain the queue through plan -> execute -> review."""
+from __future__ import annotations
+import time
+from datetime import datetime
+from pathlib import Path
+from . import db, policy
+from .backends import BackendError
+
+PLAN_SYS = ("You are planning work that a smaller model will carry out. Do not do the task. "
+            "Write a short numbered plan, the pitfalls to avoid, and how to tell the result is right.")
+EXEC_SYS = "Complete the task fully and return only the finished result."
+REVIEW_SYS = ("You are reviewing another model's work against the task. The first line of your "
+              "reply must be exactly PASS or FAIL. Then give brief reasons, and for FAIL the fixes needed.")
+DOWN_AFTER = 3  # consecutive errors before a backend is skipped for the rest of the run
+
+def passed(review: str) -> bool:
+    first = next((ln.strip().upper() for ln in review.splitlines() if ln.strip()), "")
+    return not first.startswith("FAIL")
+
+class Night:
+    def __init__(self, cfg, conn, backends, now_fn=None, log=print):
+        self.cfg, self.conn, self.backends, self.log = cfg, conn, backends, log
+        self.now = now_fn or (lambda: datetime.now().astimezone())
+        self.run_start = db.iso(self.now())
+        self.errors: dict[str, int] = {}
+        self.down: set[str] = set()
+        self.stats = {"done": 0, "failed": 0, "retried": 0, "skipped": 0}
+
+    def state(self):
+        return policy.snapshot(self.cfg, self.conn, self.now(), self.run_start)
+
+    def ok(self, name):
+        return name in self.backends and policy.available(
+            name, self.cfg, self.conn, self.state(), self.run_start, self.now(), self.down)
+
+    def call(self, name, task_id, role, prompt, system):
+        try:
+            res = self.backends[name].run(prompt, system)
+        except BackendError:
+            self.errors[name] = self.errors.get(name, 0) + 1
+            if self.errors[name] >= DOWN_AFTER:
+                self.down.add(name)
+                self.log(f"  {name} marked down for this run")
+            raise
+        self.errors[name] = 0
+        db.record_spend(self.conn, name, task_id, role, res.tokens_in, res.tokens_out, res.usd,
+                        ts=db.iso(self.now()))
+        if not res.text.strip():
+            raise BackendError(f"{name}: empty response")
+        return res.text
+
+    def process(self, task) -> str:
+        """Returns the task's new status, or 'skipped' if nothing can take it tonight."""
+        tid, lim = task["id"], self.cfg["limits"]
+        r = policy.route(task, self.cfg, self.state(), self.ok)
+        if r is None:
+            return "skipped"
+        self.log(f"#{tid} plan={r.planner} exec={r.executor} review={r.reviewer}")
+        try:
+            prompt = f"Task:\n{task['prompt']}"
+            if r.planner:
+                db.update(self.conn, tid, status="planning")
+                plan = self.call(r.planner, tid, "plan", prompt, PLAN_SYS)
+                prompt += f"\n\nPlan to follow:\n{plan}"
+            if task["feedback"]:
+                prompt += f"\n\nA previous attempt was rejected. Reviewer feedback:\n{task['feedback']}"
+            db.update(self.conn, tid, status="running", backend=r.executor)
+            answer = self.call(r.executor, tid, "execute", prompt, EXEC_SYS)
+            review = ""
+            if r.reviewer and self.ok(r.reviewer):
+                db.update(self.conn, tid, status="review")
+                review = self.call(r.reviewer, tid, "review",
+                                   f"Task:\n{task['prompt']}\n\nResult:\n{answer}", REVIEW_SYS)
+                if not passed(review):
+                    return self._retry(task, feedback=review, error="rejected by reviewer")
+        except BackendError as e:
+            return self._retry(task, error=str(e))
+        out = Path(self.cfg["paths"]["results"])
+        out.mkdir(parents=True, exist_ok=True)
+        path = out / f"{tid}.md"
+        path.write_text(f"# Task {tid}\n\n{task['prompt']}\n\n## Result ({r.executor})\n\n{answer}\n"
+                        + (f"\n## Review ({r.reviewer})\n\n{review}\n" if review else ""))
+        db.update(self.conn, tid, status="done", result_path=str(path), last_error=None)
+        return "done"
+
+    def _retry(self, task, error, feedback=None) -> str:
+        attempts = task["attempts"] + 1
+        status = "failed" if attempts >= self.cfg["limits"]["max_attempts"] else "queued"
+        fields = {"status": status, "attempts": attempts, "last_error": error[:1000]}
+        if feedback:
+            fields["feedback"] = feedback[:4000]
+        db.update(self.conn, task["id"], **fields)
+        self.log(f"  #{task['id']} -> {status}: {error[:120]}")
+        return "failed" if status == "failed" else "retried"
+
+    def run(self, max_tasks=None) -> dict:
+        stale = db.requeue_stale(self.conn)
+        if stale:
+            self.log(f"requeued {stale} task(s) left over from an interrupted run")
+        deadline = time.monotonic() + self.cfg["limits"]["max_minutes"] * 60
+        skipped: list[int] = []
+        handled = 0
+        while time.monotonic() < deadline and (max_tasks is None or handled < max_tasks):
+            task = db.next_task(self.conn, skipped)
+            if task is None:
+                break
+            outcome = self.process(task)
+            if outcome == "skipped":
+                skipped.append(task["id"])
+            else:
+                handled += 1
+            self.stats[outcome] += 1
+        self.stats["run_start"] = self.run_start
+        return self.stats

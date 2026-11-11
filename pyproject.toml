@@ -1,0 +1,17 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "night-elves"
+version = "0.1.0"
+description = "Queue tasks by day; local and frontier models work them overnight."
+readme = "README.md"
+requires-python = ">=3.11"
+dependencies = []
+
+[project.scripts]
+elf = "elves.cli:main"
+
+[tool.setuptools]
+packages = ["elves"]

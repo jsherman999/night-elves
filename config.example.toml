@@ -1,0 +1,68 @@
+# Copy to ~/.night-elves/config.toml (or ./config.toml) and edit.
+
+[paths]
+db = "~/.night-elves/queue.db"
+results = "~/.night-elves/results"
+
+[budget]
+monthly_credit_usd = 100.0   # Claude Max 5x API credit; expires at the end of each cycle
+cycle_day = 1                # day of month your plan renews (1-28)
+start_fraction = 0.5         # stay local-only until this share of the cycle has passed
+endgame_days = 7             # in the last N days the frontier model also executes hard tasks
+burst = 1.5                  # tonight's allowance = remaining / days_left * burst
+per_night_cap_usd = 15.0     # hard ceiling per run
+conserve_night_cap_usd = 2.0 # early-cycle ceiling (frontier-tier tasks and escalations only)
+
+[limits]
+max_attempts = 3             # then the task is marked failed
+escalate_after = 2           # failed local attempts before the frontier model takes over
+max_minutes = 360            # stop starting new tasks after this long
+hard_priority = 3            # priority <= this counts as "hard" in endgame mode
+
+[backends.local]
+type = "openai_compat"
+base_url = "http://localhost:11434/v1"   # Ollama; LM Studio is usually :1234/v1
+model = "your-local-model"
+max_tokens = 8192
+timeout = 3600
+
+[backends.claude_api]
+type = "anthropic_api"
+model = "claude-opus-5-5"
+api_key_env = "ANTHROPIC_API_KEY"        # key from the Console org linked to your plan
+max_tokens = 8192
+# USD per million tokens. PLACEHOLDERS: set these from the current pricing page,
+# or the pacing maths will be wrong.
+price_in = 5.0
+price_out = 25.0
+
+[backends.claude_cli]                     # Claude Code headless, on your subscription limits
+type = "command"
+argv = ["claude", "-p", "{prompt}"]
+window = [1, 5]                           # local hours it may run: 01:00 up to 05:00
+max_runs_per_night = 5
+timeout = 1800
+
+[backends.codex]                          # ChatGPT plan via Codex CLI, as a second-opinion reviewer
+type = "command"
+enabled = false
+argv = ["codex", "exec", "{prompt}"]
+window = [1, 5]
+max_runs_per_night = 3
+
+[roles]
+local = "local"
+frontier_api = "claude_api"
+frontier_sub = "claude_cli"
+second_opinion = "codex"
+
+[web]
+host = "127.0.0.1"           # keep on loopback; publish through Tailscale or a tunnel
+port = 8377
+token_env = "ELVES_TOKEN"
+sms_allow = []               # e.g. ["+16125550123"]
+
+[notify]
+# Command that receives the morning digest. "{text}" is replaced with the digest;
+# without it the digest is sent on stdin. Empty = just write the digest file.
+argv = []
