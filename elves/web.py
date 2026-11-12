@@ -44,10 +44,10 @@ COOKIE = "elves"
 TASK_PATH = re.compile(r"^/(t|tasks)/(\d+)$")
 FILE_PATH = re.compile(r"^/(t|tasks)/(\d+)/f/(\d+)$")
 
-def read_multipart(rfile, length: int, boundary: str, new_file) -> dict:
+def read_multipart(rfile, length: int, boundary: str, new_file, parts: list | None = None) -> dict:
     """Stream a multipart/form-data body. File parts are written straight to the paths
     new_file(filename) returns, so a big upload never sits in memory; other fields come back
-    as strings."""
+    as strings. With `parts`, a short description of each part is appended to it for the log."""
     if not boundary:
         raise ValueError("multipart body without a boundary")
     delim = b"--" + boundary.encode("latin-1")
@@ -95,6 +95,9 @@ def read_multipart(rfile, length: int, boundary: str, new_file) -> dict:
                     raise ValueError("the upload ended early")
             out.write(buf[:j])
             buf = buf[j + len(sep):]
+            if parts is not None:
+                parts.append(f"{name}({'file ' + repr(filename) if filename is not None else 'field'}"
+                             f" {head.get_content_type()} {out.tell()}B)")
             if not is_file and name:
                 fields[name] = out.getvalue().decode(errors="replace")
 HTML = "text/html; charset=utf-8"
@@ -207,12 +210,13 @@ def make_handler(cfg: dict, token: str):
                 if n > max_upload:
                     raise ValueError(f"the upload is over {max_upload // 2**20} MB")
                 d = read_multipart(self.rfile, n, self.headers.get_param("boundary") or "",
-                                   staged.new_file)
+                                   staged.new_file, self.parts)
                 staged.finish()
                 return d
             if n > MAX_BODY:
                 raise ValueError("body too large")
             raw = self.rfile.read(n).decode(errors="replace")
+            self.parts.append(f"{self.headers.get_content_type()} {n}B")
             if self._json():
                 d = json.loads(raw or "{}")
                 if not isinstance(d, dict):
@@ -314,6 +318,7 @@ def make_handler(cfg: dict, token: str):
                 return self._post(u, staged)
 
         def _post(self, u, staged):
+            self.parts = []
             try:
                 d = self._body(staged)
             except (ValueError, OSError) as e:
@@ -350,6 +355,11 @@ def make_handler(cfg: dict, token: str):
                         return self._redirect("/?m=" + quote(f"Not queued: {e}"))
                     msg = queued_msg(tid, after) + (f" with {nfiles} file"
                                                     f"{'s' if nfiles > 1 else ''}" if nfiles else "")
+                    named = staged is not None and any(n for _, n in staged.incoming)
+                    if not nfiles and (named or any(d.get(k) for k in FILE_FIELDS)):
+                        msg += ", but no file came through"  # sent as text, or empty
+                    print(f"intake #{tid}: {', '.join(self.parts) or '-'}; "
+                          f"fields {sorted(d)}; {nfiles} file(s) kept", flush=True)
                     if not self._wants_json():
                         return self._redirect("/?m=" + quote(msg))
                     return self._send(201, {"id": tid, "status": "queued", "run_after": after,
@@ -387,7 +397,7 @@ def make_handler(cfg: dict, token: str):
 
         def log_message(self, fmt, *args):
             line = (fmt % args).split("?")[0]  # never log the key in a query string
-            print(f"{self.address_string()} {line}")
+            print(f"{self.address_string()} {line}", flush=True)
     return Handler
 
 def serve(cfg: dict) -> None:
