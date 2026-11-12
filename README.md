@@ -30,6 +30,8 @@ In every mode:
 
 - A task with `--tier frontier` goes straight to the frontier model. If there is
   no allowance left tonight it stays queued.
+- A task with `--tier agent` goes to Claude Code with tools, in a sandbox (see
+  [Agent tier](#agent-tier)). Nothing else is ever routed there.
 - A task that fails locally twice is escalated to the frontier model.
 - "Frontier" means the API credit first. When tonight's allowance is used up,
   it falls back to `claude -p`, which only runs inside its time window and up
@@ -69,6 +71,7 @@ export ELVES_TOKEN=...         # 16+ characters, for the web and SMS intake
 ```sh
 elf add "Summarise the open issues in ~/notes/issues.md"
 elf add -p 1 -t frontier "Design the schema for the access-review tool"
+elf add -t agent "Capture 5 seconds of the Bluesky firehose to a JSON file"
 cat spec.md | elf add -
 elf list
 elf show 3
@@ -118,8 +121,9 @@ Two ways:
   your texts, have it run `elf add --source sms "<message>"`.
 - **Twilio-style webhook.** Point the number's webhook at
   `https://<your-tunnel>/sms?key=<ELVES_TOKEN>` and list your phone number in
-  `web.sms_allow`. Start a message with `!` for priority 1, or `opus:` to
-  request the frontier tier.
+  `web.sms_allow`. Start a message with `!` for priority 1, `opus:` to
+  request the frontier tier, or `agent:` for the agent tier. The same
+  shorthand works for prompts posted to `/tasks` without a `tier`.
 
 ### Morning digest
 
@@ -152,11 +156,36 @@ the API key instead of your subscription when the key is set, and the ledger
 would record that spend as $0. Set `env_unset` on the backend to change the
 list.
 
+## Agent tier
+
+Most tasks are text in, text out. A task queued with `--tier agent` instead
+runs `claude -p` with tools, so it can run commands, write files and fetch
+from the network. It is opt-in per task and only runs through the
+`claude_agent` backend in `config.example.toml`, which:
+
+- runs in `~/.night-elves/work/<id>/`, and the result file lists what was saved there
+- uses `--restricted`, so your user, project and local Claude settings,
+  hooks and MCP servers are ignored, and the file tools stay in the workspace
+- loads `~/.night-elves/agent-settings.json`, a copy of
+  `agent-settings.example.json`: Bash runs in the macOS sandbox with writes
+  limited to the workspace, reads of `~/.ssh`, `~/.config`, keychains and the
+  night-elves secrets denied, network limited to `allowedDomains`, and no
+  fallback to unsandboxed commands
+- uses `--permission-mode dontAsk`, so anything not allowed is refused rather
+  than waiting for a person
+- stops after 60 turns, or after `timeout` seconds, when its whole process
+  group is killed
+- runs inside the subscription window, up to `max_runs_per_night`
+
+On the Studio, `sudo`, writes to the home folder, reads of `~/.ssh` and
+connections to unlisted hosts were all refused by the sandbox. A deny rule
+alone is not a boundary (`sh -c "sudo …"` gets past it); the sandbox is what
+stopped it. Add hosts a task needs to `allowedDomains`.
+
 ## Limits to know about
 
-- **Tasks are text in, text out.** The built-in local and API backends do not
-  use tools or touch files. For tasks that need an agent, make the executor a
-  `command` backend that runs one (`claude -p`, `codex exec`, `hermes`).
+- **Only agent-tier tasks use tools.** The local and API backends do not
+  run commands or touch files.
 - **Subscription usage is not measured.** Neither Claude nor ChatGPT plan
   limits are read; those backends are held back by a time window and a run
   count. Only the API credit is paced in dollars.
