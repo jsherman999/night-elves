@@ -20,7 +20,8 @@ class Fake:
         return Result(text, 10, 20, self.usd)
 
 def make_cfg(tmp):
-    cfg = config.load("/nonexistent")
+    with mock.patch.object(config, "find_config", return_value=None):  # not this machine's
+        cfg = config.load()
     cfg["paths"] = {"db": ":memory:", "results": tmp, "work": os.path.join(tmp, "work"),
                     "attachments": os.path.join(tmp, "att")}
     cfg["backends"] = {
