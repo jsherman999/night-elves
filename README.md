@@ -220,6 +220,24 @@ connections to unlisted hosts were all refused by the sandbox. A deny rule
 alone is not a boundary (`sh -c "sudo …"` gets past it); the sandbox is what
 stopped it. Add hosts a task needs to `allowedDomains`.
 
+### Home network
+
+`scripts/allow-lan.py` adds every address on the Mac's local subnets to
+`allowedDomains` in `~/.night-elves/agent-settings.json` (the sandbox has no
+CIDR syntax, so it's one entry per host; `--remove` takes them out, and a
+re-run refreshes them after the network changes). What agent tasks can then do
+on the LAN, as tested on the Studio:
+
+- connect to devices over TCP, but only through the sandbox proxy: the private
+  ranges are in `NO_PROXY`, so tools must be told to use the proxy
+  (`curl --noproxy ''`, or an HTTP CONNECT in scripts)
+- read the ARP table (`arp -an`) to see recently active devices
+- not ping, use UDP (mDNS/Bonjour, SSDP, SNMP), capture packets, or read
+  per-process traffic stats (`nettop`)
+
+So it can find devices and talk to their web pages and APIs, but it can't
+measure how much traffic each device sends; that needs your router's stats.
+
 ## Limits to know about
 
 - **Only agent-tier tasks use tools.** The local and API backends do not
