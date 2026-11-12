@@ -84,11 +84,12 @@ def login(error: str | None = None) -> str:
 
 TIER_HELP = {
     "auto": "Elves pick: usually the local model, with Claude planning and checking in the second "
-            "half of the billing cycle. Tasks that fail locally twice, or have images, go to Claude.",
-    "local": "Only the Studio's local model. Free, runs any time, text only (it can't see images).",
+            "half of the billing cycle. Tasks that fail locally twice, or have images or PDFs, go "
+            "to Claude.",
+    "local": "Only the Studio's local model. Free, runs any time, text only (no images or PDFs).",
     "frontier": "Claude does the whole task, in the overnight window while tonight's allowance lasts.",
-    "agent": "Claude Code with tools in a sandbox: runs commands, writes files, builds small apps. "
-             "Overnight window only, a few per night.",
+    "agent": "Claude Code with tools in a sandbox: runs commands, writes files, builds small apps, "
+             "works through big data files. Overnight window only, a few per night.",
 }
 TIER_OPTS = tuple(TIER_HELP)
 _TIER_JS = ("var h={" + ",".join(f"{t}:{json.dumps(v)}" for t, v in TIER_HELP.items()) + "};"
@@ -117,8 +118,10 @@ def home(rows, msg: str | None = None) -> str:
 <div class=two>{tier_select()}<input name=priority type=number min=1 max=9 value=5 aria-label=priority></div>
 {tier_help()}
 <input name=at placeholder="run at (optional): 01:30, 2pm, 2026-11-20 07:05">
-<label for=images>Images (optional, up to {attachments.MAX_IMAGES})</label>
-<input id=images name=images type=file accept="image/*" multiple>
+<label for=files>Files or images (optional, up to {attachments.MAX_FILES})</label>
+<input id=files name=files type=file multiple>
+<p class=hint>Text files up to 200 KB work with any tier. Images and PDFs need Claude (not local).
+Bigger or other files need agent.</p>
 <button>Queue it</button></form>
 {section("Running", running, "Nothing running.") if running else ""}
 {section("Waiting", waiting, "The queue is empty.")}
@@ -127,8 +130,8 @@ def home(rows, msg: str | None = None) -> str:
 
 def row(t) -> str:
     pri = f" · p{t['priority']}" if t["priority"] != 5 else ""
-    n = len(attachments.names(t))
-    pri += f" · {n} image{'s' if n > 1 else ''}" if n else ""
+    n = len(attachments.files(t))
+    pri += f" · {n} file{'s' if n > 1 else ''}" if n else ""
     return (f"<a class=row href=/t/{t['id']}><div class=top><b>#{t['id']}</b>"
             f"<span class='pill {e(t['status'])}'>{e(t['status'])}</span>"
             f"<span>{e(t['tier'])}{pri} · {e(when_text(t))}</span></div>"
@@ -148,10 +151,18 @@ def task(t, result: str | None, msg: str | None = None, raw: bool = False) -> st
         head += f"<p><b>Runs {e(when_text(t))}</b></p>"
     if t["last_error"]:
         head += f"<p class=err>Last error: {e(t['last_error'])}</p>"
-    if imgs := attachments.names(t):
-        head += "<div class=imgs>" + "".join(
-            f"<a href=/t/{tid}/img/{i}><img src=/t/{tid}/img/{i} alt='image {i}' loading=lazy></a>"
-            for i in range(1, len(imgs) + 1)) + "</div>"
+    if fs := attachments.files(t):
+        imgs = [i for i, f in enumerate(fs, 1) if f["kind"] == "image"]
+        if imgs:
+            head += "<div class=imgs>" + "".join(
+                f"<a href=/t/{tid}/f/{i}><img src=/t/{tid}/f/{i} alt='{e(fs[i - 1]['name'])}' "
+                "loading=lazy></a>" for i in imgs) + "</div>"
+        others = [(i, f) for i, f in enumerate(fs, 1) if f["kind"] != "image"]
+        if others:
+            head += "<div class='card list'>" + "".join(
+                f"<a class=row href=/t/{tid}/f/{i}><b>{e(f['name'])}</b> "
+                f"<span class=mute>{e(f['kind'])} · {e(attachments.size_label(f.get('size')))}"
+                "</span></a>" for i, f in others) + "</div>"
 
     def button(action, label, cls="", confirm=None):
         js = f" onclick=\"return confirm('{e(confirm)}')\"" if confirm else ""

@@ -21,7 +21,8 @@ CREATE TABLE IF NOT EXISTS tasks (
   feedback TEXT,                             -- reviewer feedback carried into the next attempt
   last_error TEXT,
   run_after TEXT,                            -- UTC; not started before this time
-  images TEXT                                -- JSON list of file names in attachments/<id>/
+  images TEXT,                               -- 0.4.0 only; moved to files
+  files TEXT                                 -- JSON [{name, kind, size}] in attachments/<id>/
 );
 CREATE INDEX IF NOT EXISTS tasks_status ON tasks(status, priority, id);
 CREATE TABLE IF NOT EXISTS spend (
@@ -50,25 +51,30 @@ def connect(path: str) -> sqlite3.Connection:
     conn.execute("PRAGMA journal_mode=WAL")
     conn.executescript(SCHEMA)
     cols = {r[1] for r in conn.execute("PRAGMA table_info(tasks)")}
-    for col in ("run_after", "images"):  # queues made before 0.2 and 0.4
+    for col in ("run_after", "images", "files"):  # queues made before 0.2, 0.4 and 0.5
         if col not in cols:
             conn.execute(f"ALTER TABLE tasks ADD COLUMN {col} TEXT")
+    old = conn.execute("SELECT id, images FROM tasks WHERE images IS NOT NULL AND files IS NULL")
+    for tid, images in old.fetchall():  # 0.4.0 kept a list of image names
+        conn.execute("UPDATE tasks SET files=? WHERE id=?", (json.dumps(
+            [{"name": n, "kind": "image", "size": None} for n in json.loads(images)]), tid))
+    conn.commit()
     return conn
 
 def add_task(conn, prompt: str, source="cli", priority=5, tier="auto", parent_id=None,
-             run_after: str | None = None, images=(), on_insert=None) -> int:
+             run_after: str | None = None, files=(), on_insert=None) -> int:
     """on_insert(id) runs before the commit (attachments use it to move their files into
     place), so other connections never see the task without them. If it raises, nothing is
     added."""
     prompt = prompt.strip()
-    _check(prompt, priority, tier, bool(images))
+    _check(prompt, priority, tier, {f["kind"] for f in files})
     now = iso()
     try:
         cur = conn.execute(
             "INSERT INTO tasks (created_at, updated_at, source, prompt, priority, tier, parent_id,"
-            " run_after, images) VALUES (?,?,?,?,?,?,?,?,?)",
+            " run_after, files) VALUES (?,?,?,?,?,?,?,?,?)",
             (now, now, source, prompt, int(priority), tier, parent_id, run_after,
-             json.dumps(list(images)) if images else None))
+             json.dumps(list(files)) if files else None))
         if on_insert:
             on_insert(cur.lastrowid)
     except BaseException:
@@ -83,16 +89,16 @@ def update(conn, task_id: int, **fields) -> None:
     conn.execute(f"UPDATE tasks SET {sets} WHERE id=?", (*fields.values(), task_id))
     conn.commit()
 
-def _check(prompt=None, priority=None, tier=None, images=False):
+def _check(prompt=None, priority=None, tier=None, kinds=frozenset()):
     if prompt is not None and not prompt.strip():
         raise ValueError("empty prompt")
     if priority is not None and not 1 <= int(priority) <= 9:
         raise ValueError("priority must be 1-9")
     if tier is not None and tier not in TIERS:
         raise ValueError(f"tier must be one of {TIERS}")
-    if images and tier == "local":
-        raise ValueError("this task has images, and the local model can't see them; "
-                         "use auto, frontier or agent")
+    if tier is not None and kinds:
+        from .attachments import check_tier
+        check_tier(tier, kinds)
 
 def change(conn, task_id: int, allowed=EDITABLE, **fields) -> None:
     """Edit, cancel or requeue a task, but only while it is in one of the allowed states, so a
@@ -101,7 +107,8 @@ def change(conn, task_id: int, allowed=EDITABLE, **fields) -> None:
     t = get(conn, task_id)
     if t is None:
         raise LookupError(f"no task #{task_id}")
-    _check(fields.get("prompt"), fields.get("priority"), fields.get("tier"), bool(t["images"]))
+    kinds = {f["kind"] for f in json.loads(t["files"] or "[]")}
+    _check(fields.get("prompt"), fields.get("priority"), fields.get("tier"), kinds)
     if "prompt" in fields:
         fields["prompt"] = fields["prompt"].strip()
     if "priority" in fields:

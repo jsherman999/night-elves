@@ -4,7 +4,7 @@
 db = "~/.night-elves/queue.db"
 results = "~/.night-elves/results"
 work = "~/.night-elves/work"     # agent-tier workspaces, one folder per task
-attachments = "~/.night-elves/attachments"  # images sent with a task, one folder per task
+attachments = "~/.night-elves/attachments"  # files sent with a task, one folder per task
 
 [budget]
 monthly_credit_usd = 100.0   # Claude Max 5x API credit; expires at the end of each cycle
@@ -83,6 +83,7 @@ host = "127.0.0.1"           # keep on loopback; publish through Tailscale or a 
 port = 8377
 token_env = "ELVES_TOKEN"
 sms_allow = []               # e.g. ["+16125550123"]
+max_upload_mb = 2048         # one task's files through the web intake
 public_url = ""              # e.g. "https://studio.tailnet-name.ts.net": digests then link each result
 
 [notify]

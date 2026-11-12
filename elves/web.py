@@ -1,6 +1,6 @@
 """Web and SMS intake, plus phone pages to see and change the queue."""
 from __future__ import annotations
-import email.parser, email.policy, hashlib, hmac, html, json, os, re, time
+import email.parser, email.policy, hashlib, hmac, html, io, json, os, re, shutil, time
 from datetime import datetime
 from http.cookies import SimpleCookie
 from pathlib import Path
@@ -9,7 +9,9 @@ from urllib.parse import parse_qs, quote, urlparse
 from . import attachments, db, pages, policy, when
 
 MAX_BODY = 64 * 1024
-MAX_UPLOAD = 48 * 1024 * 1024  # a task with images, sent as multipart/form-data
+MAX_FIELD = 1024 * 1024  # a non-file field of a multipart upload (the prompt)
+CHUNK = 1024 * 1024
+FILE_FIELDS = ("files", "images")  # "images" is what 0.4 Shortcuts send
 MAX_RESULT = 256 * 1024  # bytes of a result file shown on its page
 
 AT = re.compile(rf"^at\s+({when.CLOCK})(?:\s*(?:cst|cdt|ct))?\s*[:,]?\s+", re.I)
@@ -39,7 +41,61 @@ def queued_msg(tid: int, after: str | None) -> str:
 
 COOKIE = "elves"
 TASK_PATH = re.compile(r"^/(t|tasks)/(\d+)$")
-IMG_PATH = re.compile(r"^/(t|tasks)/(\d+)/img/(\d+)$")
+FILE_PATH = re.compile(r"^/(t|tasks)/(\d+)/f/(\d+)$")
+
+def read_multipart(rfile, length: int, boundary: str, new_file) -> dict:
+    """Stream a multipart/form-data body. File parts are written straight to the paths
+    new_file(filename) returns, so a big upload never sits in memory; other fields come back
+    as strings."""
+    if not boundary:
+        raise ValueError("multipart body without a boundary")
+    delim = b"--" + boundary.encode("latin-1")
+    sep = b"\r\n" + delim
+    buf, left, fields = b"", length, {}
+    def fill() -> bool:
+        nonlocal buf, left
+        if left <= 0:
+            return False
+        data = rfile.read(min(CHUNK, left))
+        if not data:
+            raise ValueError("the upload ended early")
+        left -= len(data)
+        buf += data
+        return True
+    while (i := buf.find(delim)) < 0:
+        if len(buf) > 65536 or not fill():
+            raise ValueError("bad multipart body")
+    buf = buf[i + len(delim):]
+    while True:
+        while len(buf) < 2 and fill():
+            pass
+        if buf.startswith(b"--"):
+            return fields
+        if not buf.startswith(b"\r\n"):
+            raise ValueError("bad multipart body")
+        buf = buf[2:]
+        while (h := buf.find(b"\r\n\r\n")) < 0:
+            if len(buf) > 16384 or not fill():
+                raise ValueError("bad multipart headers")
+        head = email.parser.BytesHeaderParser(policy=email.policy.HTTP).parsebytes(buf[:h + 4])
+        buf = buf[h + 4:]
+        name = head.get_param("name", header="content-disposition")
+        filename = head.get_filename()
+        is_file = filename is not None or name in FILE_FIELDS
+        with (open(new_file(filename), "wb") if is_file else io.BytesIO()) as out:
+            while (j := buf.find(sep)) < 0:
+                keep = len(sep) - 1
+                if len(buf) > keep:
+                    out.write(buf[:-keep])
+                    buf = buf[-keep:]
+                if not is_file and out.tell() > MAX_FIELD:
+                    raise ValueError(f"field {name!r} is too long")
+                if not fill():
+                    raise ValueError("the upload ended early")
+            out.write(buf[:j])
+            buf = buf[j + len(sep):]
+            if not is_file and name:
+                fields[name] = out.getvalue().decode(errors="replace")
 HTML = "text/html; charset=utf-8"
 ICON = Path(__file__).with_name("icon.png")  # source: assets/icon.svg
 ICON_PATHS = {"/icon.png", "/apple-touch-icon.png", "/apple-touch-icon-precomposed.png", "/favicon.ico"}
@@ -79,12 +135,14 @@ def act(cfg: dict, conn, tid: int, d: dict) -> str:
     return f"Saved #{tid}"
 
 def task_json(t) -> dict:
-    return {**dict(t), "images": attachments.names(t)}
+    d = {k: t[k] for k in t.keys() if k != "images"}
+    return {**d, "files": attachments.files(t)}
 
 def make_handler(cfg: dict, token: str):
     # The browser cookie is derived from the token, so changing the token signs every browser out.
     session = hmac.new(token.encode(), b"night-elves web session", hashlib.sha256).hexdigest()
     results = Path(cfg["paths"]["results"]).expanduser().resolve()
+    max_upload = int(cfg["web"].get("max_upload_mb", 2048)) * 2**20
 
     class Handler(BaseHTTPRequestHandler):
         def _send(self, code, body, ctype="application/json", headers=()):
@@ -140,28 +198,19 @@ def make_handler(cfg: dict, token: str):
         def _multipart(self) -> bool:
             return self.headers.get_content_type() == "multipart/form-data"
 
-        def _body(self) -> dict:
-            """Form fields, a JSON object, or (POST /tasks only) multipart/form-data, where
-            the files of the `images` field come back as a list of bytes under "images"."""
+        def _body(self, staged=None) -> dict:
+            """Form fields or a JSON object; with `staged`, a multipart/form-data upload whose
+            files are streamed into it."""
             n = int(self.headers.get("Content-Length") or 0)
-            upload = self._multipart() and urlparse(self.path).path == "/tasks"
-            if n > (MAX_UPLOAD if upload else MAX_BODY):
-                raise ValueError("body too large" + (" (images too big)" if upload else ""))
-            if upload:
-                head = f"Content-Type: {self.headers['Content-Type']}\r\n\r\n".encode()
-                msg = email.parser.BytesParser(policy=email.policy.HTTP).parsebytes(
-                    head + self.rfile.read(n))
-                if not msg.is_multipart():
-                    raise ValueError("bad multipart body")
-                d: dict = {"images": []}
-                for part in msg.iter_parts():
-                    name = part.get_param("name", header="content-disposition")
-                    data = part.get_payload(decode=True) or b""
-                    if name == "images":
-                        d["images"].append(data)
-                    elif name:
-                        d[name] = data.decode(errors="replace")
+            if staged is not None:
+                if n > max_upload:
+                    raise ValueError(f"the upload is over {max_upload // 2**20} MB")
+                d = read_multipart(self.rfile, n, self.headers.get_param("boundary") or "",
+                                   staged.new_file)
+                staged.finish()
                 return d
+            if n > MAX_BODY:
+                raise ValueError("body too large")
             raw = self.rfile.read(n).decode(errors="replace")
             if self._json():
                 d = json.loads(raw or "{}")
@@ -179,14 +228,29 @@ def make_handler(cfg: dict, token: str):
             return (self._json() or "application/json" in self.headers.get("Accept", "")
                     or self.headers.get("Authorization", "").startswith("Bearer "))
 
-        def _image(self, t, n: int):
-            files = attachments.paths(cfg, t)
-            if not 1 <= n <= len(files) or not files[n - 1].is_file():
-                return self._send(404, {"error": "no such image"})
-            p = files[n - 1]
-            return self._send(200, p.read_bytes(), attachments.TYPES[p.suffix.lstrip(".")],
-                              [("Cache-Control", "private, max-age=86400"),
-                               ("X-Content-Type-Options", "nosniff")])
+        def _file(self, t, n: int):
+            """One attached file. Only images, PDFs and plain text open in the browser;
+            everything else (HTML and SVG included) downloads, so an upload can't run as
+            part of this site."""
+            fs, ps = attachments.files(t), attachments.paths(cfg, t)
+            if not 1 <= n <= len(fs) or not ps[n - 1].is_file():
+                return self._send(404, {"error": "no such file"})
+            f, p = fs[n - 1], ps[n - 1]
+            ext = p.suffix.lstrip(".").lower()
+            ctype, disp = {"image": (attachments.TYPES.get(ext), "inline"),
+                           "pdf": ("application/pdf", "inline"),
+                           "text": ("text/plain; charset=utf-8", "inline")}.get(f["kind"], (None, ""))
+            if not ctype:
+                ctype, disp = "application/octet-stream", "attachment"
+            self.send_response(200)
+            for k, v in (("Content-Type", ctype), ("Content-Length", str(p.stat().st_size)),
+                         ("Content-Disposition", f'{disp}; filename="{p.name}"'),
+                         ("Cache-Control", "private, max-age=3600"),
+                         ("X-Content-Type-Options", "nosniff")):
+                self.send_header(k, v)
+            self.end_headers()
+            with open(p, "rb") as fh:
+                shutil.copyfileobj(fh, self.wfile, CHUNK)
 
         def _result(self, t) -> str | None:
             if not t["result_path"]:
@@ -202,7 +266,7 @@ def make_handler(cfg: dict, token: str):
         def do_GET(self):
             u = urlparse(self.path)
             msg = parse_qs(u.query).get("m", [None])[0]
-            m = TASK_PATH.match(u.path) or IMG_PATH.match(u.path)
+            m = TASK_PATH.match(u.path) or FILE_PATH.match(u.path)
             if u.path in ICON_PATHS:  # no sign-in: iOS fetches it when adding to the Home Screen
                 return self._send(200, ICON.read_bytes(), "image/png",
                                   [("Cache-Control", "public, max-age=86400")])
@@ -229,8 +293,8 @@ def make_handler(cfg: dict, token: str):
                 t = db.get(conn, int(m.group(2)))
                 if t is None:
                     return self._send(404, {"error": "no such task"})
-                if m.re is IMG_PATH:
-                    return self._image(t, int(m.group(3)))
+                if m.re is FILE_PATH:
+                    return self._file(t, int(m.group(3)))
                 if m.group(1) == "tasks":
                     return self._send(200, {**task_json(t), "result": self._result(t)})
                 raw = parse_qs(u.query).get("raw", [""])[0] == "1"
@@ -240,11 +304,21 @@ def make_handler(cfg: dict, token: str):
 
         def do_POST(self):
             u = urlparse(self.path)
-            if self._multipart() and u.path == "/tasks" and not self._authed():
-                return self._send(401, {"error": "unauthorized"})  # before reading the upload
+            if not (self._multipart() and u.path == "/tasks"):
+                return self._post(u, None)
+            if not self._authed():  # before reading what may be a big upload
+                self.close_connection = True
+                return self._send(401, {"error": "unauthorized"})
+            with attachments.Staged(cfg) as staged:
+                return self._post(u, staged)
+
+        def _post(self, u, staged):
             try:
-                d = self._body()
-            except ValueError as e:
+                d = self._body(staged)
+            except (ValueError, OSError) as e:
+                self.close_connection = True  # the rest of the body may still be unread
+                if staged is not None and not self._wants_json():
+                    return self._redirect("/?m=" + quote(f"Not queued: {e}"))
                 return self._send(400, {"error": str(e)})
             if u.path == "/login":
                 if self._same_origin() and self._token_ok(str(d.get("token", ""))):
@@ -266,19 +340,19 @@ def make_handler(cfg: dict, token: str):
                         after = run_after(d.get("at") or at)
                         kw = dict(source="web", tier=tier, run_after=after,
                                   priority=int(d.get("priority") or priority))
-                        blobs = [b for b in d.get("images") or [] if b]
-                        tid = (attachments.add_task(cfg, conn, text, blobs, **kw) if blobs
+                        nfiles = len(staged.files) if staged else 0
+                        tid = (attachments.add_task(cfg, conn, text, staged, **kw) if nfiles
                                else db.add_task(conn, text, **kw))
                     except ValueError as e:
                         if self._wants_json():
                             return self._send(400, {"error": str(e)})
                         return self._redirect("/?m=" + quote(f"Not queued: {e}"))
-                    msg = queued_msg(tid, after) + (f" with {len(blobs)} image"
-                                                    f"{'s' if len(blobs) > 1 else ''}" if blobs else "")
+                    msg = queued_msg(tid, after) + (f" with {nfiles} file"
+                                                    f"{'s' if nfiles > 1 else ''}" if nfiles else "")
                     if not self._wants_json():
                         return self._redirect("/?m=" + quote(msg))
                     return self._send(201, {"id": tid, "status": "queued", "run_after": after,
-                                            "images": len(blobs), "message": msg})
+                                            "files": nfiles, "message": msg})
                 if m and m.group(1) == "tasks":
                     if not self._authed(d.get("token")):
                         return self._send(401, {"error": "unauthorized"})

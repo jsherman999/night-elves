@@ -6,7 +6,7 @@ from pathlib import Path
 DEFAULTS = {
     "paths": {"db": "~/.night-elves/queue.db", "results": "~/.night-elves/results",
               "work": "~/.night-elves/work",   # agent-tier tasks each get work/<id>/
-              "attachments": "~/.night-elves/attachments"},  # a task's images: attachments/<id>/
+              "attachments": "~/.night-elves/attachments"},  # a task's files: attachments/<id>/
     "budget": {
         "monthly_credit_usd": 100.0,   # API credit that expires each cycle
         "cycle_day": 1,                # day of month the credit refreshes (1-28)
@@ -21,6 +21,7 @@ DEFAULTS = {
               "frontier_sub": "claude_cli", "second_opinion": "codex", "agent": "claude_agent"},
     "backends": {},
     "web": {"host": "127.0.0.1", "port": 8377, "token_env": "ELVES_TOKEN", "sms_allow": [],
+            "max_upload_mb": 2048,  # one task's files, sent through the web intake
             "public_url": ""},  # e.g. the Tailscale address; digests link each result there
     "notify": {"argv": []},
 }

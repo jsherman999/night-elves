@@ -7,7 +7,7 @@ frontier model do the hard tasks outright.
 from __future__ import annotations
 from dataclasses import dataclass
 from datetime import date, datetime
-from . import db
+from . import attachments, db
 
 MIN_USD = 0.05  # below this, treat tonight's API allowance as used up
 
@@ -88,9 +88,12 @@ def route(task, cfg: dict, state: State, ok) -> Route | None:
     if task["tier"] == "agent":  # opt-in only: this backend can run commands
         agent = r.get("agent")
         return Route(None, agent, None) if agent and ok(agent) else None
+    kinds = attachments.kinds(task)
+    if "data" in kinds:  # only the agent can work on these; intake already insists on it
+        return None
     if task["tier"] == "local":
-        return Route(None, local, None) if local and not task["images"] else None
-    if task["tier"] == "frontier" or task["images"]:  # only Claude can see the images
+        return Route(None, local, None) if local and not kinds & attachments.CLAUDE_ONLY else None
+    if task["tier"] == "frontier" or kinds & attachments.CLAUDE_ONLY:  # only Claude sees them
         return Route(None, frontier, None) if frontier else None
     if task["attempts"] >= lim["escalate_after"] and frontier:
         return Route(None, frontier, None)  # local kept failing: escalate
