@@ -180,7 +180,10 @@ curl -H "Authorization: Bearer $ELVES_TOKEN" -F 'prompt=Find the outliers' -F ti
      -F files=@sales.parquet -F files=@notes.md https://<studio>.ts.net/tasks
 ```
 
-or an iPhone share-sheet Shortcut:
+or an iPhone share-sheet Shortcut. `scripts/make-shortcut.py https://<studio>.ts.net`
+builds and signs a ready-made one, "Send to Elves" (it needs macOS signed in to
+iCloud). Open the file to import it; Shortcuts asks for the token then, so the
+file itself holds no secret, and iCloud syncs it to the phone. To build it by hand:
 
 1. New Shortcut, turn on **Show in Share Sheet**, receiving **Images** and **Files**.
 2. **Ask for Input** (text): "What should the elves do?"; **List** `agent`, `auto`,
@@ -189,7 +192,8 @@ or an iPhone share-sheet Shortcut:
    header `Authorization: Bearer <ELVES_TOKEN>`, request body **Form** with
    `prompt` = Provided Input, `tier` = Chosen Item, and `files` as a **File**
    field set to Shortcut Input. (`images` is accepted too.)
-4. **Get Dictionary Value** `message`, then **Show Notification**.
+4. **Get Dictionary Value** `message`, then **Show Notification**. Errors carry
+   a `message` too ("Not queued: ..."), so failures show up the same way.
 
 With a bearer token the reply is JSON (`{"id", "files", "message"}`); the
 browser form gets the queue page. Uploads are streamed to disk, so size is

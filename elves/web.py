@@ -12,6 +12,7 @@ MAX_BODY = 64 * 1024
 MAX_FIELD = 1024 * 1024  # a non-file field of a multipart upload (the prompt)
 CHUNK = 1024 * 1024
 FILE_FIELDS = ("files", "images")  # "images" is what 0.4 Shortcuts send
+BAD_TOKEN = {"error": "unauthorized", "message": "Not queued: the token was wrong"}  # Shortcuts
 MAX_RESULT = 256 * 1024  # bytes of a result file shown on its page
 
 AT = re.compile(rf"^at\s+({when.CLOCK})(?:\s*(?:cst|cdt|ct))?\s*[:,]?\s+", re.I)
@@ -308,7 +309,7 @@ def make_handler(cfg: dict, token: str):
                 return self._post(u, None)
             if not self._authed():  # before reading what may be a big upload
                 self.close_connection = True
-                return self._send(401, {"error": "unauthorized"})
+                return self._send(401, BAD_TOKEN)
             with attachments.Staged(cfg) as staged:
                 return self._post(u, staged)
 
@@ -319,7 +320,7 @@ def make_handler(cfg: dict, token: str):
                 self.close_connection = True  # the rest of the body may still be unread
                 if staged is not None and not self._wants_json():
                     return self._redirect("/?m=" + quote(f"Not queued: {e}"))
-                return self._send(400, {"error": str(e)})
+                return self._send(400, {"error": str(e), "message": f"Not queued: {e}"})
             if u.path == "/login":
                 if self._same_origin() and self._token_ok(str(d.get("token", ""))):
                     return self._redirect("/", self._cookie(session, 365 * 86400))
@@ -332,7 +333,7 @@ def make_handler(cfg: dict, token: str):
             try:
                 if u.path == "/tasks":
                     if not self._authed(d.get("token")):
-                        return self._send(401, {"error": "unauthorized"})
+                        return self._send(401, BAD_TOKEN)
                     try:
                         text, priority, tier, at = parse_inline(str(d.get("prompt", "")))
                         if d.get("tier") not in (None, "", "auto"):
@@ -345,7 +346,7 @@ def make_handler(cfg: dict, token: str):
                                else db.add_task(conn, text, **kw))
                     except ValueError as e:
                         if self._wants_json():
-                            return self._send(400, {"error": str(e)})
+                            return self._send(400, {"error": str(e), "message": f"Not queued: {e}"})
                         return self._redirect("/?m=" + quote(f"Not queued: {e}"))
                     msg = queued_msg(tid, after) + (f" with {nfiles} file"
                                                     f"{'s' if nfiles > 1 else ''}" if nfiles else "")
