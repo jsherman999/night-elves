@@ -1,21 +1,15 @@
-"""Web and SMS intake. All it does is insert rows into the queue."""
+"""Web and SMS intake, plus phone pages to see and change the queue."""
 from __future__ import annotations
-import hmac, html, json, os, re
+import hashlib, hmac, html, json, os, re, time
 from datetime import datetime
+from http.cookies import SimpleCookie
+from pathlib import Path
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
-from urllib.parse import parse_qs, urlparse
-from . import db, when
+from urllib.parse import parse_qs, quote, urlparse
+from . import db, pages, policy, when
 
 MAX_BODY = 64 * 1024
-FORM = """<!doctype html><meta name=viewport content="width=device-width,initial-scale=1">
-<title>night-elves</title><style>body{font:16px system-ui;max-width:34em;margin:2em auto;padding:0 1em}
-textarea,input,select,button{font:inherit;width:100%;margin:.3em 0;box-sizing:border-box}</style>
-<h1>night-elves</h1><form method=post action=/tasks>
-<textarea name=prompt rows=6 placeholder="What should the elves do tonight?" required></textarea>
-<select name=tier><option>auto<option>local<option>frontier<option>agent</select>
-<input name=priority type=number min=1 max=9 value=5>
-<input name=at placeholder="run at (optional), e.g. 01:30 or 2pm">
-<input name=token type=password placeholder=token required><button>Queue it</button></form>"""
+MAX_RESULT = 256 * 1024  # bytes of a result file shown on its page
 
 AT = re.compile(rf"^at\s+({when.CLOCK})(?:\s*(?:cst|cdt|ct))?\s*[:,]?\s+", re.I)
 
@@ -42,45 +36,156 @@ def run_after(at: str | None) -> str | None:
 def queued_msg(tid: int, after: str | None) -> str:
     return f"Queued #{tid}" + (f" for {when.label(after)}" if after else "")
 
+COOKIE = "elves"
+TASK_PATH = re.compile(r"^/(t|tasks)/(\d+)$")
+HTML = "text/html; charset=utf-8"
+CSP = ("default-src 'none'; style-src 'unsafe-inline'; script-src 'unsafe-inline'; "
+       "form-action 'self'; frame-ancestors 'none'; base-uri 'none'")
+
+def act(cfg: dict, conn, tid: int, d: dict) -> str:
+    """One change to a task from the web: save (edit fields), now, cancel or retry."""
+    action = d.get("action") or "save"
+    if action == "cancel":
+        db.cancel(conn, tid)
+        return f"Cancelled #{tid}"
+    if action == "retry":
+        db.requeue(conn, tid)
+        return f"#{tid} is back in the queue"
+    if action == "now":
+        db.change(conn, tid, ("queued",), run_after=db.iso())
+        t, now = db.get(conn, tid), datetime.now()
+        back = cfg["roles"].get("agent") if t["tier"] == "agent" else None
+        window = cfg["backends"].get(back, {}).get("window") if back else None
+        if window and not policy.in_window(window, now.hour):
+            return f"#{tid} will start at {window[0]:02d}:00, when agent tasks may run"
+        return f"#{tid} will start within a minute"
+    if action != "save":
+        raise ValueError(f"unknown action {action!r}")
+    fields = {k: d[k] for k in ("prompt", "tier", "priority") if k in d}
+    if "priority" in fields:
+        try:
+            fields["priority"] = int(fields["priority"])
+        except (TypeError, ValueError):
+            raise ValueError("priority must be a number 1-9") from None
+    if "at" in d:
+        fields["run_after"] = run_after(str(d["at"] or "").strip() or None)
+    if not fields:
+        raise ValueError("nothing to change")
+    db.change(conn, tid, **fields)
+    return f"Saved #{tid}"
+
 def make_handler(cfg: dict, token: str):
+    # The browser cookie is derived from the token, so changing the token signs every browser out.
+    session = hmac.new(token.encode(), b"night-elves web session", hashlib.sha256).hexdigest()
+    results = Path(cfg["paths"]["results"]).expanduser().resolve()
+
     class Handler(BaseHTTPRequestHandler):
-        def _send(self, code, body, ctype="application/json"):
+        def _send(self, code, body, ctype="application/json", headers=()):
             data = body.encode() if isinstance(body, str) else json.dumps(body).encode()
             self.send_response(code)
             self.send_header("Content-Type", ctype)
             self.send_header("Content-Length", str(len(data)))
+            self.send_header("Cache-Control", "no-store")
+            if ctype == HTML:
+                self.send_header("Content-Security-Policy", CSP)
+                self.send_header("X-Content-Type-Options", "nosniff")
+            for k, v in headers:
+                self.send_header(k, v)
             self.end_headers()
             self.wfile.write(data)
 
-        def _authed(self, supplied: str | None) -> bool:
+        def _redirect(self, where, cookie=None):
+            self._send(303, "", "text/plain", [("Location", where)] + ([("Set-Cookie", cookie)] if cookie else []))
+
+        def _token_ok(self, supplied: str | None) -> bool:
             bearer = self.headers.get("Authorization", "").removeprefix("Bearer ").strip()
             return any(s and hmac.compare_digest(s.encode(), token.encode())
                        for s in (bearer, supplied))
+
+        def _cookie_ok(self) -> bool:
+            jar = SimpleCookie()
+            try:
+                jar.load(self.headers.get("Cookie", ""))
+            except Exception:
+                return False
+            m = jar.get(COOKIE)
+            return bool(m) and hmac.compare_digest(m.value.encode(), session.encode())
+
+        def _same_origin(self) -> bool:
+            """Browsers send Origin on form posts; refuse ones from another site. SameSite=Strict
+            on the cookie already stops this; this is the second lock."""
+            origin = self.headers.get("Origin")
+            if origin is None:
+                return True
+            hosts = {self.headers.get("Host"), self.headers.get("X-Forwarded-Host")} - {None}
+            return urlparse(origin).netloc in hosts
+
+        def _authed(self, supplied=None) -> bool:
+            return self._token_ok(supplied) or (self._cookie_ok() and self._same_origin())
+
+        def _cookie(self, value: str, max_age: int) -> str:
+            host = (self.headers.get("Host") or "").rsplit(":", 1)[0].strip("[]")
+            secure = "" if host in ("127.0.0.1", "localhost", "::1") else "; Secure"
+            return f"{COOKIE}={value}; Path=/; Max-Age={max_age}; HttpOnly; SameSite=Strict{secure}"
 
         def _body(self) -> dict:
             n = int(self.headers.get("Content-Length") or 0)
             if n > MAX_BODY:
                 raise ValueError("body too large")
             raw = self.rfile.read(n).decode(errors="replace")
-            if "json" in self.headers.get("Content-Type", ""):
+            if self._json():
                 d = json.loads(raw or "{}")
                 if not isinstance(d, dict):
                     raise ValueError("expected a JSON object")
                 return d
-            return {k: v[0] for k, v in parse_qs(raw).items()}
+            return {k: v[0] for k, v in parse_qs(raw, keep_blank_values=True).items()}
+
+        def _json(self) -> bool:
+            return "json" in self.headers.get("Content-Type", "")
+
+        def _result(self, t) -> str | None:
+            if not t["result_path"]:
+                return None
+            p = Path(t["result_path"]).resolve()
+            if not p.is_relative_to(results) or not p.is_file():
+                return None
+            with open(p, errors="replace") as f:
+                text = f.read(MAX_RESULT + 1)
+            return text[:MAX_RESULT] + ("\n\n[cut short; the rest is in the file]"
+                                        if len(text) > MAX_RESULT else "")
 
         def do_GET(self):
             u = urlparse(self.path)
+            msg = parse_qs(u.query).get("m", [None])[0]
+            m = TASK_PATH.match(u.path)
             if u.path == "/":
-                return self._send(200, FORM, "text/html; charset=utf-8")
-            if u.path == "/tasks":
-                if not self._authed(None):
-                    return self._send(401, {"error": "unauthorized"})
+                if not self._cookie_ok():
+                    return self._send(200, pages.login(), HTML)
                 conn = db.connect(cfg["paths"]["db"])
-                rows = [dict(r) for r in db.list_tasks(conn, limit=100)]
+                try:
+                    return self._send(200, pages.home(db.list_tasks(conn, limit=300), msg), HTML)
+                finally:
+                    conn.close()
+            if u.path == "/tasks" or (m and m.group(1) == "tasks"):
+                if not self._token_ok(None):
+                    return self._send(401, {"error": "unauthorized"})
+            elif m:
+                if not self._cookie_ok():
+                    return self._redirect("/")
+            else:
+                return self._send(404, {"error": "not found"})
+            conn = db.connect(cfg["paths"]["db"])
+            try:
+                if u.path == "/tasks":
+                    return self._send(200, [dict(r) for r in db.list_tasks(conn, limit=100)])
+                t = db.get(conn, int(m.group(2)))
+                if t is None:
+                    return self._send(404, {"error": "no such task"})
+                if m.group(1) == "tasks":
+                    return self._send(200, {**dict(t), "result": self._result(t)})
+                return self._send(200, pages.task(t, self._result(t), msg), HTML)
+            finally:
                 conn.close()
-                return self._send(200, rows)
-            self._send(404, {"error": "not found"})
 
         def do_POST(self):
             u = urlparse(self.path)
@@ -88,22 +193,51 @@ def make_handler(cfg: dict, token: str):
                 d = self._body()
             except ValueError as e:
                 return self._send(400, {"error": str(e)})
+            if u.path == "/login":
+                if self._same_origin() and self._token_ok(str(d.get("token", ""))):
+                    return self._redirect("/", self._cookie(session, 365 * 86400))
+                time.sleep(1)  # slows guessing; the token is long anyway
+                return self._send(401, pages.login("That token didn't match."), HTML)
+            if u.path == "/logout":
+                return self._redirect("/", self._cookie("", 0) if self._same_origin() else None)
+            m = TASK_PATH.match(u.path)
             conn = db.connect(cfg["paths"]["db"])
             try:
                 if u.path == "/tasks":
                     if not self._authed(d.get("token")):
                         return self._send(401, {"error": "unauthorized"})
-                    text, priority, tier, at = parse_inline(str(d.get("prompt", "")))
-                    if d.get("tier") not in (None, "", "auto"):
-                        tier = d["tier"]
-                    after = run_after(d.get("at") or at)
-                    tid = db.add_task(conn, text, source="web", tier=tier, run_after=after,
-                                      priority=int(d.get("priority") or priority))
+                    try:
+                        text, priority, tier, at = parse_inline(str(d.get("prompt", "")))
+                        if d.get("tier") not in (None, "", "auto"):
+                            tier = d["tier"]
+                        after = run_after(d.get("at") or at)
+                        tid = db.add_task(conn, text, source="web", tier=tier, run_after=after,
+                                          priority=int(d.get("priority") or priority))
+                    except ValueError as e:
+                        if self._json():
+                            return self._send(400, {"error": str(e)})
+                        return self._redirect("/?m=" + quote(f"Not queued: {e}"))
+                    if not self._json():
+                        return self._redirect("/?m=" + quote(queued_msg(tid, after)))
                     return self._send(201, {"id": tid, "status": "queued", "run_after": after,
                                             "message": queued_msg(tid, after)})
+                if m and m.group(1) == "tasks":
+                    if not self._authed(d.get("token")):
+                        return self._send(401, {"error": "unauthorized"})
+                    tid = int(m.group(2))
+                    try:
+                        msg, code = act(cfg, conn, tid, d), 200
+                    except LookupError as e:
+                        msg, code = str(e).strip("'\""), 404
+                    except ValueError as e:
+                        msg, code = str(e), 409 if "can't be changed" in str(e) else 400
+                    if not self._json():
+                        return self._redirect(f"/t/{tid}?m=" + quote(msg))
+                    t = db.get(conn, tid)
+                    return self._send(code, {"message": msg, **({"task": dict(t)} if t else {})})
                 if u.path == "/sms":  # Twilio-style webhook: form fields From and Body
                     key = parse_qs(u.query).get("key", [None])[0]
-                    if not self._authed(key) or d.get("From") not in cfg["web"]["sms_allow"]:
+                    if not self._token_ok(key) or d.get("From") not in cfg["web"]["sms_allow"]:
                         return self._send(401, {"error": "unauthorized"})
                     text, priority, tier, at = parse_inline(d.get("Body", ""))
                     after = run_after(at)

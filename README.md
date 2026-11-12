@@ -79,8 +79,16 @@ elf show 3
 elf budget              # mode, credit spent, tonight's allowance
 elf run --dry-run       # show how each queued task would be routed
 elf run                 # work the queue now
-elf retry 3             # requeue a failed task
+elf retry 3             # requeue a failed, cancelled or finished task
+elf cancel 4 5          # take queued tasks out of the queue
+elf edit 4 -t agent -p 2 --at 01:30    # also --prompt "...", --now, --tonight
 ```
+
+`elf edit` and `elf cancel` only touch tasks that haven't started (queued, failed
+or cancelled); once a run picks a task up, it is left alone. `--now` means
+"within a minute" (the every-minute job below runs it, and sends the digest);
+`--tonight` drops a scheduled time so the 01:00 run takes it. Backend windows
+still apply, so an agent task set to run now during the day waits for 01:00.
 
 Results land in `~/.night-elves/results/<id>.md`, with a `digest-<date>.txt`
 after each run.
@@ -131,10 +139,29 @@ curl -H "Authorization: Bearer $ELVES_TOKEN" -H 'Content-Type: application/json'
      -d '{"prompt":"...","priority":3,"tier":"auto"}' http://127.0.0.1:8377/tasks
 ```
 
-`GET /` is a small form for a phone. `GET /tasks` lists the queue as JSON. The
-server binds to loopback; reach it from elsewhere through Tailscale or a
+The server binds to loopback; reach it from elsewhere through Tailscale or a
 tunnel instead of opening the port. `launchd/com.nightelves.web.plist` keeps
 it running.
+
+**In a browser** (bookmark it, or Share > Add to Home Screen on an iPhone),
+`/` asks once for the token, then shows a form to queue a task and the queue
+itself: what's running, what's waiting (and when), and recent results. Tap a
+task to read its result, edit its prompt, tier, priority or time, run it now,
+cancel it, or put it back in the queue. The sign-in is a cookie derived from
+the token (HttpOnly, SameSite=Strict, Secure over HTTPS), so changing
+`ELVES_TOKEN` signs every browser out.
+
+**As JSON**, with the `Authorization: Bearer` header:
+
+| Request | Does |
+|---|---|
+| `POST /tasks` `{"prompt", "priority", "tier", "at"}` | queue a task |
+| `GET /tasks` | the latest 100 tasks |
+| `GET /tasks/<id>` | one task, with its result text |
+| `POST /tasks/<id>` `{"action": "save", "prompt", "tier", "priority", "at"}` | edit it (`"at": ""` clears the time) |
+| `POST /tasks/<id>` `{"action": "now" \| "cancel" \| "retry"}` | run it within a minute, cancel it, requeue it |
+
+A change to a task a run has already started returns 409.
 
 ### SMS intake
 

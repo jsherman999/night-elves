@@ -247,6 +247,61 @@ class ScheduleTests(Base):
         with contextlib.redirect_stderr(io.StringIO()):
             self.assertEqual(cli.main(["-c", path, "add", "--at", "later", "x"]), 2)
 
+class ChangeTests(Base):
+    def test_edit_cancel_requeue_rules(self):
+        tid = db.add_task(self.conn, "first draft")
+        db.change(self.conn, tid, prompt="  second draft ", tier="agent", priority=2)
+        t = db.get(self.conn, tid)
+        self.assertEqual((t["prompt"], t["tier"], t["priority"]), ("second draft", "agent", 2))
+        with self.assertRaises(ValueError):
+            db.change(self.conn, tid, tier="psychic")
+        with self.assertRaises(ValueError):
+            db.change(self.conn, tid, priority=0)
+        with self.assertRaises(LookupError):
+            db.cancel(self.conn, 99)
+        db.cancel(self.conn, tid)
+        self.assertEqual(db.get(self.conn, tid)["status"], "cancelled")
+        self.assertIsNone(db.next_task(self.conn))
+        db.requeue(self.conn, tid)
+        self.assertEqual(db.get(self.conn, tid)["status"], "queued")
+        db.update(self.conn, tid, status="running")
+        for change in (lambda: db.cancel(self.conn, tid), lambda: db.requeue(self.conn, tid),
+                       lambda: db.change(self.conn, tid, prompt="x")):
+            with self.assertRaisesRegex(ValueError, "is running"):
+                change()
+
+    def test_task_cancelled_after_being_picked_is_not_run(self):
+        tid = db.add_task(self.conn, "picked then cancelled")
+        n = self.night(5, hour=12)
+        task = db.next_task(self.conn)
+        db.cancel(self.conn, tid)
+        self.assertEqual(n.process(task), "skipped")
+        self.assertEqual(self.fakes["local"].calls, [])
+        self.assertEqual(db.get(self.conn, tid)["status"], "cancelled")
+
+    def test_cli_edit_cancel_retry(self):
+        path = os.path.join(self.tmp, "c.toml")
+        open(path, "w").write(f'[paths]\ndb = "{self.tmp}/q.db"\nresults = "{self.tmp}"\n')
+        out, err = io.StringIO(), io.StringIO()
+        with contextlib.redirect_stdout(out), contextlib.redirect_stderr(err):
+            cli.main(["-c", path, "add", "--at", "03:15", "scheduled thing"])
+            cli.main(["-c", path, "add", "other"])
+            self.assertEqual(cli.main(["-c", path, "edit", "1", "-t", "agent", "-p", "1",
+                                       "--prompt", "new words", "--tonight"]), 0)
+            self.assertEqual(cli.main(["-c", path, "edit", "2", "--now"]), 0)
+            self.assertEqual(cli.main(["-c", path, "edit", "2"]), 2)
+            self.assertEqual(cli.main(["-c", path, "cancel", "1", "2"]), 0)
+            self.assertEqual(cli.main(["-c", path, "cancel", "7"]), 1)
+            self.assertEqual(cli.main(["-c", path, "retry", "2"]), 0)
+        conn = db.connect(f"{self.tmp}/q.db")
+        one, two = db.get(conn, 1), db.get(conn, 2)
+        self.assertEqual((one["status"], one["tier"], one["priority"], one["prompt"], one["run_after"]),
+                         ("cancelled", "agent", 1, "new words", None))
+        self.assertEqual(two["status"], "queued")
+        self.assertIsNotNone(two["run_after"])
+        self.assertIn("no task #7", err.getvalue())
+        self.assertIn("cancelled #2", out.getvalue())
+
 class MiscTests(Base):
     def test_command_backend_arg_and_stdin(self):
         self.assertEqual(Command("e", {"argv": ["echo", "{prompt}"]}).run("hi; rm -rf /").text, "hi; rm -rf /")
@@ -333,6 +388,72 @@ class MiscTests(Base):
         self.assertEqual([(r["source"], r["priority"], r["tier"], r["prompt"]) for r in rows],
                          [("sms", 1, "auto", "urgent"), ("web", 5, "agent", "run it"),
                           ("web", 2, "auto", "from web")])
+
+    def test_phone_pages(self):
+        self.cfg["paths"]["db"] = os.path.join(self.tmp, "q.db")
+        conn = db.connect(self.cfg["paths"]["db"])
+        done = db.add_task(conn, "finished <b>thing</b>")
+        res = os.path.join(self.tmp, f"{done}.md")
+        open(res, "w").write("# the answer <script>")
+        db.update(conn, done, status="done", result_path=res)
+        db.update(conn, db.add_task(conn, "elsewhere"), status="done", result_path="/etc/hosts")
+        waiting = db.add_task(conn, "waiting one", run_after="2030-01-01T07:30:00Z")
+        srv = ThreadingHTTPServer(("127.0.0.1", 0), web.make_handler(self.cfg, "s3cret-token-123456"))
+        threading.Thread(target=srv.serve_forever, daemon=True).start()
+        base = f"http://127.0.0.1:{srv.server_port}"
+        class NoRedirect(urllib.request.HTTPRedirectHandler):
+            def redirect_request(self, *a, **k):
+                return None
+        opener = urllib.request.build_opener(NoRedirect)
+        def call(path, data=None, headers=None):
+            req = urllib.request.Request(base + path, data=data, headers=headers or {})
+            try:
+                with opener.open(req) as r:
+                    return r.status, r.read().decode(), r.headers
+            except urllib.error.HTTPError as e:
+                return e.code, e.read().decode(), e.headers
+        form = {"Content-Type": "application/x-www-form-urlencoded"}
+        self.assertIn("Sign in", call("/")[1])
+        self.assertEqual(call("/login", b"token=wrong", form)[0], 401)
+        code, _, h = call("/login", b"token=s3cret-token-123456", form)
+        self.assertEqual(code, 303)
+        cookie = h["Set-Cookie"].split(";")[0]
+        self.assertIn("HttpOnly", h["Set-Cookie"])
+        self.assertIn("SameSite=Strict", h["Set-Cookie"])
+        self.assertNotIn("s3cret", cookie)
+        me = {"Cookie": cookie}
+        code, page, h = call("/", headers=me)
+        self.assertEqual(code, 200)
+        self.assertIn("default-src 'none'", h["Content-Security-Policy"])
+        self.assertIn("finished &lt;b&gt;thing&lt;/b&gt;", page)
+        self.assertIn(f"href=/t/{waiting}", page)
+        page = call(f"/t/{done}", headers=me)[1]
+        self.assertIn("# the answer &lt;script&gt;", page)
+        self.assertNotIn("localhost", call(f"/t/{done + 1}", headers=me)[1])  # outside results/
+        self.assertEqual(call(f"/t/{done}")[0], 303)  # not signed in
+        # changes: from the page with the cookie, and as JSON with the token
+        code, _, h = call(f"/tasks/{waiting}", b"action=save&prompt=edited&tier=local&priority=2&at=",
+                          {**form, **me, "Origin": base})
+        self.assertEqual((code, h["Location"]), (303, f"/t/{waiting}?m=Saved%20%23{waiting}"))
+        t = db.get(conn, waiting)
+        self.assertEqual((t["prompt"], t["tier"], t["priority"], t["run_after"]), ("edited", "local", 2, None))
+        self.assertEqual(call(f"/tasks/{waiting}", b"action=cancel",
+                              {**form, **me, "Origin": "https://evil.example"})[0], 401)
+        self.assertEqual(call(f"/tasks/{waiting}", b"action=cancel", form)[0], 401)
+        auth = {"Content-Type": "application/json", "Authorization": "Bearer s3cret-token-123456"}
+        code, text, _ = call(f"/tasks/{waiting}", json.dumps({"action": "now"}).encode(), auth)
+        self.assertEqual(code, 200)
+        self.assertIn("within a minute", json.loads(text)["message"])
+        self.assertEqual(call(f"/tasks/{waiting}", b'{"action": "cancel"}', auth)[0], 200)
+        self.assertEqual(call(f"/tasks/{waiting}", b'{"action": "cancel"}', auth)[0], 409)
+        self.assertEqual(call("/tasks/999", b'{"action": "cancel"}', auth)[0], 404)
+        self.assertEqual(db.get(conn, waiting)["status"], "cancelled")
+        code, text, _ = call(f"/tasks/{done}", headers={"Authorization": "Bearer s3cret-token-123456"})
+        self.assertEqual(json.loads(text)["result"], "# the answer <script>")
+        code, _, h = call("/tasks", b"prompt=agent%3A+from+the+page&priority=5&at=", {**form, **me})
+        self.assertEqual((code, h["Location"]), (303, "/?m=Queued%20%234"))
+        self.assertEqual(db.get(conn, 4)["tier"], "agent")
+        srv.shutdown()
 
 if __name__ == "__main__":
     unittest.main()

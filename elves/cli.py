@@ -5,6 +5,11 @@ from datetime import datetime
 from . import backends, config, db, notify, policy, when
 from .dispatcher import Night
 
+def describe(t) -> str:
+    at = f"@{when.label(t['run_after'])} " if t["run_after"] and t["status"] == "queued" else ""
+    return (f"#{t['id']:<4} {t['status']:<9} p{t['priority']} {t['tier']:<8} "
+            f"{t['source']:<4} {at}{' '.join(t['prompt'].split())[:60]}")
+
 def main(argv=None) -> int:
     ap = argparse.ArgumentParser(prog="elf", description="Queue tasks for overnight model work.")
     ap.add_argument("-c", "--config", help="path to config.toml")
@@ -19,8 +24,19 @@ def main(argv=None) -> int:
     l.add_argument("-s", "--status")
     s = sub.add_parser("show", help="show one task and its result")
     s.add_argument("id", type=int)
-    r = sub.add_parser("retry", help="put a failed task back in the queue")
+    r = sub.add_parser("retry", help="put a failed, cancelled or finished task back in the queue")
     r.add_argument("id", type=int)
+    c = sub.add_parser("cancel", help="take queued tasks out of the queue (retry brings one back)")
+    c.add_argument("id", type=int, nargs="+")
+    e = sub.add_parser("edit", help="change a task that hasn't started")
+    e.add_argument("id", type=int)
+    e.add_argument("--prompt", help="new prompt ('-' reads it from stdin)")
+    e.add_argument("-p", "--priority", type=int)
+    e.add_argument("-t", "--tier", choices=db.TIERS)
+    w = e.add_mutually_exclusive_group()
+    w.add_argument("--at", help="run at this local time instead")
+    w.add_argument("--now", action="store_true", help="run within a minute (the backend's window still applies)")
+    w.add_argument("--tonight", action="store_true", help="drop the scheduled time; run in the nightly run")
     n = sub.add_parser("run", help="work the queue now (launchd calls this nightly)")
     n.add_argument("--max-tasks", type=int)
     n.add_argument("--dry-run", action="store_true", help="show routing without calling models")
@@ -50,9 +66,7 @@ def main(argv=None) -> int:
         print(f"queued #{tid}" + (f" for {when.label(after)}" if after else ""))
     elif args.cmd == "list":
         for t in db.list_tasks(conn, args.status):
-            at = f"@{when.label(t['run_after'])} " if t["run_after"] and t["status"] == "queued" else ""
-            print(f"#{t['id']:<4} {t['status']:<8} p{t['priority']} {t['tier']:<8} "
-                  f"{t['source']:<4} {at}{' '.join(t['prompt'].split())[:60]}")
+            print(describe(t))
     elif args.cmd == "show":
         t = db.get(conn, args.id)
         if not t:
@@ -62,9 +76,34 @@ def main(argv=None) -> int:
             print(f"{k}: {t[k]}")
         if t["result_path"]:
             print("\n" + open(t["result_path"]).read())
-    elif args.cmd == "retry":
-        db.update(conn, args.id, status="queued", attempts=0, last_error=None)
-        print(f"requeued #{args.id}")
+    elif args.cmd in ("retry", "cancel", "edit"):
+        try:
+            if args.cmd == "retry":
+                db.requeue(conn, args.id)
+                print(f"requeued #{args.id}")
+            elif args.cmd == "cancel":
+                for tid in args.id:
+                    db.cancel(conn, tid)
+                    print(f"cancelled #{tid}")
+            else:
+                fields = {k: v for k, v in (("priority", args.priority), ("tier", args.tier))
+                          if v is not None}
+                if args.prompt is not None:
+                    fields["prompt"] = sys.stdin.read() if args.prompt == "-" else args.prompt
+                if args.at:
+                    fields["run_after"] = db.iso(when.parse_at(args.at, now))
+                elif args.now:
+                    fields["run_after"] = db.iso(now)
+                elif args.tonight:
+                    fields["run_after"] = None
+                if not fields:
+                    print("nothing to change; see elf edit --help", file=sys.stderr)
+                    return 2
+                db.change(conn, args.id, **fields)
+                print(describe(db.get(conn, args.id)))
+        except (LookupError, ValueError) as e:
+            print(e, file=sys.stderr)
+            return 1
     elif args.cmd == "budget":
         st = policy.snapshot(cfg, conn, now, db.iso(now))
         print(f"mode: {st.mode}   cycle {st.elapsed:.0%} elapsed, {st.days_left} day(s) left\n"

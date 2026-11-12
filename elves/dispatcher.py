@@ -98,10 +98,11 @@ class Night:
         if r is None:
             return "skipped"
         self.log(f"#{tid} plan={r.planner} exec={r.executor} review={r.reviewer}")
+        if not db.claim(self.conn, tid, "planning" if r.planner else "running"):
+            return "skipped"  # cancelled or changed since it was picked
         try:
             prompt = f"Task:\n{task['prompt']}"
             if r.planner:
-                db.update(self.conn, tid, status="planning")
                 plan = self.call(r.planner, tid, "plan", prompt, PLAN_SYS)
                 prompt += f"\n\nPlan to follow:\n{plan}"
             if task["feedback"]:

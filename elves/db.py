@@ -13,7 +13,7 @@ CREATE TABLE IF NOT EXISTS tasks (
   prompt TEXT NOT NULL,
   priority INTEGER NOT NULL DEFAULT 5,       -- 1 = most important
   tier TEXT NOT NULL DEFAULT 'auto',         -- auto | local | frontier | agent
-  status TEXT NOT NULL DEFAULT 'queued',     -- queued | planning | running | review | done | failed
+  status TEXT NOT NULL DEFAULT 'queued',     -- queued | planning | running | review | done | failed | cancelled
   parent_id INTEGER REFERENCES tasks(id),
   backend TEXT,                              -- backend that produced the result
   result_path TEXT,
@@ -35,6 +35,8 @@ CREATE TABLE IF NOT EXISTS spend (
 CREATE INDEX IF NOT EXISTS spend_ts ON spend(backend, ts);
 """
 TIERS = ("auto", "local", "frontier", "agent")
+ACTIVE = ("planning", "running", "review")  # a run is working on it; hands off
+EDITABLE = ("queued", "failed", "cancelled")
 
 def iso(dt: datetime | None = None) -> str:
     return (dt or datetime.now(timezone.utc)).astimezone(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
@@ -53,10 +55,7 @@ def connect(path: str) -> sqlite3.Connection:
 def add_task(conn, prompt: str, source="cli", priority=5, tier="auto", parent_id=None,
              run_after: str | None = None) -> int:
     prompt = prompt.strip()
-    if not prompt:
-        raise ValueError("empty prompt")
-    if tier not in TIERS:
-        raise ValueError(f"tier must be one of {TIERS}")
+    _check(prompt, priority, tier)
     now = iso()
     cur = conn.execute(
         "INSERT INTO tasks (created_at, updated_at, source, prompt, priority, tier, parent_id,"
@@ -70,6 +69,52 @@ def update(conn, task_id: int, **fields) -> None:
     sets = ", ".join(f"{k}=?" for k in fields)
     conn.execute(f"UPDATE tasks SET {sets} WHERE id=?", (*fields.values(), task_id))
     conn.commit()
+
+def _check(prompt=None, priority=None, tier=None):
+    if prompt is not None and not prompt.strip():
+        raise ValueError("empty prompt")
+    if priority is not None and not 1 <= int(priority) <= 9:
+        raise ValueError("priority must be 1-9")
+    if tier is not None and tier not in TIERS:
+        raise ValueError(f"tier must be one of {TIERS}")
+
+def change(conn, task_id: int, allowed=EDITABLE, **fields) -> None:
+    """Edit, cancel or requeue a task, but only while it is in one of the allowed states, so a
+    task a run has already started is never changed underneath it. Raises LookupError or
+    ValueError with a message fit to show the user."""
+    t = get(conn, task_id)
+    if t is None:
+        raise LookupError(f"no task #{task_id}")
+    _check(fields.get("prompt"), fields.get("priority"), fields.get("tier"))
+    if "prompt" in fields:
+        fields["prompt"] = fields["prompt"].strip()
+    if "priority" in fields:
+        fields["priority"] = int(fields["priority"])
+    fields["updated_at"] = iso()
+    sets = ", ".join(f"{k}=?" for k in fields)
+    marks = ",".join("?" * len(allowed))
+    cur = conn.execute(f"UPDATE tasks SET {sets} WHERE id=? AND status IN ({marks})",
+                       (*fields.values(), task_id, *allowed))
+    conn.commit()
+    if not cur.rowcount:
+        status = get(conn, task_id)["status"]
+        verb = "running" if status in ACTIVE else status
+        raise ValueError(f"#{task_id} is {verb}, so it can't be changed now")
+
+def cancel(conn, task_id: int) -> None:
+    change(conn, task_id, ("queued", "failed"), status="cancelled")
+
+def requeue(conn, task_id: int) -> None:
+    """Back into the queue with fresh attempts: for failed, cancelled or finished tasks."""
+    change(conn, task_id, ("failed", "cancelled", "done"), status="queued", attempts=0,
+           last_error=None)
+
+def claim(conn, task_id: int, status: str) -> bool:
+    """Start work on a task, unless it was cancelled or edited away since it was picked."""
+    cur = conn.execute("UPDATE tasks SET status=?, updated_at=? WHERE id=? AND status='queued'",
+                       (status, iso(), task_id))
+    conn.commit()
+    return cur.rowcount == 1
 
 def get(conn, task_id: int):
     return conn.execute("SELECT * FROM tasks WHERE id=?", (task_id,)).fetchone()
