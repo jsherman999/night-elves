@@ -32,6 +32,11 @@ def text(*parts) -> dict:
 def var(ref: dict) -> dict:
     return {"Value": ref, "WFSerializationType": "WFTextTokenAttachment"}
 
+def file_value(ref: dict) -> dict:
+    """A form field's file value: the variable wrapped one level deeper than a text value.
+    Without the wrapper Shortcuts silently leaves the field out of the request."""
+    return {"Value": var(ref), "WFSerializationType": "WFTokenAttachmentParameterState"}
+
 def fields(*items) -> dict:
     """A dictionary of fields; each item is (key, type, value): type 0 is text, 5 a file."""
     return {"Value": {"WFDictionaryFieldValueItems": [
@@ -62,7 +67,7 @@ def build(url: str) -> dict:
                WFHTTPBodyType="Form",
                WFFormValues=fields(("prompt", 0, text(out(ask, "Provided Input"))),
                                    ("tier", 0, text(out(pick, "Chosen Item"))),
-                                   ("files", 5, var(shared)))),
+                                   ("files", 5, file_value(shared)))),
         action("getvalueforkey", msg, WFGetDictionaryValueType="Value",
                WFDictionaryKey="message", WFInput=var(out(post, "Contents of URL"))),
         action("notification", WFNotificationActionTitle="Elves",
