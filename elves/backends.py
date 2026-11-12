@@ -56,7 +56,7 @@ class OpenAICompat:
                    "max_tokens": self.c.get("max_tokens", 4096)},
                   self.c.get("timeout", 1800))
         try:
-            text = d["choices"][0]["message"]["content"] or ""
+            text = (d["choices"][0]["message"]["content"] or "").strip()
         except (KeyError, IndexError) as e:
             raise BackendError(f"{self.name}: unexpected response {str(d)[:300]}") from e
         u = d.get("usage") or {}
