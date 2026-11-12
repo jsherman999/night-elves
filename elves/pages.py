@@ -42,6 +42,7 @@ def page(title: str, body: str, msg: str | None = None) -> str:
     return ('<!doctype html><html lang=en><meta charset=utf-8>'
             '<meta name=viewport content="width=device-width,initial-scale=1">'
             '<meta name=apple-mobile-web-app-title content="Elves">'
+            '<link rel=apple-touch-icon href=/apple-touch-icon.png><link rel=icon href=/icon.png>'
             f'<title>{e(title)}</title><style>{CSS}</style><main>{flash}{body}</main></html>')
 
 def local(utc_iso: str) -> datetime:

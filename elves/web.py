@@ -39,7 +39,9 @@ def queued_msg(tid: int, after: str | None) -> str:
 COOKIE = "elves"
 TASK_PATH = re.compile(r"^/(t|tasks)/(\d+)$")
 HTML = "text/html; charset=utf-8"
-CSP = ("default-src 'none'; style-src 'unsafe-inline'; script-src 'unsafe-inline'; "
+ICON = Path(__file__).with_name("icon.png")  # source: assets/icon.svg
+ICON_PATHS = {"/icon.png", "/apple-touch-icon.png", "/apple-touch-icon-precomposed.png", "/favicon.ico"}
+CSP = ("default-src 'none'; img-src 'self'; style-src 'unsafe-inline'; script-src 'unsafe-inline'; "
        "form-action 'self'; frame-ancestors 'none'; base-uri 'none'")
 
 def act(cfg: dict, conn, tid: int, d: dict) -> str:
@@ -81,11 +83,13 @@ def make_handler(cfg: dict, token: str):
 
     class Handler(BaseHTTPRequestHandler):
         def _send(self, code, body, ctype="application/json", headers=()):
-            data = body.encode() if isinstance(body, str) else json.dumps(body).encode()
+            data = (body if isinstance(body, bytes) else body.encode() if isinstance(body, str)
+                    else json.dumps(body).encode())
             self.send_response(code)
             self.send_header("Content-Type", ctype)
             self.send_header("Content-Length", str(len(data)))
-            self.send_header("Cache-Control", "no-store")
+            if not any(k == "Cache-Control" for k, _ in headers):
+                self.send_header("Cache-Control", "no-store")
             if ctype == HTML:
                 self.send_header("Content-Security-Policy", CSP)
                 self.send_header("X-Content-Type-Options", "nosniff")
@@ -158,6 +162,9 @@ def make_handler(cfg: dict, token: str):
             u = urlparse(self.path)
             msg = parse_qs(u.query).get("m", [None])[0]
             m = TASK_PATH.match(u.path)
+            if u.path in ICON_PATHS:  # no sign-in: iOS fetches it when adding to the Home Screen
+                return self._send(200, ICON.read_bytes(), "image/png",
+                                  [("Cache-Control", "public, max-age=86400")])
             if u.path == "/":
                 if not self._cookie_ok():
                     return self._send(200, pages.login(), HTML)

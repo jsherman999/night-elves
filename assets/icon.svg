@@ -1,0 +1,27 @@
+<!-- Source of elves/icon.png: render at 540px, then sips -z 180 180 -->
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 1024 1024">
+<defs>
+ <linearGradient id="sky" x1="0" y1="0" x2="0" y2="1">
+  <stop offset="0" stop-color="#2a2f6e"/><stop offset="1" stop-color="#0c0e26"/></linearGradient>
+ <radialGradient id="glow" cx="0.47" cy="0.55" r="0.45">
+  <stop offset="0" stop-color="#ffe9a3" stop-opacity=".16"/><stop offset="1" stop-color="#ffe9a3" stop-opacity="0"/></radialGradient>
+ <mask id="cres"><rect width="1024" height="1024" fill="#fff"/><circle cx="560" cy="400" r="250" fill="#000"/></mask>
+</defs>
+<rect width="1024" height="1024" fill="url(#sky)"/>
+<rect width="1024" height="1024" fill="url(#glow)"/>
+<g transform="translate(70 95) scale(0.88)"><circle cx="440" cy="500" r="300" fill="#f6d77a" mask="url(#cres)"/>
+<!-- elf hat on the moon's upper tip -->
+<g transform="rotate(-8 410 210)">
+<path d="M330 215 C350 140 420 70 520 60 C600 52 660 90 690 150 C650 120 600 110 560 125 C520 140 490 170 485 215 Z" fill="#3fae6a"/>
+<path d="M330 215 C350 140 420 70 520 60 C470 90 430 140 415 215 Z" fill="#2f8f55"/>
+<rect x="312" y="200" width="196" height="48" rx="24" fill="#eef2fa"/>
+<circle cx="696" cy="160" r="34" fill="#eef2fa"/>
+</g></g>
+<g fill="#fff">
+ <path d="M760 690 l14 40 40 14 -40 14 -14 40 -14 -40 -40 -14 40 -14z"/>
+ <path d="M250 200 l9 26 26 9 -26 9 -9 26 -9 -26 -26 -9 26 -9z" opacity=".9"/>
+ <path d="M860 170 l7 20 20 7 -20 7 -7 20 -7 -20 -20 -7 20 -7z" opacity=".8"/>
+ <circle cx="180" cy="760" r="8" opacity=".7"/><circle cx="640" cy="880" r="6" opacity=".6"/>
+ <circle cx="900" cy="860" r="7" opacity=".7"/>
+</g>
+</svg>

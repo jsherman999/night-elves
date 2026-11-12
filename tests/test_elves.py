@@ -413,11 +413,13 @@ class MiscTests(Base):
             req = urllib.request.Request(base + path, data=data, headers=headers or {})
             try:
                 with opener.open(req) as r:
-                    return r.status, r.read().decode(), r.headers
+                    return r.status, r.read().decode(errors="replace"), r.headers
             except urllib.error.HTTPError as e:
                 return e.code, e.read().decode(), e.headers
         form = {"Content-Type": "application/x-www-form-urlencoded"}
         self.assertIn("Sign in", call("/")[1])
+        code, _, h = call("/apple-touch-icon.png")
+        self.assertEqual((code, h["Content-Type"]), (200, "image/png"))
         self.assertEqual(call("/login", b"token=wrong", form)[0], 401)
         code, _, h = call("/login", b"token=s3cret-token-123456", form)
         self.assertEqual(code, 303)
