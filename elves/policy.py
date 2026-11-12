@@ -88,12 +88,25 @@ def route(task, cfg: dict, state: State, ok) -> Route | None:
     if task["tier"] == "agent":  # opt-in only: this backend can run commands
         agent = r.get("agent")
         return Route(None, agent, None) if agent and ok(agent) else None
-    kinds = attachments.kinds(task)
+    fs = attachments.files(task)
+    kinds = {f["kind"] for f in fs}
     if "data" in kinds:  # only the agent can work on these; intake already insists on it
         return None
+    if kinds & attachments.VISUAL:  # images or PDFs: Claude, or a local vision model
+        vision = r.get("local_vision")
+        vision = vision if vision and ok(vision) and attachments.local_can_see(fs) else None
+        if task["tier"] == "local":
+            return Route(None, vision, None) if vision else None
+        if task["tier"] == "frontier" or not vision:
+            return Route(None, frontier, None) if frontier else None
+        if task["attempts"] >= lim["escalate_after"] and frontier:
+            return Route(None, frontier, None)
+        if state.mode == "endgame" and frontier and task["priority"] <= lim["hard_priority"]:
+            return Route(None, frontier, None)
+        return Route(None, vision, None)  # no planner or reviewer: they couldn't see the images
     if task["tier"] == "local":
-        return Route(None, local, None) if local and not kinds & attachments.CLAUDE_ONLY else None
-    if task["tier"] == "frontier" or kinds & attachments.CLAUDE_ONLY:  # only Claude sees them
+        return Route(None, local, None) if local else None
+    if task["tier"] == "frontier":
         return Route(None, frontier, None) if frontier else None
     if task["attempts"] >= lim["escalate_after"] and frontier:
         return Route(None, frontier, None)  # local kept failing: escalate

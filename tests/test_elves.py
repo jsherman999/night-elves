@@ -1,4 +1,4 @@
-import contextlib, html, io, json, os, subprocess, tempfile, threading, time, unittest
+import contextlib, html, io, json, os, shutil, subprocess, tempfile, threading, time, unittest
 import urllib.error, urllib.request
 from unittest import mock
 from datetime import date, datetime, timezone
@@ -687,6 +687,100 @@ class FileTests(Base):
         rows = db.list_tasks(db.connect(self.cfg["paths"]["db"]))
         self.assertEqual([(r["prompt"], len(attachments.files(r))) for r in rows],
                          [("no file", 0), ("0.4 shortcut", 1), ("make an app like this", 3)])
+
+def make_pdf(pages: int) -> bytes:
+    """A minimal valid PDF with a line of text on each page."""
+    objs = ["<< /Type /Catalog /Pages 2 0 R >>",
+            "<< /Type /Pages /Kids [%s] /Count %d >>" % (" ".join(f"{3 + 2 * i} 0 R" for i in range(pages)), pages)]
+    for i in range(pages):
+        objs.append(f"<< /Type /Page /Parent 2 0 R /MediaBox [0 0 612 792] /Contents {4 + 2 * i} 0 R "
+                    f"/Resources << /Font << /F1 {3 + 2 * pages} 0 R >> >> >>")
+        stream = f"BT /F1 24 Tf 72 700 Td (Page {i + 1}) Tj ET"
+        objs.append(f"<< /Length {len(stream)} >>\nstream\n{stream}\nendstream")
+    objs.append("<< /Type /Font /Subtype /Type1 /BaseFont /Helvetica >>")
+    out, offs = bytearray(b"%PDF-1.4\n"), []
+    for n, o in enumerate(objs, 1):
+        offs.append(len(out))
+        out += f"{n} 0 obj\n{o}\nendobj\n".encode()
+    x = len(out)
+    out += f"xref\n0 {len(objs) + 1}\n0000000000 65535 f \n".encode()
+    out += b"".join(f"{o:010d} 00000 n \n".encode() for o in offs)
+    out += f"trailer\n<< /Size {len(objs) + 1} /Root 1 0 R >>\nstartxref\n{x}\n%%EOF\n".encode()
+    return bytes(out)
+
+class LocalVisionTests(Base):
+    stage = FileTests.stage
+    def setUp(self):
+        super().setUp()
+        self.cfg["backends"]["local_vision"] = {"type": "openai_compat", "vision": True}
+        self.cfg["roles"]["local_vision"] = "local_vision"
+
+    def night(self, day, hour=2, **fakes):
+        return super().night(day, hour, local_vision=Fake("i see it"), **fakes)
+
+    def test_images_go_to_the_local_vision_model(self):
+        tid = self.add(("shot.png", PNG), tier="local")  # allowed now
+        self.night(18, hour=12).run()
+        v = self.fakes["local_vision"]
+        self.assertEqual([p.name for p in v.files], ["1-shot.png"])
+        self.assertEqual(self.fakes["claude_api"].calls, [])  # no planner or reviewer
+        self.assertEqual(db.get(self.conn, tid)["backend"], "local_vision")
+
+    def test_auto_prefers_local_vision_then_escalates(self):
+        tid = self.add(("shot.png", PNG))
+        db.update(self.conn, tid, attempts=2)
+        self.night(18, hour=12).run()
+        self.assertEqual(db.get(self.conn, tid)["backend"], "claude_api")
+        self.assertEqual(self.fakes["local_vision"].calls, [])
+
+    def test_frontier_and_endgame_still_use_claude(self):
+        a = self.add(("shot.png", PNG), tier="frontier")
+        b = self.add(("shot.png", PNG), priority=1)
+        self.night(28, hour=12).run()  # endgame: hard tasks go to Claude
+        self.assertEqual([db.get(self.conn, t)["backend"] for t in (a, b)], ["claude_api"] * 2)
+
+    def test_without_vision_backend_local_is_refused(self):
+        self.cfg["roles"]["local_vision"] = ""
+        with self.assertRaisesRegex(ValueError, "can't see images"):
+            self.add(("shot.png", PNG), tier="local", vision=False)
+
+    def add(self, *items, **kw):
+        kw.setdefault("vision", attachments.local_vision(self.cfg))
+        with self.stage(*items) as st:
+            return db.add_task(self.conn, kw.pop("prompt", "do it"), files=st.files,
+                               on_insert=st.commit, **kw)
+
+    def test_long_pdf_is_refused_for_local_and_goes_to_claude_on_auto(self):
+        files = [{"name": "1-a.pdf", "kind": "pdf", "size": 9, "pages": 40}]
+        with self.assertRaisesRegex(ValueError, "up to 20 pages"):
+            attachments.check_tier("local", files, vision=True)
+        attachments.check_tier("auto", files, vision=True)
+        self.assertFalse(attachments.local_can_see(files))
+        self.assertFalse(attachments.local_can_see([{"name": "x", "kind": "pdf", "pages": None}]))
+
+    @unittest.skipUnless(shutil.which("swiftc"), "needs macOS with swiftc")
+    def test_pdf_pages_are_counted_and_rendered(self):
+        tid = self.add(("doc.pdf", make_pdf(3)), tier="local")
+        t = db.get(self.conn, tid)
+        f = attachments.files(t)[0]
+        self.assertEqual((f["kind"], f["pages"]), ("pdf", 3))
+        self.night(18, hour=12).run()
+        v = self.fakes["local_vision"]
+        self.assertEqual([p.name for p in v.files], ["page-001.png", "page-002.png", "page-003.png"])
+        self.assertTrue(all(attachments.sniff(p.read_bytes()[:16]) == "png" for p in v.files))
+        self.assertIn("1-doc.pdf (3 pages, images 1-3)", v.calls[0][0])
+
+    def test_openai_backend_sends_data_urls(self):
+        from pathlib import Path
+        png = Path(self.tmp, "1.png")
+        png.write_bytes(PNG)
+        b = backends.OpenAICompat("v", {"model": "m", "base_url": "http://x/v1", "vision": True})
+        reply = {"choices": [{"message": {"content": "a dot"}}]}
+        with mock.patch.object(backends, "_post", return_value=reply) as post:
+            self.assertEqual(b.run("what", files=[png]).text, "a dot")
+        content = post.call_args[0][2]["messages"][0]["content"]
+        self.assertEqual(content[0], {"type": "text", "text": "what"})
+        self.assertTrue(content[1]["image_url"]["url"].startswith("data:image/png;base64,iVBOR"))
 
 class MarkdownTests(unittest.TestCase):
     def test_blocks(self):

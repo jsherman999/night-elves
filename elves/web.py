@@ -132,7 +132,7 @@ def act(cfg: dict, conn, tid: int, d: dict) -> str:
         fields["run_after"] = run_after(str(d["at"] or "").strip() or None)
     if not fields:
         raise ValueError("nothing to change")
-    db.change(conn, tid, **fields)
+    db.change(conn, tid, vision=attachments.local_vision(cfg), **fields)
     return f"Saved #{tid}"
 
 def task_json(t) -> dict:

@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "night-elves"
-version = "0.5.0"
+version = "0.6.0"
 description = "Queue tasks by day; local and frontier models work them overnight."
 readme = "README.md"
 requires-python = ">=3.11"
@@ -17,4 +17,4 @@ elf = "elves.cli:main"
 packages = ["elves"]
 
 [tool.setuptools.package-data]
-elves = ["icon.png"]
+elves = ["icon.png", "pdfpages.swift"]

@@ -206,11 +206,24 @@ Each file gets a kind when it arrives, and the kind decides who can work on it:
 | Kind | What | Who |
 |---|---|---|
 | text | UTF-8, up to 200 KB for all of a task's text files together | any tier: pasted into the prompt |
-| image | PNG, JPEG, GIF, WebP, HEIC (converted to JPEG; shrunk past 2048 px or 3.75 MB with `sips`) | Claude only: not `local` |
-| pdf | up to 30 MB | Claude only: not `local` |
+| image | PNG, JPEG, GIF, WebP, HEIC (converted to JPEG; shrunk past 2048 px or 3.75 MB with `sips`) | Claude, or the local vision model |
+| pdf | up to 30 MB | Claude, or the local vision model up to 20 pages |
 | data | anything else, or text past the 200 KB budget | `agent` only |
 
-So `auto` sends a task with images or PDFs to the frontier model, and a task
+**Local vision.** The general local model may not see images (gpt-oss-120b
+doesn't). Name a second local backend with `vision = true` in
+`roles.local_vision` (see `config.example.toml`) and images, plus PDFs of up
+to 20 pages, go to it: `local` uses it, and `auto` uses it first, like the
+local model for text, moving to Claude after two failed attempts or for
+priority 1-3 tasks in the endgame. There is no planner or reviewer for these,
+since they couldn't see the images. Images go as data URLs in the OpenAI
+format; PDF pages are rendered to PNG by `elves/pdfpages.swift`, which is
+compiled with `swiftc` the first time a PDF arrives (macOS with the Xcode
+command line tools) and also counts the pages at intake. Without a vision
+backend, `local` refuses images and PDFs and `auto` sends them to Claude.
+
+So without a local vision model, `auto` sends a task with images or PDFs to
+the frontier model; with one, it sends it there first. A task
 with data files has to be queued as `agent` (the agent tier stays opt-in, so
 it isn't chosen for you). The agent gets copies in `work/<id>/input/`, made
 with APFS clones so a big file isn't stored twice and the original stays

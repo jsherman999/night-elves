@@ -84,9 +84,10 @@ def login(error: str | None = None) -> str:
 
 TIER_HELP = {
     "auto": "Elves pick: usually the local model, with Claude planning and checking in the second "
-            "half of the billing cycle. Tasks that fail locally twice, or have images or PDFs, go "
-            "to Claude.",
-    "local": "Only the Studio's local model. Free, runs any time, text only (no images or PDFs).",
+            "half of the billing cycle. Images and PDFs go to the local vision model if there is "
+            "one, else Claude. Tasks that fail locally twice go to Claude.",
+    "local": "Only the Studio's local models. Free, runs any time. Images and PDFs of up to 20 "
+             "pages go to the local vision model, if one is set up.",
     "frontier": "Claude does the whole task, in the overnight window while tonight's allowance lasts.",
     "agent": "Claude Code with tools in a sandbox: runs commands, writes files, builds small apps, "
              "works through big data files. Overnight window only, a few per night.",
@@ -120,8 +121,8 @@ def home(rows, msg: str | None = None) -> str:
 <input name=at placeholder="run at (optional): 01:30, 2pm, 2026-11-20 07:05">
 <label for=files>Files or images (optional, up to {attachments.MAX_FILES})</label>
 <input id=files name=files type=file multiple>
-<p class=hint>Text files up to 200 KB work with any tier. Images and PDFs need Claude (not local).
-Bigger or other files need agent.</p>
+<p class=hint>Text files up to 200 KB work with any tier. Images and PDFs need Claude or the
+local vision model. Bigger or other kinds of files need agent.</p>
 <button>Queue it</button></form>
 {section("Running", running, "Nothing running.") if running else ""}
 {section("Waiting", waiting, "The queue is empty.")}

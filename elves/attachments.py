@@ -1,8 +1,10 @@
 """Files attached to a task, stored in attachments/<task id>/.
 
 Each file gets a kind when it arrives, which decides who can work on it:
-  image  PNG/JPEG/GIF/WebP/HEIC (HEIC converted, big ones shrunk): Claude only
-  pdf    up to 30 MB: Claude only (the API reads it; claude -p opens it)
+  image  PNG/JPEG/GIF/WebP/HEIC (HEIC converted, big ones shrunk): Claude, or a local
+         vision model when one is configured (roles.local_vision)
+  pdf    up to 30 MB: Claude (the API reads it; claude -p opens it), or the local vision
+         model for PDFs of up to LOCAL_PDF_PAGES pages, sent as page images
   text   UTF-8, up to INLINE_MAX for all of a task's text files together: pasted into the
          prompt, so any model can use it
   data   anything else, or text too big to paste: the agent tier only, which can run code on it
@@ -11,7 +13,7 @@ Names on disk are generated here: the position, then the upload's own name with 
 outside [A-Za-z0-9._-] replaced, e.g. 2-sales_2026.csv. Files are found by their index in the
 task's `files` list, so no path from a request is ever opened."""
 from __future__ import annotations
-import json, os, re, shutil, subprocess, tempfile
+import hashlib, json, os, re, shutil, subprocess, tempfile
 from pathlib import Path
 
 MAX_FILES = 20
@@ -19,8 +21,11 @@ MAX_EDGE = 2048                 # longer side of an image after normalising
 API_MAX_BYTES = 3_750_000       # keeps an image's base64 form under the API's 5 MB
 PDF_MAX = 30 * 1024 * 1024      # the API takes up to 32 MB per request
 INLINE_MAX = 200_000            # bytes of text pasted into a prompt, all files together
+LOCAL_PDF_PAGES = 20            # longest PDF the local vision model gets, as page images
+PAGE_EDGE = 1600                # pixels, longer side of a rendered PDF page
+PDF_TOOL = Path(__file__).with_name("pdfpages.swift")
 TYPES = {"png": "image/png", "jpg": "image/jpeg", "gif": "image/gif", "webp": "image/webp"}
-CLAUDE_ONLY = {"image", "pdf"}
+VISUAL = {"image", "pdf"}  # kinds a model has to see, not read as text
 
 def sniff(head: bytes) -> str | None:
     """The image type from a file's first bytes, or None. HEIC/HEIF (iPhone photos) is 'heic'."""
@@ -51,15 +56,33 @@ def paths(cfg: dict, task, only=None) -> list[Path]:
     return [task_dir(cfg, task["id"]) / f["name"] for f in files(task)
             if only is None or f["kind"] in only]
 
-def check_tier(tier: str | None, ks: set[str]) -> None:
-    """Raise ValueError if this tier can't work with files of these kinds."""
-    if tier is None:
+def local_vision(cfg: dict) -> bool:
+    """Whether a local model that can see images is configured."""
+    name = cfg["roles"].get("local_vision")
+    c = cfg["backends"].get(name) if name else None
+    return bool(c and c.get("enabled", True) and c.get("vision"))
+
+def local_can_see(fs: list[dict]) -> bool:
+    """Whether a local vision model can take all of these files' images and PDFs."""
+    return all(f["kind"] != "pdf" or (f.get("pages") or 0) and f["pages"] <= LOCAL_PDF_PAGES
+               for f in fs)
+
+def check_tier(tier: str | None, fs: list[dict], vision: bool = False) -> None:
+    """Raise ValueError if this tier can't work with these files. vision: a local vision
+    model is configured (local_vision(cfg))."""
+    ks = {f["kind"] for f in fs}
+    if tier is None or not ks:
         return
     if "data" in ks and tier != "agent":
         raise ValueError("big or non-text files need the agent tier, which can run code on "
                          "them (text files up to 200 KB in all work with any tier)")
-    if ks & CLAUDE_ONLY and tier == "local":
-        raise ValueError("the local model can't see images or PDFs; use auto, frontier or agent")
+    if ks & VISUAL and tier == "local":
+        if not vision:
+            raise ValueError("the local model can't see images or PDFs; use auto, frontier "
+                             "or agent")
+        if not local_can_see(fs):
+            raise ValueError(f"the local model takes PDFs of up to {LOCAL_PDF_PAGES} pages; "
+                             "use auto, frontier or agent")
 
 def size_label(n: int | None) -> str:
     if n is None:
@@ -105,6 +128,55 @@ def _normalise(p: Path, kind: str) -> Path:
     if out != p:
         p.unlink(missing_ok=True)
     return out
+
+def _pdf_tool(root: Path) -> Path | None:
+    """The PDF helper, compiled from pdfpages.swift on first use into attachments/.tools/.
+    None where it can't be built (not macOS, no Xcode command line tools)."""
+    src = PDF_TOOL.read_bytes()
+    exe = root / ".tools" / f"pdfpages-{hashlib.sha256(src).hexdigest()[:12]}"
+    if exe.is_file():
+        return exe
+    if not shutil.which("swiftc"):
+        return None
+    exe.parent.mkdir(parents=True, exist_ok=True)
+    tmp = exe.with_name(exe.name + f".{os.getpid()}")
+    try:
+        subprocess.run(["swiftc", "-O", str(PDF_TOOL), "-o", str(tmp)], check=True,
+                       capture_output=True, timeout=300)
+        tmp.rename(exe)
+        return exe
+    except (OSError, subprocess.SubprocessError):
+        tmp.unlink(missing_ok=True)
+        return None
+
+def pdf_page_count(root: Path, pdf: Path) -> int | None:
+    tool = _pdf_tool(root)
+    if not tool:
+        return None
+    try:
+        out = subprocess.run([str(tool), str(pdf)], capture_output=True, text=True,
+                             timeout=60, check=True).stdout
+        return int(out.split()[0])
+    except (OSError, subprocess.SubprocessError, ValueError, IndexError):
+        return None
+
+def pdf_pages(cfg: dict, task, f: dict) -> list[Path]:
+    """A PDF's pages as PNGs (cached in attachments/<id>/.pages/), for a local vision model."""
+    tdir = task_dir(cfg, task["id"])
+    out = tdir / ".pages" / f["name"]
+    want = min(f.get("pages") or LOCAL_PDF_PAGES, LOCAL_PDF_PAGES)
+    pages = sorted(out.glob("page-*.png"))
+    if len(pages) < want:
+        tool = _pdf_tool(Path(cfg["paths"]["attachments"]))
+        if not tool:
+            raise ValueError("can't render PDF pages here (needs macOS and swiftc)")
+        try:
+            subprocess.run([str(tool), str(tdir / f["name"]), str(out), str(want),
+                            str(PAGE_EDGE)], capture_output=True, timeout=600, check=True)
+        except (OSError, subprocess.SubprocessError) as e:
+            raise ValueError(f"couldn't render {f['name']}: {e}") from None
+        pages = sorted(out.glob("page-*.png"))
+    return pages[:want]
 
 def _is_text(p: Path) -> bool:
     try:
@@ -158,15 +230,19 @@ class Staged:
                 p.rename(dest)
                 dest, kind = _normalise(dest, img), "image"
             else:
+                pages = None
                 if head.startswith(b"%PDF-") and size <= PDF_MAX:
-                    kind = "pdf"
+                    kind, pages = "pdf", pdf_page_count(self.root, p)
                 elif size <= text_left and _is_text(p):
                     kind, text_left = "text", text_left - size
                 else:
                     kind = "data"
                 dest = self.dir / name
                 p.rename(dest)
-            self.files.append({"name": dest.name, "kind": kind, "size": dest.stat().st_size})
+            rec = {"name": dest.name, "kind": kind, "size": dest.stat().st_size}
+            if kind == "pdf":
+                rec["pages"] = pages
+            self.files.append(rec)
         for p, _ in self.incoming:
             p.unlink(missing_ok=True)
         return self.files
@@ -183,7 +259,7 @@ class Staged:
 def add_task(cfg: dict, conn, prompt: str, staged: Staged, **kw) -> int:
     """db.add_task with the staged files: the row and the folder appear together or not at all."""
     from . import db
-    return db.add_task(conn, prompt, files=staged.files,
+    return db.add_task(conn, prompt, files=staged.files, vision=local_vision(cfg),
                        on_insert=staged.commit if staged.files else None, **kw)
 
 def inline_text(cfg: dict, task) -> str:

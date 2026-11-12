@@ -62,12 +62,12 @@ def connect(path: str) -> sqlite3.Connection:
     return conn
 
 def add_task(conn, prompt: str, source="cli", priority=5, tier="auto", parent_id=None,
-             run_after: str | None = None, files=(), on_insert=None) -> int:
+             run_after: str | None = None, files=(), on_insert=None, vision=False) -> int:
     """on_insert(id) runs before the commit (attachments use it to move their files into
     place), so other connections never see the task without them. If it raises, nothing is
     added."""
     prompt = prompt.strip()
-    _check(prompt, priority, tier, {f["kind"] for f in files})
+    _check(prompt, priority, tier, list(files), vision)
     now = iso()
     try:
         cur = conn.execute(
@@ -89,26 +89,27 @@ def update(conn, task_id: int, **fields) -> None:
     conn.execute(f"UPDATE tasks SET {sets} WHERE id=?", (*fields.values(), task_id))
     conn.commit()
 
-def _check(prompt=None, priority=None, tier=None, kinds=frozenset()):
+def _check(prompt=None, priority=None, tier=None, files=(), vision=False):
+    """vision: a local vision model is configured, so the local tier can take images."""
     if prompt is not None and not prompt.strip():
         raise ValueError("empty prompt")
     if priority is not None and not 1 <= int(priority) <= 9:
         raise ValueError("priority must be 1-9")
     if tier is not None and tier not in TIERS:
         raise ValueError(f"tier must be one of {TIERS}")
-    if tier is not None and kinds:
+    if tier is not None and files:
         from .attachments import check_tier
-        check_tier(tier, kinds)
+        check_tier(tier, list(files), vision)
 
-def change(conn, task_id: int, allowed=EDITABLE, **fields) -> None:
+def change(conn, task_id: int, allowed=EDITABLE, vision=False, **fields) -> None:
     """Edit, cancel or requeue a task, but only while it is in one of the allowed states, so a
     task a run has already started is never changed underneath it. Raises LookupError or
     ValueError with a message fit to show the user."""
     t = get(conn, task_id)
     if t is None:
         raise LookupError(f"no task #{task_id}")
-    kinds = {f["kind"] for f in json.loads(t["files"] or "[]")}
-    _check(fields.get("prompt"), fields.get("priority"), fields.get("tier"), kinds)
+    _check(fields.get("prompt"), fields.get("priority"), fields.get("tier"),
+           json.loads(t["files"] or "[]"), vision)
     if "prompt" in fields:
         fields["prompt"] = fields["prompt"].strip()
     if "priority" in fields:

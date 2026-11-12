@@ -28,6 +28,14 @@ model = "your-local-model"
 max_tokens = 8192
 timeout = 3600
 
+[backends.local_vision]                  # optional: a local model that can see images, used
+type = "openai_compat"                    # for images and PDFs of up to 20 pages (as page
+base_url = "http://localhost:1234/v1"     # images) when roles.local_vision names it
+model = "your-vision-model"               # e.g. LM Studio's id for Qwen3.8-27B (MLX)
+vision = true
+max_tokens = 16384                        # thinking models spend part of this reasoning
+timeout = 3600
+
 [backends.claude_api]
 type = "anthropic_api"
 model = "claude-opus-5-5"
@@ -77,6 +85,7 @@ frontier_api = "claude_api"
 frontier_sub = "claude_cli"
 second_opinion = "codex"
 agent = "claude_agent"
+local_vision = ""            # "local_vision" to use the block above
 
 [web]
 host = "127.0.0.1"           # keep on loopback; publish through Tailscale or a tunnel

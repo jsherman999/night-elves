@@ -30,10 +30,25 @@ class OpenAICompat:
     def __init__(self, name, c):
         self.name, self.c = name, c
     def run(self, prompt, system=None, files=()) -> Result:
+        """files: images, sent as data URLs, if the backend has vision = true."""
+        content = prompt
         if files:
-            raise BackendError(f"{self.name}: this backend can't read images or PDFs")
+            if not self.c.get("vision"):
+                raise BackendError(f"{self.name}: this backend can't read images")
+            from .attachments import TYPES
+            content = [{"type": "text", "text": prompt}]
+            for p in files:
+                media = TYPES.get(p.suffix.lstrip(".").lower())
+                try:
+                    if not media:
+                        raise KeyError(p.suffix)
+                    data = base64.b64encode(p.read_bytes()).decode()
+                except (OSError, KeyError) as e:
+                    raise BackendError(f"{self.name}: can't attach {p.name}: {e}") from e
+                content.append({"type": "image_url",
+                                "image_url": {"url": f"data:{media};base64,{data}"}})
         msgs = ([{"role": "system", "content": system}] if system else []) + \
-               [{"role": "user", "content": prompt}]
+               [{"role": "user", "content": content}]
         key = os.environ.get(self.c.get("api_key_env", ""), "none")
         d = _post(self.c["base_url"].rstrip("/") + "/chat/completions",
                   {"Authorization": f"Bearer {key}"},

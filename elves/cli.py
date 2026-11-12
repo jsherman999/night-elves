@@ -110,7 +110,7 @@ def main(argv=None) -> int:
                 if not fields:
                     print("nothing to change; see elf edit --help", file=sys.stderr)
                     return 2
-                db.change(conn, args.id, **fields)
+                db.change(conn, args.id, vision=attachments.local_vision(cfg), **fields)
                 print(describe(db.get(conn, args.id)))
         except (LookupError, ValueError) as e:
             print(e, file=sys.stderr)

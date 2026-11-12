@@ -167,8 +167,25 @@ class Night:
                     "them with your tools; read big ones in parts or with code, not all at once):"
                     + attachments.listing(task, "input/"), cwd, [])
         prompt += attachments.inline_text(self.cfg, task)
-        seen = attachments.paths(self.cfg, task, attachments.CLAUDE_ONLY)
-        if seen and self.cfg["backends"].get(executor, {}).get("type") == "command":
+        seen = attachments.paths(self.cfg, task, attachments.VISUAL)
+        kind = self.cfg["backends"].get(executor, {}).get("type")
+        if seen and kind == "openai_compat":  # a local vision model: PDFs go as page images
+            send, notes = [], []
+            for f, p in zip(attachments.files(task), attachments.paths(self.cfg, task)):
+                if f["kind"] == "image":
+                    send.append(p)
+                elif f["kind"] == "pdf":
+                    try:
+                        pages = attachments.pdf_pages(self.cfg, task, f)
+                    except ValueError as e:
+                        raise BackendError(str(e)) from e
+                    notes.append(f"{f['name']} ({len(pages)} pages, images "
+                                 f"{len(send) + 1}-{len(send) + len(pages)})")
+                    send += pages
+            if notes:
+                prompt += "\n\nThe PDFs are attached as page images: " + "; ".join(notes) + "."
+            return prompt, cwd, send
+        if seen and kind == "command":
             return (prompt + "\n\nImages and PDFs attached to this task (open each one with the "
                     "Read tool before you start):" + "".join(f"\n- {p}" for p in seen),
                     attachments.task_dir(self.cfg, task["id"]), [])  # claude -p reads in its cwd

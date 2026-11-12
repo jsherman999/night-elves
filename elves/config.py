@@ -18,7 +18,8 @@ DEFAULTS = {
     },
     "limits": {"max_attempts": 3, "escalate_after": 2, "max_minutes": 360, "hard_priority": 3},
     "roles": {"local": "local", "frontier_api": "claude_api",
-              "frontier_sub": "claude_cli", "second_opinion": "codex", "agent": "claude_agent"},
+              "frontier_sub": "claude_cli", "second_opinion": "codex", "agent": "claude_agent",
+              "local_vision": ""},  # a local model that sees images, e.g. "local_vision"
     "backends": {},
     "web": {"host": "127.0.0.1", "port": 8377, "token_env": "ELVES_TOKEN", "sms_allow": [],
             "max_upload_mb": 2048,  # one task's files, sent through the web intake
