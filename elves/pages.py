@@ -1,8 +1,9 @@
 """HTML for the phone pages: sign-in, the queue, and one task. Everything shown is escaped here."""
 from __future__ import annotations
+import json
 from datetime import datetime
 from html import escape as e
-from . import db
+from . import attachments, db
 
 CSS = """
 :root{--bg:#f6f5f2;--card:#fff;--ink:#1d1d1f;--mute:#6b6b70;--line:#e3e1dc;--accent:#4b5bd6;
@@ -35,6 +36,11 @@ button.quiet{background:var(--off-bg);color:var(--ink)}button.danger{background:
 .err{color:var(--bad)}.mute{color:var(--mute);font-size:.9em}
 pre{white-space:pre-wrap;overflow-wrap:anywhere;font:13px/1.5 ui-monospace,Menlo,monospace;margin:0}
 label{font-size:.85em;color:var(--mute)}
+.hint{font-size:.85em;color:var(--mute);margin:.1em 0 .4em}
+input[type=file]{padding:7px 10px}
+.imgs{display:grid;grid-template-columns:repeat(auto-fill,minmax(120px,1fr));gap:8px;margin:.6em 0}
+.imgs img{width:100%;height:160px;object-fit:cover;object-position:top;border-radius:9px;
+border:1px solid var(--line);background:var(--card);display:block}
 """
 
 def page(title: str, body: str, msg: str | None = None) -> str:
@@ -62,11 +68,26 @@ def login(error: str | None = None) -> str:
 <button>Sign in</button></form>
 <p class=mute>This browser stays signed in for a year. Changing the token signs everyone out.</p>""")
 
-TIER_OPTS = ("auto", "local", "frontier", "agent")
+TIER_HELP = {
+    "auto": "Elves pick: usually the local model, with Claude planning and checking in the second "
+            "half of the billing cycle. Tasks that fail locally twice, or have images, go to Claude.",
+    "local": "Only the Studio's local model. Free, runs any time, text only (it can't see images).",
+    "frontier": "Claude does the whole task, in the overnight window while tonight's allowance lasts.",
+    "agent": "Claude Code with tools in a sandbox: runs commands, writes files, builds small apps. "
+             "Overnight window only, a few per night.",
+}
+TIER_OPTS = tuple(TIER_HELP)
+_TIER_JS = ("var h={" + ",".join(f"{t}:{json.dumps(v)}" for t, v in TIER_HELP.items()) + "};"
+            "document.getElementById('tierhelp').textContent=h[this.value]")
 
 def tier_select(current="auto") -> str:
-    return "<select name=tier id=tier>" + "".join(
-        f"<option{' selected' if t == current else ''}>{t}" for t in TIER_OPTS) + "</select>"
+    tip = e("\n".join(f"{t}: {v}" for t, v in TIER_HELP.items()))
+    return (f'<select name=tier id=tier title="{tip}" aria-describedby=tierhelp onchange="{e(_TIER_JS)}">'
+            + "".join(f"<option{' selected' if t == current else ''} title=\"{e(TIER_HELP[t])}\">{t}"
+                      for t in TIER_OPTS) + "</select>")
+
+def tier_help(current="auto") -> str:
+    return f"<p class=hint id=tierhelp>{e(TIER_HELP.get(current, ''))}</p>"
 
 def home(rows, msg: str | None = None) -> str:
     waiting = sorted((t for t in rows if t["status"] == "queued"),
@@ -77,10 +98,13 @@ def home(rows, msg: str | None = None) -> str:
         inner = "".join(row(t) for t in items) or f'<div class="row mute">{empty}</div>'
         return f"<h2>{name}</h2><div class='card list'>{inner}</div>"
     return page("Night Elves", f"""<h1>night-elves</h1>
-<form method=post action=/tasks class=card>
+<form method=post action=/tasks class=card enctype=multipart/form-data>
 <textarea name=prompt rows=4 placeholder="What should the elves do?" required></textarea>
 <div class=two>{tier_select()}<input name=priority type=number min=1 max=9 value=5 aria-label=priority></div>
+{tier_help()}
 <input name=at placeholder="run at (optional): 01:30, 2pm, 2026-11-20 07:05">
+<label for=images>Images (optional, up to {attachments.MAX_IMAGES})</label>
+<input id=images name=images type=file accept="image/*" multiple>
 <button>Queue it</button></form>
 {section("Running", running, "Nothing running.") if running else ""}
 {section("Waiting", waiting, "The queue is empty.")}
@@ -89,6 +113,8 @@ def home(rows, msg: str | None = None) -> str:
 
 def row(t) -> str:
     pri = f" · p{t['priority']}" if t["priority"] != 5 else ""
+    n = len(attachments.names(t))
+    pri += f" · {n} image{'s' if n > 1 else ''}" if n else ""
     return (f"<a class=row href=/t/{t['id']}><div class=top><b>#{t['id']}</b>"
             f"<span class='pill {e(t['status'])}'>{e(t['status'])}</span>"
             f"<span>{e(t['tier'])}{pri} · {e(when_text(t))}</span></div>"
@@ -108,6 +134,10 @@ def task(t, result: str | None, msg: str | None = None) -> str:
         head += f"<p><b>Runs {e(when_text(t))}</b></p>"
     if t["last_error"]:
         head += f"<p class=err>Last error: {e(t['last_error'])}</p>"
+    if imgs := attachments.names(t):
+        head += "<div class=imgs>" + "".join(
+            f"<a href=/t/{tid}/img/{i}><img src=/t/{tid}/img/{i} alt='image {i}' loading=lazy></a>"
+            for i in range(1, len(imgs) + 1)) + "</div>"
 
     def button(action, label, cls="", confirm=None):
         js = f" onclick=\"return confirm('{e(confirm)}')\"" if confirm else ""
@@ -123,6 +153,7 @@ def task(t, result: str | None, msg: str | None = None) -> str:
 <div class=two><div><label for=tier>Tier</label>{tier_select(t['tier'])}</div>
 <div><label for=priority>Priority (1 = first)</label>
 <input id=priority name=priority type=number min=1 max=9 value={t['priority']}></div></div>
+{tier_help(t['tier'])}
 <label for=at>Run at (empty = the nightly run)</label>
 <input id=at name=at value="{e(at)}" placeholder="01:30, 2pm, 2026-11-20 07:05">
 <button>Save changes</button></form>"""

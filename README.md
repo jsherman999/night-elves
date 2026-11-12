@@ -156,12 +156,50 @@ the token (HttpOnly, SameSite=Strict, Secure over HTTPS), so changing
 | Request | Does |
 |---|---|
 | `POST /tasks` `{"prompt", "priority", "tier", "at"}` | queue a task |
+| `POST /tasks` as `multipart/form-data`, same fields plus `images` files | queue a task with images |
 | `GET /tasks` | the latest 100 tasks |
-| `GET /tasks/<id>` | one task, with its result text |
+| `GET /tasks/<id>` | one task, with its result text and image names |
+| `GET /tasks/<id>/img/<n>` | its nth image (1-based) |
 | `POST /tasks/<id>` `{"action": "save", "prompt", "tier", "priority", "at"}` | edit it (`"at": ""` clears the time) |
 | `POST /tasks/<id>` `{"action": "now" \| "cancel" \| "retry"}` | run it within a minute, cancel it, requeue it |
 
 A change to a task a run has already started returns 409.
+
+### Images
+
+A task can carry up to 4 images: a screenshot to build something from, a photo
+of a whiteboard, an error dialog. Attach them with the form's image picker,
+`elf add -i shot.png "make a page like this"`, or from an iPhone with a
+share-sheet Shortcut:
+
+1. New Shortcut, turn on **Show in Share Sheet**, accepting **Images**.
+2. **Ask for Input** (text): "What should the elves do?"
+3. **Get Contents of URL**: `https://<studio>.ts.net/tasks`, method POST,
+   header `Authorization: Bearer <ELVES_TOKEN>`, request body **Form** with
+   `prompt` = the provided input, `tier` = `agent` (or `auto`), and `images` as
+   a **File** field set to the Shortcut Input.
+4. **Show Notification** with the `message` from the result.
+
+Then take a screenshot, tap it, Share > the Shortcut. With a bearer token the
+reply is JSON (`{"id", "message", ...}`); the browser form gets the queue page.
+
+What happens to them:
+
+- They are checked by their first bytes (PNG, JPEG, GIF, WebP, HEIC), stored as
+  `~/.night-elves/attachments/<id>/1.png`, 2..., and shown on the task's page.
+  File names from the upload are never used.
+- HEIC (iPhone photos) is converted to JPEG, and anything over 2048 px on the
+  long side or 3.75 MB is shrunk, with macOS's `sips`.
+- Only Claude can see them, so `auto` sends an image task to the frontier
+  model, and `local` is refused. `agent` is still opt-in: pick it when the
+  result should be files, such as an app built from the screenshot. The agent
+  gets copies in `work/<id>/input/`, and the frontier model gets them inline
+  through the API or, on the `claude -p` fallback, as files in the
+  attachments folder it runs in.
+- Uploads are capped at 20 MB each and 48 MB per request. A multipart upload
+  must carry the bearer header or the sign-in cookie; a token in the form body
+  isn't enough, so nobody can make the server read 48 MB without signing in.
+- SMS intake is text only.
 
 ### SMS intake
 

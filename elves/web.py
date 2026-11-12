@@ -1,14 +1,15 @@
 """Web and SMS intake, plus phone pages to see and change the queue."""
 from __future__ import annotations
-import hashlib, hmac, html, json, os, re, time
+import email.parser, email.policy, hashlib, hmac, html, json, os, re, time
 from datetime import datetime
 from http.cookies import SimpleCookie
 from pathlib import Path
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from urllib.parse import parse_qs, quote, urlparse
-from . import db, pages, policy, when
+from . import attachments, db, pages, policy, when
 
 MAX_BODY = 64 * 1024
+MAX_UPLOAD = 48 * 1024 * 1024  # a task with images, sent as multipart/form-data
 MAX_RESULT = 256 * 1024  # bytes of a result file shown on its page
 
 AT = re.compile(rf"^at\s+({when.CLOCK})(?:\s*(?:cst|cdt|ct))?\s*[:,]?\s+", re.I)
@@ -38,6 +39,7 @@ def queued_msg(tid: int, after: str | None) -> str:
 
 COOKIE = "elves"
 TASK_PATH = re.compile(r"^/(t|tasks)/(\d+)$")
+IMG_PATH = re.compile(r"^/(t|tasks)/(\d+)/img/(\d+)$")
 HTML = "text/html; charset=utf-8"
 ICON = Path(__file__).with_name("icon.png")  # source: assets/icon.svg
 ICON_PATHS = {"/icon.png", "/apple-touch-icon.png", "/apple-touch-icon-precomposed.png", "/favicon.ico"}
@@ -75,6 +77,9 @@ def act(cfg: dict, conn, tid: int, d: dict) -> str:
         raise ValueError("nothing to change")
     db.change(conn, tid, **fields)
     return f"Saved #{tid}"
+
+def task_json(t) -> dict:
+    return {**dict(t), "images": attachments.names(t)}
 
 def make_handler(cfg: dict, token: str):
     # The browser cookie is derived from the token, so changing the token signs every browser out.
@@ -132,10 +137,31 @@ def make_handler(cfg: dict, token: str):
             secure = "" if host in ("127.0.0.1", "localhost", "::1") else "; Secure"
             return f"{COOKIE}={value}; Path=/; Max-Age={max_age}; HttpOnly; SameSite=Strict{secure}"
 
+        def _multipart(self) -> bool:
+            return self.headers.get_content_type() == "multipart/form-data"
+
         def _body(self) -> dict:
+            """Form fields, a JSON object, or (POST /tasks only) multipart/form-data, where
+            the files of the `images` field come back as a list of bytes under "images"."""
             n = int(self.headers.get("Content-Length") or 0)
-            if n > MAX_BODY:
-                raise ValueError("body too large")
+            upload = self._multipart() and urlparse(self.path).path == "/tasks"
+            if n > (MAX_UPLOAD if upload else MAX_BODY):
+                raise ValueError("body too large" + (" (images too big)" if upload else ""))
+            if upload:
+                head = f"Content-Type: {self.headers['Content-Type']}\r\n\r\n".encode()
+                msg = email.parser.BytesParser(policy=email.policy.HTTP).parsebytes(
+                    head + self.rfile.read(n))
+                if not msg.is_multipart():
+                    raise ValueError("bad multipart body")
+                d: dict = {"images": []}
+                for part in msg.iter_parts():
+                    name = part.get_param("name", header="content-disposition")
+                    data = part.get_payload(decode=True) or b""
+                    if name == "images":
+                        d["images"].append(data)
+                    elif name:
+                        d[name] = data.decode(errors="replace")
+                return d
             raw = self.rfile.read(n).decode(errors="replace")
             if self._json():
                 d = json.loads(raw or "{}")
@@ -146,6 +172,21 @@ def make_handler(cfg: dict, token: str):
 
         def _json(self) -> bool:
             return "json" in self.headers.get("Content-Type", "")
+
+        def _wants_json(self) -> bool:
+            """Scripts and Shortcuts (JSON bodies, a bearer token, or Accept: JSON) get JSON;
+            browsers get redirects back to the pages."""
+            return (self._json() or "application/json" in self.headers.get("Accept", "")
+                    or self.headers.get("Authorization", "").startswith("Bearer "))
+
+        def _image(self, t, n: int):
+            files = attachments.paths(cfg, t)
+            if not 1 <= n <= len(files) or not files[n - 1].is_file():
+                return self._send(404, {"error": "no such image"})
+            p = files[n - 1]
+            return self._send(200, p.read_bytes(), attachments.TYPES[p.suffix.lstrip(".")],
+                              [("Cache-Control", "private, max-age=86400"),
+                               ("X-Content-Type-Options", "nosniff")])
 
         def _result(self, t) -> str | None:
             if not t["result_path"]:
@@ -161,7 +202,7 @@ def make_handler(cfg: dict, token: str):
         def do_GET(self):
             u = urlparse(self.path)
             msg = parse_qs(u.query).get("m", [None])[0]
-            m = TASK_PATH.match(u.path)
+            m = TASK_PATH.match(u.path) or IMG_PATH.match(u.path)
             if u.path in ICON_PATHS:  # no sign-in: iOS fetches it when adding to the Home Screen
                 return self._send(200, ICON.read_bytes(), "image/png",
                                   [("Cache-Control", "public, max-age=86400")])
@@ -184,18 +225,22 @@ def make_handler(cfg: dict, token: str):
             conn = db.connect(cfg["paths"]["db"])
             try:
                 if u.path == "/tasks":
-                    return self._send(200, [dict(r) for r in db.list_tasks(conn, limit=100)])
+                    return self._send(200, [task_json(r) for r in db.list_tasks(conn, limit=100)])
                 t = db.get(conn, int(m.group(2)))
                 if t is None:
                     return self._send(404, {"error": "no such task"})
+                if m.re is IMG_PATH:
+                    return self._image(t, int(m.group(3)))
                 if m.group(1) == "tasks":
-                    return self._send(200, {**dict(t), "result": self._result(t)})
+                    return self._send(200, {**task_json(t), "result": self._result(t)})
                 return self._send(200, pages.task(t, self._result(t), msg), HTML)
             finally:
                 conn.close()
 
         def do_POST(self):
             u = urlparse(self.path)
+            if self._multipart() and u.path == "/tasks" and not self._authed():
+                return self._send(401, {"error": "unauthorized"})  # before reading the upload
             try:
                 d = self._body()
             except ValueError as e:
@@ -218,16 +263,21 @@ def make_handler(cfg: dict, token: str):
                         if d.get("tier") not in (None, "", "auto"):
                             tier = d["tier"]
                         after = run_after(d.get("at") or at)
-                        tid = db.add_task(conn, text, source="web", tier=tier, run_after=after,
-                                          priority=int(d.get("priority") or priority))
+                        kw = dict(source="web", tier=tier, run_after=after,
+                                  priority=int(d.get("priority") or priority))
+                        blobs = [b for b in d.get("images") or [] if b]
+                        tid = (attachments.add_task(cfg, conn, text, blobs, **kw) if blobs
+                               else db.add_task(conn, text, **kw))
                     except ValueError as e:
-                        if self._json():
+                        if self._wants_json():
                             return self._send(400, {"error": str(e)})
                         return self._redirect("/?m=" + quote(f"Not queued: {e}"))
-                    if not self._json():
-                        return self._redirect("/?m=" + quote(queued_msg(tid, after)))
+                    msg = queued_msg(tid, after) + (f" with {len(blobs)} image"
+                                                    f"{'s' if len(blobs) > 1 else ''}" if blobs else "")
+                    if not self._wants_json():
+                        return self._redirect("/?m=" + quote(msg))
                     return self._send(201, {"id": tid, "status": "queued", "run_after": after,
-                                            "message": queued_msg(tid, after)})
+                                            "images": len(blobs), "message": msg})
                 if m and m.group(1) == "tasks":
                     if not self._authed(d.get("token")):
                         return self._send(401, {"error": "unauthorized"})
@@ -238,10 +288,10 @@ def make_handler(cfg: dict, token: str):
                         msg, code = str(e).strip("'\""), 404
                     except ValueError as e:
                         msg, code = str(e), 409 if "can't be changed" in str(e) else 400
-                    if not self._json():
+                    if not self._wants_json():
                         return self._redirect(f"/t/{tid}?m=" + quote(msg))
                     t = db.get(conn, tid)
-                    return self._send(code, {"message": msg, **({"task": dict(t)} if t else {})})
+                    return self._send(code, {"message": msg, **({"task": task_json(t)} if t else {})})
                 if u.path == "/sms":  # Twilio-style webhook: form fields From and Body
                     key = parse_qs(u.query).get("key", [None])[0]
                     if not self._token_ok(key) or d.get("From") not in cfg["web"]["sms_allow"]:

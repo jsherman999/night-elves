@@ -3,7 +3,7 @@ from __future__ import annotations
 import subprocess, time
 from datetime import datetime, timedelta
 from pathlib import Path
-from . import db, policy
+from . import attachments, db, policy
 from .backends import BackendError
 
 PLAN_SYS = ("You are planning work that a smaller model will carry out. Do not do the task. "
@@ -74,10 +74,10 @@ class Night:
         return name in self.backends and policy.available(
             name, self.cfg, self.conn, self.state(), self.period_start, self.now(), self.down)
 
-    def call(self, name, task_id, role, prompt, system, cwd=None):
+    def call(self, name, task_id, role, prompt, system, cwd=None, images=()):
+        kw = {k: v for k, v in (("cwd", cwd), ("images", images)) if v}
         try:
-            res = (self.backends[name].run(prompt, system, cwd=cwd) if cwd
-                   else self.backends[name].run(prompt, system))
+            res = self.backends[name].run(prompt, system, **kw)
         except BackendError:
             self.errors[name] = self.errors.get(name, 0) + 1
             if self.errors[name] >= DOWN_AFTER:
@@ -108,12 +108,20 @@ class Night:
             if task["feedback"]:
                 prompt += f"\n\nA previous attempt was rejected. Reviewer feedback:\n{task['feedback']}"
             db.update(self.conn, tid, status="running", backend=r.executor)
-            work = None
+            work, cwd, images = None, None, attachments.paths(self.cfg, task)
             if task["tier"] == "agent":
                 work = Path(self.cfg["paths"]["work"]) / str(tid)
                 work.mkdir(parents=True, exist_ok=True)
+                cwd = work
+            if images:
+                if missing := [p.name for p in images if not p.is_file()]:
+                    raise BackendError(f"attached image(s) missing: {', '.join(missing)}")
+                if work:  # the agent's file tools only reach its workspace
+                    images = attachments.copy_into(self.cfg, task, work / "input")
+                elif self.cfg["backends"].get(r.executor, {}).get("type") == "command":
+                    cwd = attachments.task_dir(self.cfg, tid)  # so claude -p can Read them
             answer = self.call(r.executor, tid, "execute", prompt, AGENT_SYS if work else EXEC_SYS,
-                               cwd=str(work) if work else None)
+                               cwd=str(cwd) if cwd else None, images=images)
             review = ""
             if r.reviewer and self.ok(r.reviewer):
                 db.update(self.conn, tid, status="review")
@@ -143,7 +151,11 @@ class Night:
             if names:
                 title = " ".join(task["prompt"].split())[:60]
                 files += "\n" + commit_workspace(work, f"Task {tid}: {title}") + "\n"
-        path.write_text(f"# Task {tid}\n\n{task['prompt']}\n\n## Result ({r.executor})\n\n{answer}\n"
+        attached = attachments.names(task)
+        if attached:
+            attached = f"Attached: {', '.join(attached)} (in {attachments.task_dir(self.cfg, tid)})\n\n"
+        path.write_text(f"# Task {tid}\n\n{task['prompt']}\n\n{attached or ''}"
+                        f"## Result ({r.executor})\n\n{answer}\n"
                         + files
                         + (f"\n## Review ({r.reviewer})\n\n{review}\n" if review else ""))
         db.update(self.conn, tid, status="done", result_path=str(path), last_error=None)

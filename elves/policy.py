@@ -89,8 +89,8 @@ def route(task, cfg: dict, state: State, ok) -> Route | None:
         agent = r.get("agent")
         return Route(None, agent, None) if agent and ok(agent) else None
     if task["tier"] == "local":
-        return Route(None, local, None) if local else None
-    if task["tier"] == "frontier":
+        return Route(None, local, None) if local and not task["images"] else None
+    if task["tier"] == "frontier" or task["images"]:  # only Claude can see the images
         return Route(None, frontier, None) if frontier else None
     if task["attempts"] >= lim["escalate_after"] and frontier:
         return Route(None, frontier, None)  # local kept failing: escalate

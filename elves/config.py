@@ -5,7 +5,8 @@ from pathlib import Path
 
 DEFAULTS = {
     "paths": {"db": "~/.night-elves/queue.db", "results": "~/.night-elves/results",
-              "work": "~/.night-elves/work"},  # agent-tier tasks each get work/<id>/
+              "work": "~/.night-elves/work",   # agent-tier tasks each get work/<id>/
+              "attachments": "~/.night-elves/attachments"},  # a task's images: attachments/<id>/
     "budget": {
         "monthly_credit_usd": 100.0,   # API credit that expires each cycle
         "cycle_day": 1,                # day of month the credit refreshes (1-28)
@@ -39,7 +40,7 @@ def find_config(path: str | None = None) -> Path | None:
 def load(path: str | None = None) -> dict:
     p = find_config(path)
     cfg = _merge(DEFAULTS, tomllib.loads(p.read_text()) if p else {})
-    for k in ("db", "results", "work"):
+    for k in ("db", "results", "work", "attachments"):
         cfg["paths"][k] = str(Path(cfg["paths"][k]).expanduser())
     day = cfg["budget"]["cycle_day"]
     if not 1 <= day <= 28:

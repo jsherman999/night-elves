@@ -1,18 +1,18 @@
-import contextlib, io, json, os, subprocess, tempfile, threading, time, unittest
+import contextlib, html, io, json, os, subprocess, tempfile, threading, time, unittest
 import urllib.error, urllib.request
 from unittest import mock
 from datetime import date, datetime, timezone
 from http.server import ThreadingHTTPServer
-from elves import cli, config, db, notify, policy, web, when
+from elves import attachments, backends, cli, config, db, notify, pages, policy, web, when
 from elves.backends import BackendError, Command, Result
 from elves.dispatcher import Night, passed
 
 class Fake:
     def __init__(self, reply="ok", usd=0.0, fail=0):
         self.reply, self.usd, self.fail, self.calls = reply, usd, fail, []
-    def run(self, prompt, system=None, cwd=None):
+    def run(self, prompt, system=None, cwd=None, images=()):
         self.calls.append((prompt, system))
-        self.cwd = cwd
+        self.cwd, self.images = cwd, list(images)
         if self.fail:
             self.fail -= 1
             raise BackendError("boom")
@@ -21,7 +21,8 @@ class Fake:
 
 def make_cfg(tmp):
     cfg = config.load("/nonexistent")
-    cfg["paths"] = {"db": ":memory:", "results": tmp, "work": os.path.join(tmp, "work")}
+    cfg["paths"] = {"db": ":memory:", "results": tmp, "work": os.path.join(tmp, "work"),
+                    "attachments": os.path.join(tmp, "att")}
     cfg["backends"] = {
         "local": {"type": "openai_compat"},
         "claude_api": {"type": "anthropic_api"},
@@ -433,6 +434,7 @@ class MiscTests(Base):
         self.assertIn("default-src 'none'", h["Content-Security-Policy"])
         self.assertIn("finished &lt;b&gt;thing&lt;/b&gt;", page)
         self.assertIn(f"href=/t/{waiting}", page)
+        self.assertIn(f"id=tierhelp>{html.escape(pages.TIER_HELP['auto'])}<", page)
         page = call(f"/t/{done}", headers=me)[1]
         self.assertIn("# the answer &lt;script&gt;", page)
         self.assertNotIn("localhost", call(f"/t/{done + 1}", headers=me)[1])  # outside results/
@@ -463,3 +465,144 @@ class MiscTests(Base):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+PNG = (b"\x89PNG\r\n\x1a\n\x00\x00\x00\rIHDR\x00\x00\x00\x01\x00\x00\x00\x01\x08\x06\x00\x00"
+       b"\x00\x1f\x15\xc4\x89\x00\x00\x00\rIDATx\x9cc\xf8\xff\xff?\x00\x05\xfe\x02\xfe\xa75\x81"
+       b"\x84\x00\x00\x00\x00IEND\xaeB`\x82")  # 1x1
+
+def multipart(fields: dict, files: list[bytes]) -> tuple[bytes, str]:
+    b = "XyZboundary"
+    out = b"".join(f'--{b}\r\nContent-Disposition: form-data; name="{k}"\r\n\r\n{v}\r\n'.encode()
+                   for k, v in fields.items())
+    for i, data in enumerate(files):
+        out += (f'--{b}\r\nContent-Disposition: form-data; name="images"; filename="s{i}.png"\r\n'
+                f"Content-Type: image/png\r\n\r\n").encode() + data + b"\r\n"
+    return out + f"--{b}--\r\n".encode(), f"multipart/form-data; boundary={b}"
+
+class ImageTests(Base):
+    def test_sniff(self):
+        self.assertEqual(attachments.sniff(PNG), "png")
+        self.assertEqual(attachments.sniff(b"\xff\xd8\xff\xe0rest"), "jpg")
+        self.assertEqual(attachments.sniff(b"\x00\x00\x00\x18ftypheic...."), "heic")
+        self.assertIsNone(attachments.sniff(b"<html>"))
+
+    def test_add_stores_images_and_refuses_local(self):
+        tid = attachments.add_task(self.cfg, self.conn, "make this", [PNG, PNG])
+        t = db.get(self.conn, tid)
+        self.assertEqual(attachments.names(t), ["1.png", "2.png"])
+        self.assertTrue(all(p.read_bytes() == PNG for p in attachments.paths(self.cfg, t)))
+        with self.assertRaisesRegex(ValueError, "local model"):
+            db.change(self.conn, tid, tier="local")
+        with self.assertRaisesRegex(ValueError, "local model"):
+            attachments.add_task(self.cfg, self.conn, "x", [PNG], tier="local")
+        with self.assertRaisesRegex(ValueError, "isn't a PNG"):
+            attachments.add_task(self.cfg, self.conn, "x", [b"not an image"])
+        with self.assertRaisesRegex(ValueError, "at most"):
+            attachments.add_task(self.cfg, self.conn, "x", [PNG] * 5)
+        self.assertEqual(len(db.list_tasks(self.conn)), 1)
+        self.assertEqual(sorted(os.listdir(self.cfg["paths"]["attachments"])), [str(tid)])  # no strays
+
+    def test_failed_move_adds_nothing(self):
+        def boom(tid):
+            raise OSError("disk full")
+        with self.assertRaises(OSError):
+            db.add_task(self.conn, "x", images=["1.png"], on_insert=boom)
+        self.assertEqual(db.list_tasks(self.conn), [])
+
+    def test_auto_with_images_goes_to_claude_api(self):
+        tid = attachments.add_task(self.cfg, self.conn, "what is this", [PNG])
+        n = self.night(5, hour=12)  # conserve mode would normally stay local
+        self.assertEqual(n.run()["done"], 1)
+        api = self.fakes["claude_api"]
+        self.assertEqual(self.fakes["local"].calls, [])
+        self.assertEqual([p.name for p in api.images], ["1.png"])
+        self.assertIn("1.png", open(db.get(self.conn, tid)["result_path"]).read())
+
+    def test_cli_fallback_runs_in_the_image_folder(self):
+        tid = attachments.add_task(self.cfg, self.conn, "what is this", [PNG], tier="frontier")
+        self.cfg["budget"]["conserve_night_cap_usd"] = 0  # no API allowance tonight
+        n = self.night(5, hour=2)
+        self.assertEqual(n.run()["done"], 1)
+        cli_ = self.fakes["claude_cli"]
+        self.assertEqual(cli_.cwd, os.path.join(self.cfg["paths"]["attachments"], str(tid)))
+
+    def test_agent_gets_copies_in_its_workspace(self):
+        self.cfg["backends"]["claude_agent"] = {"type": "command", "argv": ["x"], "window": [1, 5]}
+        tid = attachments.add_task(self.cfg, self.conn, "build this", [PNG], tier="agent")
+        agent = Fake("built")
+        self.night(18, hour=2, claude_agent=agent).run()
+        work = os.path.join(self.tmp, "work", str(tid))
+        self.assertEqual([str(p) for p in agent.images], [os.path.join(work, "input", "1.png")])
+        self.assertTrue(os.path.isfile(os.path.join(work, "input", "1.png")))
+
+    def test_missing_image_is_an_error_not_a_blind_answer(self):
+        tid = attachments.add_task(self.cfg, self.conn, "what is this", [PNG])
+        os.remove(attachments.paths(self.cfg, db.get(self.conn, tid))[0])
+        self.night(18, hour=12).run()
+        self.assertIn("missing", db.get(self.conn, tid)["last_error"])
+
+    def test_backends_attach_images(self):
+        p = os.path.join(self.tmp, "1.png")
+        open(p, "wb").write(PNG)
+        from pathlib import Path
+        api = backends.AnthropicAPI("claude_api", {"model": "m"})
+        with mock.patch.dict(os.environ, {"ANTHROPIC_API_KEY": "k"}), \
+             mock.patch.object(backends, "_post", return_value={"content": [{"type": "text", "text": "a cat"}]}) as post:
+            self.assertEqual(api.run("describe", images=[Path(p)]).text, "a cat")
+        content = post.call_args[0][2]["messages"][0]["content"]
+        self.assertEqual(content[0]["source"]["media_type"], "image/png")
+        self.assertEqual(content[-1], {"type": "text", "text": "describe"})
+        with self.assertRaises(BackendError):
+            backends.OpenAICompat("local", {"model": "m", "base_url": "x"}).run("x", images=[Path(p)])
+        cmd = backends.Command("c", {"argv": ["cat"]})
+        self.assertIn(p, cmd.run("look", images=[Path(p)]).text)
+
+    def test_web_upload_and_view(self):
+        self.cfg["paths"]["db"] = os.path.join(self.tmp, "q.db")
+        srv = ThreadingHTTPServer(("127.0.0.1", 0), web.make_handler(self.cfg, "s3cret-token-123456"))
+        threading.Thread(target=srv.serve_forever, daemon=True).start()
+        base = f"http://127.0.0.1:{srv.server_port}"
+        class NoRedirect(urllib.request.HTTPRedirectHandler):
+            def redirect_request(self, *a, **k):
+                return None
+        opener = urllib.request.build_opener(NoRedirect)
+        def call(path, data=None, headers=None):
+            req = urllib.request.Request(base + path, data=data, headers=headers or {})
+            try:
+                with opener.open(req) as r:
+                    return r.status, r.read(), r.headers
+            except urllib.error.HTTPError as e:
+                return e.code, e.read(), e.headers
+        body, ctype = multipart({"prompt": "make an app like this", "tier": "agent"}, [PNG])
+        self.assertEqual(call("/tasks", body, {"Content-Type": ctype})[0], 401)
+        bearer = {"Authorization": "Bearer s3cret-token-123456"}
+        code, out, _ = call("/tasks", body, {"Content-Type": ctype, **bearer})  # a Shortcut
+        self.assertEqual(code, 201)
+        self.assertEqual(json.loads(out)["images"], 1)
+        bad, ctype2 = multipart({"prompt": "x"}, [b"#!/bin/sh"])
+        code, out, _ = call("/tasks", bad, {"Content-Type": ctype2, **bearer})
+        self.assertEqual(code, 400)
+        local, ctype3 = multipart({"prompt": "x", "tier": "local"}, [PNG])
+        self.assertEqual(call("/tasks", local, {"Content-Type": ctype3, **bearer})[0], 400)
+        cookie = call("/login", b"token=s3cret-token-123456",
+                      {"Content-Type": "application/x-www-form-urlencoded"})[2]["Set-Cookie"].split(";")[0]
+        me = {"Cookie": cookie}
+        code, _, h = call("/tasks", body, {"Content-Type": ctype, **me, "Origin": base})  # the form
+        self.assertEqual((code, h["Location"][:12]), (303, "/?m=Queued%2"))
+        empty, ctype4 = multipart({"prompt": "no picture"}, [b""])  # form sent with no file chosen
+        self.assertEqual(call("/tasks", empty, {"Content-Type": ctype4, **me})[0], 303)
+        page = call("/t/1", headers=me)[1].decode()
+        self.assertIn("<img src=/t/1/img/1", page)
+        self.assertIn("1 image", call("/", headers=me)[1].decode())
+        code, img, h = call("/t/1/img/1", headers=me)
+        self.assertEqual((code, img, h["Content-Type"]), (200, PNG, "image/png"))
+        self.assertEqual(call("/t/1/img/1")[0], 303)  # not signed in
+        self.assertEqual(call("/t/1/img/2", headers=me)[0], 404)
+        self.assertEqual(call("/tasks/1/img/1", headers=bearer)[0], 200)
+        self.assertEqual(json.loads(call("/tasks/1", headers=bearer)[1])["images"], ["1.png"])
+        srv.shutdown()
+        rows = db.list_tasks(db.connect(self.cfg["paths"]["db"]))
+        self.assertEqual([(r["prompt"], r["tier"], bool(r["images"])) for r in rows],
+                         [("no picture", "auto", False), ("make an app like this", "agent", True),
+                          ("make an app like this", "agent", True)])

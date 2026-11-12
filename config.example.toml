@@ -4,6 +4,7 @@
 db = "~/.night-elves/queue.db"
 results = "~/.night-elves/results"
 work = "~/.night-elves/work"     # agent-tier workspaces, one folder per task
+attachments = "~/.night-elves/attachments"  # images sent with a task, one folder per task
 
 [budget]
 monthly_credit_usd = 100.0   # Claude Max 5x API credit; expires at the end of each cycle

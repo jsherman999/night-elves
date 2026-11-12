@@ -2,7 +2,7 @@
 from __future__ import annotations
 import argparse, sys
 from datetime import datetime
-from . import backends, config, db, notify, policy, when
+from . import attachments, backends, config, db, notify, policy, when
 from .dispatcher import Night
 
 def describe(t) -> str:
@@ -20,6 +20,8 @@ def main(argv=None) -> int:
     a.add_argument("-t", "--tier", choices=db.TIERS, default="auto")
     a.add_argument("--source", default="cli")
     a.add_argument("--at", help="not before this local time: 01:30, 2pm, or 2026-11-12 01:30")
+    a.add_argument("-i", "--image", action="append", default=[], metavar="FILE",
+                   help=f"attach an image (repeatable, up to {attachments.MAX_IMAGES})")
     l = sub.add_parser("list", help="show recent tasks")
     l.add_argument("-s", "--status")
     s = sub.add_parser("show", help="show one task and its result")
@@ -59,11 +61,17 @@ def main(argv=None) -> int:
         text = sys.stdin.read() if args.prompt == ["-"] else " ".join(args.prompt)
         try:
             after = db.iso(when.parse_at(args.at, now)) if args.at else None
-        except ValueError as e:
+            kw = dict(source=args.source, priority=args.priority, tier=args.tier, run_after=after)
+            if args.image:
+                blobs = [open(f, "rb").read() for f in args.image]
+                tid = attachments.add_task(cfg, conn, text, blobs, **kw)
+            else:
+                tid = db.add_task(conn, text, **kw)
+        except (OSError, ValueError) as e:
             print(e, file=sys.stderr)
             return 2
-        tid = db.add_task(conn, text, args.source, args.priority, args.tier, run_after=after)
-        print(f"queued #{tid}" + (f" for {when.label(after)}" if after else ""))
+        print(f"queued #{tid}" + (f" for {when.label(after)}" if after else "")
+              + (f" with {len(args.image)} image(s)" if args.image else ""))
     elif args.cmd == "list":
         for t in db.list_tasks(conn, args.status):
             print(describe(t))

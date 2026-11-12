@@ -1,6 +1,6 @@
 """Model backends. Each one takes a prompt and returns a Result."""
 from __future__ import annotations
-import json, os, signal, subprocess, urllib.request
+import base64, json, os, signal, subprocess, urllib.request
 from dataclasses import dataclass
 
 class BackendError(RuntimeError):
@@ -29,7 +29,9 @@ class OpenAICompat:
     """Any OpenAI-compatible server: Ollama, LM Studio, mlx_lm.server, llama.cpp."""
     def __init__(self, name, c):
         self.name, self.c = name, c
-    def run(self, prompt, system=None) -> Result:
+    def run(self, prompt, system=None, images=()) -> Result:
+        if images:
+            raise BackendError(f"{self.name}: this backend doesn't take images")
         msgs = ([{"role": "system", "content": system}] if system else []) + \
                [{"role": "user", "content": prompt}]
         key = os.environ.get(self.c.get("api_key_env", ""), "none")
@@ -49,12 +51,22 @@ class AnthropicAPI:
     """Claude API with a Console key; this is what spends the monthly API credit."""
     def __init__(self, name, c):
         self.name, self.c = name, c
-    def run(self, prompt, system=None) -> Result:
+    def run(self, prompt, system=None, images=()) -> Result:
         key = os.environ.get(self.c.get("api_key_env", "ANTHROPIC_API_KEY"))
         if not key:
             raise BackendError(f"{self.name}: API key env var is not set")
+        content = prompt
+        if images:
+            from .attachments import TYPES
+            try:
+                content = [{"type": "image", "source": {
+                    "type": "base64", "media_type": TYPES[p.suffix.lstrip(".")],
+                    "data": base64.b64encode(p.read_bytes()).decode()}} for p in images]
+            except (OSError, KeyError) as e:
+                raise BackendError(f"{self.name}: can't attach image: {e}") from e
+            content.append({"type": "text", "text": prompt})
         body = {"model": self.c["model"], "max_tokens": self.c.get("max_tokens", 4096),
-                "messages": [{"role": "user", "content": prompt}]}
+                "messages": [{"role": "user", "content": content}]}
         if system:
             body["system"] = system
         d = _post("https://api.anthropic.com/v1/messages",
@@ -76,7 +88,12 @@ class Command:
     It runs in its own process group, so a timeout also kills anything it started."""
     def __init__(self, name, c):
         self.name, self.c = name, c
-    def run(self, prompt, system=None, cwd=None) -> Result:
+    def run(self, prompt, system=None, cwd=None, images=()) -> Result:
+        """images must be inside cwd (Claude Code reads files there without asking)."""
+        if images:
+            listing = "\n".join(f"- {p}" for p in images)
+            prompt += ("\n\nImages attached to this task (look at each one with the Read tool "
+                       f"before you start):\n{listing}")
         full = f"{system}\n\n{prompt}" if system else prompt
         argv = [os.path.expanduser(a) if a.startswith("~/") else a for a in self.c["argv"]]
         as_arg = any("{prompt}" in a for a in argv)
