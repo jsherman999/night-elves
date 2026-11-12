@@ -69,7 +69,9 @@ class AnthropicAPI:
 class Command:
     """A CLI that takes a prompt and prints an answer: `claude -p`, `codex exec`, `hermes`.
     Put "{prompt}" in argv to pass the prompt as an argument; otherwise it goes on stdin.
-    Runs without a shell. Flat-rate tools record $0 and are limited by runs per night."""
+    Runs without a shell. Flat-rate tools record $0 and are limited by runs per night.
+    Variables in env_unset are removed first: with ANTHROPIC_API_KEY set, `claude -p` bills the
+    API instead of the subscription, and the ledger would record that spend as $0."""
     def __init__(self, name, c):
         self.name, self.c = name, c
     def run(self, prompt, system=None) -> Result:
@@ -77,9 +79,11 @@ class Command:
         argv = list(self.c["argv"])
         as_arg = any("{prompt}" in a for a in argv)
         argv = [a.replace("{prompt}", full) for a in argv]
+        drop = set(self.c.get("env_unset", ["ANTHROPIC_API_KEY"]))
+        env = {k: v for k, v in os.environ.items() if k not in drop}
         try:
             p = subprocess.run(argv, input=None if as_arg else full, capture_output=True,
-                               text=True, timeout=self.c.get("timeout", 1800))
+                               text=True, timeout=self.c.get("timeout", 1800), env=env)
         except (OSError, subprocess.TimeoutExpired) as e:
             raise BackendError(f"{self.name}: {e}") from e
         if p.returncode != 0:

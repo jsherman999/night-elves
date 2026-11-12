@@ -1,4 +1,5 @@
 import json, os, tempfile, threading, unittest, urllib.error, urllib.request
+from unittest import mock
 from datetime import date, datetime, timezone
 from http.server import ThreadingHTTPServer
 from elves import config, db, notify, policy, web
@@ -116,13 +117,20 @@ class DispatchTests(Base):
         stats = self.night(18, hour=12, claude_api=Fake("answer", usd=0.6)).run()
         self.assertEqual((stats["done"], stats["skipped"]), (2, 2))
 
-    def test_errors_fail_task_and_mark_backend_down(self):
-        a = db.add_task(self.conn, "a", tier="local")
-        b = db.add_task(self.conn, "b", tier="local")
-        stats = self.night(5, hour=12, local=Fake(fail=99)).run()
-        self.assertEqual(db.get(self.conn, a)["status"], "failed")
-        self.assertEqual(db.get(self.conn, b)["status"], "queued")  # backend down, left for later
-        self.assertEqual(stats["failed"], 1)
+    def test_outage_costs_one_attempt_per_run_and_marks_backend_down(self):
+        ids = [db.add_task(self.conn, t, tier="local") for t in "abcd"]
+        n = self.night(5, hour=12, local=Fake(fail=99))
+        stats = n.run()
+        self.assertEqual([db.get(self.conn, i)["attempts"] for i in ids], [1, 1, 1, 0])
+        self.assertTrue(all(db.get(self.conn, i)["status"] == "queued" for i in ids))
+        self.assertIn("local", n.down)
+        self.assertEqual((stats["retried"], stats["failed"]), (3, 0))
+
+    def test_errors_fail_task_after_max_attempts(self):
+        tid = db.add_task(self.conn, "a", tier="local")
+        db.update(self.conn, tid, attempts=2)
+        stats = self.night(5, hour=12, local=Fake(fail=1)).run()
+        self.assertEqual((db.get(self.conn, tid)["status"], stats["failed"]), ("failed", 1))
 
     def test_stale_tasks_requeued_and_digest(self):
         tid = db.add_task(self.conn, "interrupted")
@@ -143,6 +151,12 @@ class MiscTests(Base):
         self.assertEqual(Command("c", {"argv": ["cat"]}).run("via stdin", "sys").text, "sys\n\nvia stdin")
         with self.assertRaises(BackendError):
             Command("f", {"argv": ["false"]}).run("x")
+
+    def test_command_backend_drops_api_key(self):
+        sh = ["sh", "-c", 'echo "${ANTHROPIC_API_KEY:-unset} ${ELVES_KEEP:-unset}"']
+        with mock.patch.dict(os.environ, ANTHROPIC_API_KEY="sk-test", ELVES_KEEP="kept"):
+            self.assertEqual(Command("c", {"argv": sh}).run("x").text, "unset kept")
+            self.assertEqual(Command("c", {"argv": sh, "env_unset": []}).run("x").text, "sk-test kept")
 
     def test_parse_inline(self):
         self.assertEqual(web.parse_inline("! opus: fix it"), ("fix it", 1, "frontier"))

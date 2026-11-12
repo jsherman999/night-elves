@@ -35,15 +35,19 @@ In every mode:
   it falls back to `claude -p`, which only runs inside its time window and up
   to its nightly run cap, so the subscription is fresh in the morning.
 - Tonight's allowance is `remaining / days_left * burst`, capped per night.
-- Three failed attempts mark a task `failed`. A backend that errors three
-  times in a row is skipped for the rest of the run.
+- Three failed attempts mark a task `failed`. A reviewer rejection is retried
+  the same night with the feedback attached. A backend error costs the task one
+  attempt and holds it until the next run, so an outage can't fail a task
+  outright. A backend that errors three times in a row is skipped for the rest
+  of the run.
 
 ## Install
 
 ```sh
 brew install python            # macOS ships an older Python
 git clone https://github.com/jsherman999/night-elves && cd night-elves
-pip install -e .               # or: pipx install .
+brew install pipx && pipx ensurepath
+pipx install --editable .      # elf goes in ~/.local/bin; Homebrew Python refuses a plain pip install
 mkdir -p ~/.night-elves && cp config.example.toml ~/.night-elves/config.toml
 ```
 
@@ -87,6 +91,11 @@ launchctl load ~/Library/LaunchAgents/com.nightelves.nightly.plist
 It runs at 01:00 through `scripts/nightly.sh`, which loads the env file and
 wraps the run in `caffeinate` so the Mac stays awake. Adjust the clone path in
 the plist if the repo is not in `~/night-elves`.
+
+`caffeinate` only holds the Mac awake once the run has started. If the Mac
+sleeps, launchd runs the job when it next wakes, so either stop it sleeping on
+power (`sudo pmset -c sleep 0`) or wake it just before the run
+(`sudo pmset repeat wakeorpoweron MTWRFSU 00:55:00`).
 
 ### Web intake
 
@@ -134,6 +143,10 @@ argv = ["osascript", "-e", "on run a", "-e",
 
 A `command` backend passes the prompt as an argument where `{prompt}` appears
 in `argv`, or on stdin if it does not. Nothing goes through a shell.
+`ANTHROPIC_API_KEY` is removed from its environment, because `claude -p` bills
+the API key instead of your subscription when the key is set, and the ledger
+would record that spend as $0. Set `env_unset` on the backend to change the
+list.
 
 ## Limits to know about
 

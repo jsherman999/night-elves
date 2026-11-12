@@ -42,6 +42,8 @@ argv = ["claude", "-p", "{prompt}"]
 window = [1, 5]                           # local hours it may run: 01:00 up to 05:00
 max_runs_per_night = 5
 timeout = 1800
+# env_unset = ["ANTHROPIC_API_KEY"]       # the default for command backends: keeps `claude -p` on
+                                          # the subscription instead of billing the API key
 
 [backends.codex]                          # ChatGPT plan via Codex CLI, as a second-opinion reviewer
 type = "command"

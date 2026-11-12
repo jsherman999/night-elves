@@ -24,6 +24,7 @@ class Night:
         self.run_start = db.iso(self.now())
         self.errors: dict[str, int] = {}
         self.down: set[str] = set()
+        self.held: set[int] = set()  # hit a backend error; wait for the next run
         self.stats = {"done": 0, "failed": 0, "retried": 0, "skipped": 0}
 
     def state(self):
@@ -74,6 +75,9 @@ class Night:
                 if not passed(review):
                     return self._retry(task, feedback=review, error="rejected by reviewer")
         except BackendError as e:
+            # One error attempt per run, so an outage can't use up every attempt in seconds.
+            # Reviewer rejections above retry straight away, carrying the feedback.
+            self.held.add(tid)
             return self._retry(task, error=str(e))
         out = Path(self.cfg["paths"]["results"])
         out.mkdir(parents=True, exist_ok=True)
@@ -101,7 +105,7 @@ class Night:
         skipped: list[int] = []
         handled = 0
         while time.monotonic() < deadline and (max_tasks is None or handled < max_tasks):
-            task = db.next_task(self.conn, skipped)
+            task = db.next_task(self.conn, [*skipped, *self.held])
             if task is None:
                 break
             outcome = self.process(task)
