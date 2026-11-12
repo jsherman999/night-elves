@@ -1,0 +1,12 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+  <key>Label</key><string>com.nightelves.due</string>
+  <key>ProgramArguments</key>
+  <array><string>/Users/YOU/night-elves/scripts/nightly.sh</string><string>--due-only</string></array>
+  <key>StartInterval</key><integer>60</integer>
+  <key>StandardOutPath</key><string>/Users/YOU/.night-elves/due.log</string>
+  <key>StandardErrorPath</key><string>/Users/YOU/.night-elves/due.log</string>
+</dict>
+</plist>

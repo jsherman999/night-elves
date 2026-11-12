@@ -23,10 +23,10 @@ def digest(cfg, conn, since: str, now: datetime | None = None) -> str:
                  f"${st.credit:.0f} this cycle, {st.days_left}d left ({st.mode})")
     return "\n".join(lines)
 
-def send(cfg, text: str) -> None:
+def send(cfg, text: str, name: str | None = None) -> None:
     out = Path(cfg["paths"]["results"])
     out.mkdir(parents=True, exist_ok=True)
-    (out / f"digest-{datetime.now():%Y-%m-%d}.txt").write_text(text + "\n")
+    (out / f"{name or f'digest-{datetime.now():%Y-%m-%d}'}.txt").write_text(text + "\n")
     argv = cfg["notify"].get("argv") or []
     if not argv:
         return

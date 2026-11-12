@@ -72,6 +72,7 @@ export ELVES_TOKEN=...         # 16+ characters, for the web and SMS intake
 elf add "Summarise the open issues in ~/notes/issues.md"
 elf add -p 1 -t frontier "Design the schema for the access-review tool"
 elf add -t agent "Capture 5 seconds of the Bluesky firehose to a JSON file"
+elf add --at 01:30 -t agent "Record which hosts answer ping on the LAN"
 cat spec.md | elf add -
 elf list
 elf show 3
@@ -100,6 +101,28 @@ sleeps, launchd runs the job when it next wakes, so either stop it sleeping on
 power (`sudo pmset -c sleep 0`) or wake it just before the run
 (`sudo pmset repeat wakeorpoweron MTWRFSU 00:55:00`).
 
+### Scheduled tasks
+
+`--at` holds a task until a local time: `01:30`, `1:30am`, `2pm`, or
+`2026-11-20 07:05`. A bare time means its next occurrence. From the phone,
+start the prompt with `at 1:30am` (a colon or am/pm is needed, so "At 5
+companies…" is left alone), or send an `at` field to `/tasks`.
+
+A second launch agent, `launchd/com.nightelves.due.plist`, runs
+`elf run --due-only` every minute. It only picks up scheduled tasks whose time
+has come, and it is silent and sends no digest when there are none. If the
+nightly run is busy, it leaves the task to that run, which takes due tasks
+before anything else. Install it like the nightly plist.
+
+What "at" means:
+
+- It's "not before", accurate to about a minute when nothing else is running.
+- The backend's window still applies: an agent or `claude -p` task set for
+  2pm waits for the next 01:00-05:00 window. Local-model tasks run any time.
+- A scheduled task that hits a backend error is retried 30 minutes later.
+- Nightly caps (API allowance, runs per night) count from local midnight, so
+  daytime scheduled runs share the same day's allowance with the night run.
+
 ### Web intake
 
 ```sh
@@ -122,8 +145,9 @@ Two ways:
 - **Twilio-style webhook.** Point the number's webhook at
   `https://<your-tunnel>/sms?key=<ELVES_TOKEN>` and list your phone number in
   `web.sms_allow`. Start a message with `!` for priority 1, `opus:` to
-  request the frontier tier, or `agent:` for the agent tier. The same
-  shorthand works for prompts posted to `/tasks` without a `tier`.
+  request the frontier tier, `agent:` for the agent tier, or `at 1:30am` to
+  schedule it. These can be combined in any order. The same shorthand works
+  for prompts posted to `/tasks` without a `tier`.
 
 ### Morning digest
 

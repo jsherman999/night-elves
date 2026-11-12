@@ -1,7 +1,7 @@
 """The nightly run: drain the queue through plan -> execute -> review."""
 from __future__ import annotations
 import time
-from datetime import datetime
+from datetime import datetime, timedelta
 from pathlib import Path
 from . import db, policy
 from .backends import BackendError
@@ -15,6 +15,7 @@ AGENT_SYS = ("You are running unattended overnight and nobody can answer questio
              "directory is this task's workspace: do the work there with the tools you have, and "
              "save every file you create inside it, even if the task names another path. Finish "
              "with a short summary of what you did and the files you produced.")
+RETRY_DELAY = timedelta(minutes=30)  # before a scheduled task is tried again after an error
 DOWN_AFTER = 3  # consecutive errors before a backend is skipped for the rest of the run
 
 def passed(review: str) -> bool:
@@ -26,17 +27,20 @@ class Night:
         self.cfg, self.conn, self.backends, self.log = cfg, conn, backends, log
         self.now = now_fn or (lambda: datetime.now().astimezone())
         self.run_start = db.iso(self.now())
+        # Nightly caps count from local midnight, so the scheduled-task runs during the day
+        # share one allowance instead of each starting a fresh one.
+        self.period_start = db.iso(self.now().replace(hour=0, minute=0, second=0, microsecond=0))
         self.errors: dict[str, int] = {}
         self.down: set[str] = set()
         self.held: set[int] = set()  # hit a backend error; wait for the next run
         self.stats = {"done": 0, "failed": 0, "retried": 0, "skipped": 0}
 
     def state(self):
-        return policy.snapshot(self.cfg, self.conn, self.now(), self.run_start)
+        return policy.snapshot(self.cfg, self.conn, self.now(), self.period_start)
 
     def ok(self, name):
         return name in self.backends and policy.available(
-            name, self.cfg, self.conn, self.state(), self.run_start, self.now(), self.down)
+            name, self.cfg, self.conn, self.state(), self.period_start, self.now(), self.down)
 
     def call(self, name, task_id, role, prompt, system, cwd=None):
         try:
@@ -87,8 +91,12 @@ class Night:
         except BackendError as e:
             # One error attempt per run, so an outage can't use up every attempt in seconds.
             # Reviewer rejections above retry straight away, carrying the feedback.
+            # Scheduled tasks are also picked up by the every-minute job, so push them back.
             self.held.add(tid)
-            return self._retry(task, error=str(e))
+            outcome = self._retry(task, error=str(e))
+            if task["run_after"] and outcome == "retried":
+                db.update(self.conn, tid, run_after=db.iso(self.now() + RETRY_DELAY))
+            return outcome
         out = Path(self.cfg["paths"]["results"])
         out.mkdir(parents=True, exist_ok=True)
         path = out / f"{tid}.md"
@@ -113,7 +121,8 @@ class Night:
         self.log(f"  #{task['id']} -> {status}: {error[:120]}")
         return "failed" if status == "failed" else "retried"
 
-    def run(self, max_tasks=None) -> dict:
+    def run(self, max_tasks=None, due_only=False) -> dict:
+        """due_only: just the scheduled tasks whose time has come (the every-minute job)."""
         stale = db.requeue_stale(self.conn)
         if stale:
             self.log(f"requeued {stale} task(s) left over from an interrupted run")
@@ -121,7 +130,7 @@ class Night:
         skipped: list[int] = []
         handled = 0
         while time.monotonic() < deadline and (max_tasks is None or handled < max_tasks):
-            task = db.next_task(self.conn, [*skipped, *self.held])
+            task = db.next_task(self.conn, [*skipped, *self.held], db.iso(self.now()), due_only)
             if task is None:
                 break
             outcome = self.process(task)

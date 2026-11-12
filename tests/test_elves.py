@@ -1,8 +1,8 @@
-import json, os, tempfile, threading, time, unittest, urllib.error, urllib.request
+import contextlib, io, json, os, tempfile, threading, time, unittest, urllib.error, urllib.request
 from unittest import mock
 from datetime import date, datetime, timezone
 from http.server import ThreadingHTTPServer
-from elves import config, db, notify, policy, web
+from elves import cli, config, db, notify, policy, web, when
 from elves.backends import BackendError, Command, Result
 from elves.dispatcher import Night, passed
 
@@ -171,6 +171,72 @@ class DispatchTests(Base):
         self.assertTrue(passed("PASS\nok") and passed("\n pass"))
         self.assertFalse(passed("FAIL: nope"))
 
+class ScheduleTests(Base):
+    def clock(self, day, hour, minute=0):
+        self.t = datetime(2026, 11, day, hour, minute, tzinfo=timezone.utc)
+        return lambda: self.t
+
+    def night_at(self, day, hour, minute=0, **fakes):
+        self.fakes = {"local": Fake("local answer"), "claude_api": Fake("PASS\nfine", usd=0.5),
+                      "claude_cli": Fake("cli answer"), **fakes}
+        return Night(self.cfg, self.conn, self.fakes, now_fn=self.clock(day, hour, minute),
+                     log=lambda *_: None)
+
+    def test_parse_at(self):
+        now = datetime(2026, 11, 12, 0, 45, tzinfo=timezone.utc)
+        self.assertEqual(when.parse_at("01:30", now), now.replace(hour=1, minute=30))
+        self.assertEqual(when.parse_at("12:15am", now), datetime(2026, 11, 13, 0, 15, tzinfo=timezone.utc))
+        self.assertEqual(when.parse_at("2 pm", now).hour, 14)
+        self.assertEqual(when.parse_at("12pm", now).hour, 12)
+        self.assertEqual(when.parse_at("2026-11-20 7:05", now), datetime(2026, 11, 20, 7, 5, tzinfo=timezone.utc))
+        for bad in ("5", "25:00", "13pm", "tomorrow"):
+            with self.assertRaises(ValueError):
+                when.parse_at(bad, now)
+
+    def test_scheduled_task_waits_and_due_run_ignores_the_rest(self):
+        plain = db.add_task(self.conn, "plain")
+        timed = db.add_task(self.conn, "timed", run_after="2026-11-05T02:00:00Z")
+        stats = self.night_at(5, 1).run()
+        self.assertEqual((stats["done"], db.get(self.conn, timed)["status"]), (1, "queued"))
+        later = db.add_task(self.conn, "plain, added later")
+        stats = self.night_at(5, 2, 1).run(due_only=True)
+        self.assertEqual(stats["done"], 1)
+        self.assertEqual([db.get(self.conn, i)["status"] for i in (plain, timed, later)],
+                         ["done", "done", "queued"])
+
+    def test_due_tasks_go_first(self):
+        db.add_task(self.conn, "urgent but plain", priority=1)
+        timed = db.add_task(self.conn, "timed", priority=9, run_after="2026-11-05T02:00:00Z")
+        n = self.night_at(5, 3)
+        n.run(max_tasks=1)
+        self.assertEqual(db.get(self.conn, timed)["status"], "done")
+
+    def test_error_pushes_scheduled_task_back(self):
+        tid = db.add_task(self.conn, "timed", tier="local", run_after="2026-11-05T02:00:00Z")
+        self.night_at(5, 2, 5, local=Fake(fail=1)).run(due_only=True)
+        t = db.get(self.conn, tid)
+        self.assertEqual((t["status"], t["attempts"], t["run_after"]), ("queued", 1, "2026-11-05T02:35:00Z"))
+
+    def test_nightly_cap_is_shared_by_runs_on_the_same_day(self):
+        self.cfg["budget"]["per_night_cap_usd"] = 1.0
+        for i in range(3):
+            db.add_task(self.conn, f"t{i}", tier="frontier")
+        api = Fake("answer", usd=0.6)
+        self.night_at(18, 12, claude_api=api).run(max_tasks=1)
+        stats = self.night_at(18, 15, claude_api=api).run()
+        self.assertEqual((stats["done"], stats["skipped"]), (1, 1))
+
+    def test_cli_add_at_and_list(self):
+        path = os.path.join(self.tmp, "c.toml")
+        open(path, "w").write(f'[paths]\ndb = "{self.tmp}/q.db"\nresults = "{self.tmp}"\n')
+        out = io.StringIO()
+        with contextlib.redirect_stdout(out):
+            self.assertEqual(cli.main(["-c", path, "add", "--at", "03:15", "scheduled thing"]), 0)
+            cli.main(["-c", path, "list"])
+        self.assertRegex(out.getvalue(), r"queued #1 for \w{3} 03:15\n#1 .* @\w{3} 03:15 scheduled thing")
+        with contextlib.redirect_stderr(io.StringIO()):
+            self.assertEqual(cli.main(["-c", path, "add", "--at", "later", "x"]), 2)
+
 class MiscTests(Base):
     def test_command_backend_arg_and_stdin(self):
         self.assertEqual(Command("e", {"argv": ["echo", "{prompt}"]}).run("hi; rm -rf /").text, "hi; rm -rf /")
@@ -203,9 +269,14 @@ class MiscTests(Base):
         self.assertTrue(any(f.startswith("digest-") for f in os.listdir(self.tmp)))
 
     def test_parse_inline(self):
-        self.assertEqual(web.parse_inline("! opus: fix it"), ("fix it", 1, "frontier"))
-        self.assertEqual(web.parse_inline("plain"), ("plain", 5, "auto"))
-        self.assertEqual(web.parse_inline("Agent: fetch it"), ("fetch it", 5, "agent"))
+        self.assertEqual(web.parse_inline("! opus: fix it"), ("fix it", 1, "frontier", None))
+        self.assertEqual(web.parse_inline("plain"), ("plain", 5, "auto", None))
+        self.assertEqual(web.parse_inline("Agent: fetch it"), ("fetch it", 5, "agent", None))
+        self.assertEqual(web.parse_inline("at 1:30am agent: capture"), ("capture", 5, "agent", "1:30am"))
+        self.assertEqual(web.parse_inline("agent: At 2 PM CST, scan it"), ("scan it", 5, "agent", "2 PM"))
+        self.assertEqual(web.parse_inline("! at 01:30: do it"), ("do it", 1, "auto", "01:30"))
+        self.assertEqual(web.parse_inline("At 5 companies, compare"), ("At 5 companies, compare", 5, "auto", None))
+        self.assertEqual(web.parse_inline("at 1:30 make tea"), ("make tea", 5, "auto", "1:30"))
 
     def test_web_intake(self):
         self.cfg["paths"]["db"] = os.path.join(self.tmp, "q.db")
@@ -225,8 +296,12 @@ class MiscTests(Base):
         self.assertEqual(post("/tasks", body, js)[0], 401)
         self.assertEqual(post("/tasks", body, {**js, "Authorization": "Bearer s3cret-token-123456"})[0], 201)
         self.assertEqual(post("/tasks", b"{}", {**js, "Authorization": "Bearer s3cret-token-123456"})[0], 400)
-        shorthand = json.dumps({"prompt": "agent: run it"}).encode()
-        self.assertEqual(post("/tasks", shorthand, {**js, "Authorization": "Bearer s3cret-token-123456"})[0], 201)
+        shorthand = json.dumps({"prompt": "agent: run it", "at": "2026-12-01 01:30"}).encode()
+        code, text = post("/tasks", shorthand, {**js, "Authorization": "Bearer s3cret-token-123456"})
+        self.assertEqual(code, 201)
+        self.assertTrue(json.loads(text)["message"].startswith("Queued #2 for "))
+        bad = json.dumps({"prompt": "x", "at": "soonish"}).encode()
+        self.assertEqual(post("/tasks", bad, {**js, "Authorization": "Bearer s3cret-token-123456"})[0], 400)
         form = {"Content-Type": "application/x-www-form-urlencoded"}
         self.assertEqual(post("/sms?key=s3cret-token-123456", b"From=%2B19990000000&Body=hi", form)[0], 401)
         code, text = post("/sms?key=s3cret-token-123456", b"From=%2B15550001111&Body=%21urgent", form)
@@ -234,6 +309,7 @@ class MiscTests(Base):
         self.assertIn("Queued #3", text)
         srv.shutdown()
         rows = db.list_tasks(db.connect(self.cfg["paths"]["db"]))
+        self.assertIsNotNone(rows[1]["run_after"])
         self.assertEqual([(r["source"], r["priority"], r["tier"], r["prompt"]) for r in rows],
                          [("sms", 1, "auto", "urgent"), ("web", 5, "agent", "run it"),
                           ("web", 2, "auto", "from web")])

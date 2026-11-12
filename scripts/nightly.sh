@@ -6,4 +6,4 @@
 set -eu
 [ -f "$HOME/.night-elves/env" ] && . "$HOME/.night-elves/env"
 export PATH="$HOME/.local/bin:/opt/homebrew/bin:/usr/local/bin:$PATH"  # pipx puts elf in ~/.local/bin
-exec caffeinate -i elf run
+exec caffeinate -i elf run "$@"  # the every-minute job passes --due-only

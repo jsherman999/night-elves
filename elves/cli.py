@@ -2,7 +2,7 @@
 from __future__ import annotations
 import argparse, sys
 from datetime import datetime
-from . import backends, config, db, notify, policy
+from . import backends, config, db, notify, policy, when
 from .dispatcher import Night
 
 def main(argv=None) -> int:
@@ -14,6 +14,7 @@ def main(argv=None) -> int:
     a.add_argument("-p", "--priority", type=int, default=5, help="1 = most important (default 5)")
     a.add_argument("-t", "--tier", choices=db.TIERS, default="auto")
     a.add_argument("--source", default="cli")
+    a.add_argument("--at", help="not before this local time: 01:30, 2pm, or 2026-11-12 01:30")
     l = sub.add_parser("list", help="show recent tasks")
     l.add_argument("-s", "--status")
     s = sub.add_parser("show", help="show one task and its result")
@@ -24,6 +25,8 @@ def main(argv=None) -> int:
     n.add_argument("--max-tasks", type=int)
     n.add_argument("--dry-run", action="store_true", help="show routing without calling models")
     n.add_argument("--no-notify", action="store_true")
+    n.add_argument("--due-only", action="store_true",
+                   help="only scheduled tasks that are due; quiet when there are none")
     sub.add_parser("budget", help="show API-credit pacing")
     sub.add_parser("serve", help="start the web/SMS intake server")
     args = ap.parse_args(argv)
@@ -38,11 +41,18 @@ def main(argv=None) -> int:
 
     if args.cmd == "add":
         text = sys.stdin.read() if args.prompt == ["-"] else " ".join(args.prompt)
-        print(f"queued #{db.add_task(conn, text, args.source, args.priority, args.tier)}")
+        try:
+            after = db.iso(when.parse_at(args.at, now)) if args.at else None
+        except ValueError as e:
+            print(e, file=sys.stderr)
+            return 2
+        tid = db.add_task(conn, text, args.source, args.priority, args.tier, run_after=after)
+        print(f"queued #{tid}" + (f" for {when.label(after)}" if after else ""))
     elif args.cmd == "list":
         for t in db.list_tasks(conn, args.status):
+            at = f"@{when.label(t['run_after'])} " if t["run_after"] and t["status"] == "queued" else ""
             print(f"#{t['id']:<4} {t['status']:<8} p{t['priority']} {t['tier']:<8} "
-                  f"{t['source']:<4} {' '.join(t['prompt'].split())[:60]}")
+                  f"{t['source']:<4} {at}{' '.join(t['prompt'].split())[:60]}")
     elif args.cmd == "show":
         t = db.get(conn, args.id)
         if not t:
@@ -67,20 +77,26 @@ def main(argv=None) -> int:
             st = night.state()
             print(f"mode={st.mode} allowance=${st.tonight_allowance:.2f}")
             for t in reversed(db.list_tasks(conn, "queued")):
-                print(f"#{t['id']}: {policy.route(t, cfg, st, night.ok) or 'skip tonight'}")
+                wait = (f"waits until {when.label(t['run_after'])}"
+                        if t["run_after"] and t["run_after"] > db.iso(now) else None)
+                print(f"#{t['id']}: {wait or policy.route(t, cfg, st, night.ok) or 'skip tonight'}")
             return 0
         import fcntl
         lock = open(cfg["paths"]["db"] + ".lock", "w")
         try:
             fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
         except OSError:
+            if args.due_only:  # the nightly run is working; it picks up due tasks itself
+                return 0
             print("another run is already in progress", file=sys.stderr)
             return 1
-        stats = night.run(args.max_tasks)
+        stats = night.run(args.max_tasks, due_only=args.due_only)
+        if args.due_only and not stats["done"] + stats["failed"] + stats["retried"]:
+            return 0
         text = notify.digest(cfg, conn, stats["run_start"])
         print(text)
         if not args.no_notify:
-            notify.send(cfg, text)
+            notify.send(cfg, text, f"digest-{now:%Y-%m-%d-%H%M}" if args.due_only else None)
     return 0
 
 if __name__ == "__main__":
