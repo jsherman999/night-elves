@@ -3,7 +3,7 @@ from __future__ import annotations
 import json
 from datetime import datetime
 from html import escape as e
-from . import attachments, db
+from . import attachments, db, md
 
 CSS = """
 :root{--bg:#f6f5f2;--card:#fff;--ink:#1d1d1f;--mute:#6b6b70;--line:#e3e1dc;--accent:#4b5bd6;
@@ -38,6 +38,20 @@ pre{white-space:pre-wrap;overflow-wrap:anywhere;font:13px/1.5 ui-monospace,Menlo
 label{font-size:.85em;color:var(--mute)}
 .hint{font-size:.85em;color:var(--mute);margin:.1em 0 .4em}
 input[type=file]{padding:7px 10px}
+.md{overflow-wrap:anywhere}.md>:first-child{margin-top:0}.md>:last-child{margin-bottom:0}
+.md h1,.md h2,.md h3,.md h4,.md h5,.md h6{font-size:1.05em;margin:1.1em 0 .4em;text-transform:none;
+letter-spacing:0;color:var(--ink)}.md h1{font-size:1.25em}.md h2{font-size:1.12em}
+.md p,.md ul,.md ol,.md blockquote,.md pre,.md .tbl{margin:.55em 0}.md ul,.md ol{padding-left:1.4em}
+.md li{margin:.15em 0}.md li>ul,.md li>ol{margin:.15em 0}
+.md code{font:.88em ui-monospace,Menlo,monospace;background:var(--off-bg);padding:.1em .35em;
+border-radius:5px}.md pre{background:var(--off-bg);padding:10px 12px;border-radius:9px;overflow-x:auto}
+.md pre code{background:none;padding:0;font-size:13px;white-space:pre}
+.md blockquote{border-left:3px solid var(--line);padding-left:10px;color:var(--mute)}
+.md hr{border:0;border-top:1px solid var(--line);margin:1em 0}
+.md .tbl{overflow-x:auto;max-width:100%}.md table{border-collapse:collapse;font-size:.92em;width:max-content}
+.md th,.md td{border:1px solid var(--line);padding:4px 8px;vertical-align:top;text-align:left;
+max-width:18em;overflow-wrap:break-word}
+.md th{background:var(--off-bg)}
 .imgs{display:grid;grid-template-columns:repeat(auto-fill,minmax(120px,1fr));gap:8px;margin:.6em 0}
 .imgs img{width:100%;height:160px;object-fit:cover;object-position:top;border-radius:9px;
 border:1px solid var(--line);background:var(--card);display:block}
@@ -120,7 +134,7 @@ def row(t) -> str:
             f"<span>{e(t['tier'])}{pri} · {e(when_text(t))}</span></div>"
             f"<div class=txt>{e(' '.join(t['prompt'].split())[:140])}</div></a>")
 
-def task(t, result: str | None, msg: str | None = None) -> str:
+def task(t, result: str | None, msg: str | None = None, raw: bool = False) -> str:
     tid, status = t["id"], t["status"]
     facts = [f"tier {t['tier']}", f"priority {t['priority']}", f"from {t['source']}",
              f"added {local(t['created_at']):%a %b %d %H:%M}"]
@@ -168,6 +182,9 @@ def task(t, result: str | None, msg: str | None = None) -> str:
         acts.append("<p class=mute>A run is working on this task, so it can't be changed.</p>")
     body += f"<div class=acts>{''.join(acts)}</div>"
     if result is not None:
-        body += f"<h2>Result</h2><div class=card><pre>{e(result)}</pre></div>"
+        switch = (f"<a href=/t/{tid}>formatted</a>" if raw else f"<a href=/t/{tid}?raw=1>plain text</a>")
+        shown = f"<pre>{e(result)}</pre>" if raw else md.render(result)
+        body += (f"<h2>Result</h2><div class='card{'' if raw else ' md'}'>{shown}</div>"
+                 f"<p class=mute>Show as {switch}</p>")
     body += "<p><a href=/>&larr; Queue</a></p>"
     return page(f"Task {tid}", body, msg)

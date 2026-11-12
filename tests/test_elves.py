@@ -437,7 +437,8 @@ class MiscTests(Base):
         self.assertIn(f"href=/t/{waiting}", page)
         self.assertIn(f"id=tierhelp>{html.escape(pages.TIER_HELP['auto'])}<", page)
         page = call(f"/t/{done}", headers=me)[1]
-        self.assertIn("# the answer &lt;script&gt;", page)
+        self.assertIn("<h1>the answer &lt;script&gt;</h1>", page)
+        self.assertIn("# the answer &lt;script&gt;", call(f"/t/{done}?raw=1", headers=me)[1])
         self.assertNotIn("localhost", call(f"/t/{done + 1}", headers=me)[1])  # outside results/
         self.assertEqual(call(f"/t/{done}")[0], 303)  # not signed in
         # changes: from the page with the cookie, and as JSON with the token
@@ -607,3 +608,32 @@ class ImageTests(Base):
         self.assertEqual([(r["prompt"], r["tier"], bool(r["images"])) for r in rows],
                          [("no picture", "auto", False), ("make an app like this", "agent", True),
                           ("make an app like this", "agent", True)])
+
+
+class MarkdownTests(unittest.TestCase):
+    def test_blocks(self):
+        from elves import md
+        out = md.render("# Title\n\nSome **bold** and `x<y`.\n\n1. one\n2. two\n   - sub\n\n"
+                        "- [x] done\n\n| a | b |\n|---|--:|\n| 1 | 2 |\n\n```sh\necho <hi>\n```\n> q")
+        for want in ("<h1>Title</h1>", "<strong>bold</strong>", "<code>x&lt;y</code>",
+                     "<ol><li>one</li><li>two\n<ul><li>sub</li></ul></li></ol>", "<li>☑ done</li>",
+                     "<th>a</th>", "<td style=text-align:right>2</td>",
+                     '<pre><code class="lang-sh">echo &lt;hi&gt;</code></pre>', "<blockquote><p>q</p>"):
+            self.assertIn(want, out)
+
+    def test_nothing_from_the_source_becomes_markup(self):
+        from elves import md
+        out = md.render('<script>alert(1)</script> <img src=x onerror=alert(1)>\n\n'
+                        '[a](javascript:alert(1)) [b](//evil.example) [c](https://ok.example/p_(1))'
+                        ' [d](x" onmouseover="y) https://ok.example/?a=1&b="2"\n\n'
+                        '`<b>` **<i>x</i>** | not | a | table |')
+        self.assertNotIn("<script", out)
+        self.assertNotIn("<img", out)
+        self.assertNotIn("<i>", out)
+        self.assertNotIn("javascript:", out.split("href")[0] + "".join(
+            h.split(">")[0] for h in out.split("href=")[1:]))
+        self.assertNotIn("evil.example\"", out)
+        hrefs = [h.split('"')[1] for h in out.split("href=")[1:]]
+        self.assertEqual(hrefs, ["https://ok.example/p_(1)", "https://ok.example/?a=1&amp;b=&quot;2"])
+        self.assertNotIn("&amp;quot;", out)
+        self.assertNotIn("onmouseover=\"", out)

@@ -233,7 +233,8 @@ def make_handler(cfg: dict, token: str):
                     return self._image(t, int(m.group(3)))
                 if m.group(1) == "tasks":
                     return self._send(200, {**task_json(t), "result": self._result(t)})
-                return self._send(200, pages.task(t, self._result(t), msg), HTML)
+                raw = parse_qs(u.query).get("raw", [""])[0] == "1"
+                return self._send(200, pages.task(t, self._result(t), msg, raw), HTML)
             finally:
                 conn.close()
 

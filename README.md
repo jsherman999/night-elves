@@ -147,7 +147,10 @@ it running.
 `/` asks once for the token, then shows a form to queue a task and the queue
 itself: what's running, what's waiting (and when), and recent results. Tap a
 task to read its result, edit its prompt, tier, priority or time, run it now,
-cancel it, or put it back in the queue. The sign-in is a cookie derived from
+cancel it, or put it back in the queue. Results are shown formatted from their
+Markdown (headings, lists, tables, code, links), with a link to the plain text.
+The renderer is in `elves/md.py`: it escapes all source text, shows raw HTML as
+text, and only links http(s), mailto and same-site paths. The sign-in is a cookie derived from
 the token (HttpOnly, SameSite=Strict, Secure over HTTPS), so changing
 `ELVES_TOKEN` signs every browser out.
 
