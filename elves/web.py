@@ -11,17 +11,19 @@ FORM = """<!doctype html><meta name=viewport content="width=device-width,initial
 textarea,input,select,button{font:inherit;width:100%;margin:.3em 0;box-sizing:border-box}</style>
 <h1>night-elves</h1><form method=post action=/tasks>
 <textarea name=prompt rows=6 placeholder="What should the elves do tonight?" required></textarea>
-<select name=tier><option>auto<option>local<option>frontier</select>
+<select name=tier><option>auto<option>local<option>frontier<option>agent</select>
 <input name=priority type=number min=1 max=9 value=5>
 <input name=token type=password placeholder=token required><button>Queue it</button></form>"""
 
 def parse_inline(text: str) -> tuple[str, int, str]:
-    """SMS shorthand: a leading '!' means priority 1, a leading 'opus:' means frontier tier."""
+    """Phone shorthand: a leading '!' means priority 1; a leading 'opus:' asks for the frontier
+    tier and 'agent:' for the agent tier."""
     text, priority, tier = text.strip(), 5, "auto"
     if text.startswith("!"):
         text, priority = text[1:].lstrip(), 1
-    if text.lower().startswith("opus:"):
-        text, tier = text[5:].lstrip(), "frontier"
+    for prefix, t in (("opus:", "frontier"), ("agent:", "agent")):
+        if text.lower().startswith(prefix):
+            text, tier = text[len(prefix):].lstrip(), t
     return text, priority, tier
 
 def make_handler(cfg: dict, token: str):
@@ -75,9 +77,11 @@ def make_handler(cfg: dict, token: str):
                 if u.path == "/tasks":
                     if not self._authed(d.get("token")):
                         return self._send(401, {"error": "unauthorized"})
-                    tid = db.add_task(conn, str(d.get("prompt", "")), source="web",
-                                      priority=int(d.get("priority") or 5),
-                                      tier=d.get("tier") or "auto")
+                    text, priority, tier = parse_inline(str(d.get("prompt", "")))
+                    if d.get("tier") not in (None, "", "auto"):
+                        tier = d["tier"]
+                    tid = db.add_task(conn, text, source="web", tier=tier,
+                                      priority=int(d.get("priority") or priority))
                     return self._send(201, {"id": tid, "status": "queued"})
                 if u.path == "/sms":  # Twilio-style webhook: form fields From and Body
                     key = parse_qs(u.query).get("key", [None])[0]

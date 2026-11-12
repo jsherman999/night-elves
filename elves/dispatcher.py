@@ -11,6 +11,10 @@ PLAN_SYS = ("You are planning work that a smaller model will carry out. Do not d
 EXEC_SYS = "Complete the task fully and return only the finished result."
 REVIEW_SYS = ("You are reviewing another model's work against the task. The first line of your "
               "reply must be exactly PASS or FAIL. Then give brief reasons, and for FAIL the fixes needed.")
+AGENT_SYS = ("You are running unattended overnight and nobody can answer questions. The current "
+             "directory is this task's workspace: do the work there with the tools you have, and "
+             "save every file you create inside it, even if the task names another path. Finish "
+             "with a short summary of what you did and the files you produced.")
 DOWN_AFTER = 3  # consecutive errors before a backend is skipped for the rest of the run
 
 def passed(review: str) -> bool:
@@ -34,9 +38,10 @@ class Night:
         return name in self.backends and policy.available(
             name, self.cfg, self.conn, self.state(), self.run_start, self.now(), self.down)
 
-    def call(self, name, task_id, role, prompt, system):
+    def call(self, name, task_id, role, prompt, system, cwd=None):
         try:
-            res = self.backends[name].run(prompt, system)
+            res = (self.backends[name].run(prompt, system, cwd=cwd) if cwd
+                   else self.backends[name].run(prompt, system))
         except BackendError:
             self.errors[name] = self.errors.get(name, 0) + 1
             if self.errors[name] >= DOWN_AFTER:
@@ -66,7 +71,12 @@ class Night:
             if task["feedback"]:
                 prompt += f"\n\nA previous attempt was rejected. Reviewer feedback:\n{task['feedback']}"
             db.update(self.conn, tid, status="running", backend=r.executor)
-            answer = self.call(r.executor, tid, "execute", prompt, EXEC_SYS)
+            work = None
+            if task["tier"] == "agent":
+                work = Path(self.cfg["paths"]["work"]) / str(tid)
+                work.mkdir(parents=True, exist_ok=True)
+            answer = self.call(r.executor, tid, "execute", prompt, AGENT_SYS if work else EXEC_SYS,
+                               cwd=str(work) if work else None)
             review = ""
             if r.reviewer and self.ok(r.reviewer):
                 db.update(self.conn, tid, status="review")
@@ -82,7 +92,13 @@ class Night:
         out = Path(self.cfg["paths"]["results"])
         out.mkdir(parents=True, exist_ok=True)
         path = out / f"{tid}.md"
+        files = ""
+        if work:
+            names = sorted(str(p.relative_to(work)) for p in work.rglob("*") if p.is_file())
+            files = (f"\n## Files in {work}\n\n" + "".join(f"- {n}\n" for n in names[:200])
+                     if names else f"\n## Files\n\nNothing was saved in {work}.\n")
         path.write_text(f"# Task {tid}\n\n{task['prompt']}\n\n## Result ({r.executor})\n\n{answer}\n"
+                        + files
                         + (f"\n## Review ({r.reviewer})\n\n{review}\n" if review else ""))
         db.update(self.conn, tid, status="done", result_path=str(path), last_error=None)
         return "done"

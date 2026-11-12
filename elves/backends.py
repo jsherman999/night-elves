@@ -1,6 +1,6 @@
 """Model backends. Each one takes a prompt and returns a Result."""
 from __future__ import annotations
-import json, os, subprocess, urllib.request
+import json, os, signal, subprocess, urllib.request
 from dataclasses import dataclass
 
 class BackendError(RuntimeError):
@@ -71,24 +71,39 @@ class Command:
     Put "{prompt}" in argv to pass the prompt as an argument; otherwise it goes on stdin.
     Runs without a shell. Flat-rate tools record $0 and are limited by runs per night.
     Variables in env_unset are removed first: with ANTHROPIC_API_KEY set, `claude -p` bills the
-    API instead of the subscription, and the ledger would record that spend as $0."""
+    API instead of the subscription, and the ledger would record that spend as $0.
+    It runs in its own process group, so a timeout also kills anything it started."""
     def __init__(self, name, c):
         self.name, self.c = name, c
-    def run(self, prompt, system=None) -> Result:
+    def run(self, prompt, system=None, cwd=None) -> Result:
         full = f"{system}\n\n{prompt}" if system else prompt
-        argv = list(self.c["argv"])
+        argv = [os.path.expanduser(a) if a.startswith("~/") else a for a in self.c["argv"]]
         as_arg = any("{prompt}" in a for a in argv)
         argv = [a.replace("{prompt}", full) for a in argv]
         drop = set(self.c.get("env_unset", ["ANTHROPIC_API_KEY"]))
         env = {k: v for k, v in os.environ.items() if k not in drop}
         try:
-            p = subprocess.run(argv, input=None if as_arg else full, capture_output=True,
-                               text=True, timeout=self.c.get("timeout", 1800), env=env)
-        except (OSError, subprocess.TimeoutExpired) as e:
+            p = subprocess.Popen(argv, stdin=subprocess.DEVNULL if as_arg else subprocess.PIPE,
+                                 stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True,
+                                 env=env, cwd=cwd, start_new_session=True)
+        except OSError as e:
+            raise BackendError(f"{self.name}: {e}") from e
+        try:
+            out, err = p.communicate(None if as_arg else full, timeout=self.c.get("timeout", 1800))
+        except subprocess.TimeoutExpired as e:
+            for sig in (signal.SIGTERM, signal.SIGKILL):  # TERM first lets claude stop its tools
+                try:
+                    os.killpg(p.pid, sig)
+                    p.communicate(timeout=10)
+                    break
+                except ProcessLookupError:
+                    break
+                except subprocess.TimeoutExpired:
+                    continue
             raise BackendError(f"{self.name}: {e}") from e
         if p.returncode != 0:
-            raise BackendError(f"{self.name}: exit {p.returncode}: {p.stderr.strip()[:500]}")
-        return Result(p.stdout.strip())
+            raise BackendError(f"{self.name}: exit {p.returncode}: {err.strip()[:500]}")
+        return Result(out.strip())
 
 TYPES = {"openai_compat": OpenAICompat, "anthropic_api": AnthropicAPI, "command": Command}
 

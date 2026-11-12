@@ -3,6 +3,7 @@
 [paths]
 db = "~/.night-elves/queue.db"
 results = "~/.night-elves/results"
+work = "~/.night-elves/work"     # agent-tier workspaces, one folder per task
 
 [budget]
 monthly_credit_usd = 100.0   # Claude Max 5x API credit; expires at the end of each cycle
@@ -45,7 +46,17 @@ timeout = 1800
 # env_unset = ["ANTHROPIC_API_KEY"]       # the default for command backends: keeps `claude -p` on
                                           # the subscription instead of billing the API key
 
-[backends.codex]                          # ChatGPT plan via Codex CLI, as a second-opinion reviewer
+[backends.claude_agent]                   # agent tier only: Claude Code that may run commands
+type = "command"                          # prompt goes on stdin; cwd is ~/.night-elves/work/<id>
+argv = ["claude", "-p", "--restricted", "--strict-mcp-config",
+        "--tools", "Bash,Read,Edit,Write,Glob,Grep,WebFetch",
+        "--settings", "~/.night-elves/agent-settings.json",   # copy of agent-settings.example.json
+        "--permission-mode", "dontAsk", "--max-turns", "60"]
+window = [1, 5]
+max_runs_per_night = 3
+timeout = 2700                            # then the whole process group is killed
+
+[backends.codex]                         # ChatGPT plan via Codex CLI, as a second-opinion reviewer
 type = "command"
 enabled = false
 argv = ["codex", "exec", "{prompt}"]
@@ -57,6 +68,7 @@ local = "local"
 frontier_api = "claude_api"
 frontier_sub = "claude_cli"
 second_opinion = "codex"
+agent = "claude_agent"
 
 [web]
 host = "127.0.0.1"           # keep on loopback; publish through Tailscale or a tunnel

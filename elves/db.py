@@ -12,7 +12,7 @@ CREATE TABLE IF NOT EXISTS tasks (
   source TEXT NOT NULL DEFAULT 'cli',        -- cli | web | sms | ...
   prompt TEXT NOT NULL,
   priority INTEGER NOT NULL DEFAULT 5,       -- 1 = most important
-  tier TEXT NOT NULL DEFAULT 'auto',         -- auto | local | frontier
+  tier TEXT NOT NULL DEFAULT 'auto',         -- auto | local | frontier | agent
   status TEXT NOT NULL DEFAULT 'queued',     -- queued | planning | running | review | done | failed
   parent_id INTEGER REFERENCES tasks(id),
   backend TEXT,                              -- backend that produced the result
@@ -33,7 +33,7 @@ CREATE TABLE IF NOT EXISTS spend (
 );
 CREATE INDEX IF NOT EXISTS spend_ts ON spend(backend, ts);
 """
-TIERS = ("auto", "local", "frontier")
+TIERS = ("auto", "local", "frontier", "agent")
 
 def iso(dt: datetime | None = None) -> str:
     return (dt or datetime.now(timezone.utc)).astimezone(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")

@@ -1,4 +1,4 @@
-import json, os, tempfile, threading, unittest, urllib.error, urllib.request
+import json, os, tempfile, threading, time, unittest, urllib.error, urllib.request
 from unittest import mock
 from datetime import date, datetime, timezone
 from http.server import ThreadingHTTPServer
@@ -9,8 +9,9 @@ from elves.dispatcher import Night, passed
 class Fake:
     def __init__(self, reply="ok", usd=0.0, fail=0):
         self.reply, self.usd, self.fail, self.calls = reply, usd, fail, []
-    def run(self, prompt, system=None):
+    def run(self, prompt, system=None, cwd=None):
         self.calls.append((prompt, system))
+        self.cwd = cwd
         if self.fail:
             self.fail -= 1
             raise BackendError("boom")
@@ -19,7 +20,7 @@ class Fake:
 
 def make_cfg(tmp):
     cfg = config.load("/nonexistent")
-    cfg["paths"] = {"db": ":memory:", "results": tmp}
+    cfg["paths"] = {"db": ":memory:", "results": tmp, "work": os.path.join(tmp, "work")}
     cfg["backends"] = {
         "local": {"type": "openai_compat"},
         "claude_api": {"type": "anthropic_api"},
@@ -141,6 +142,31 @@ class DispatchTests(Base):
         text = notify.digest(self.cfg, self.conn, stats["run_start"], at(5)())
         self.assertIn("1 done, 0 failed", text)
 
+    def test_agent_tier_runs_in_its_workspace(self):
+        self.cfg["backends"]["claude_agent"] = {"type": "command", "argv": ["x"], "window": [1, 5]}
+        tid = db.add_task(self.conn, "capture something", tier="agent")
+        def work(prompt, system):
+            open(os.path.join(agent.cwd, "out.json"), "w").write("{}")
+            return "saved out.json"
+        agent = Fake(work)
+        stats = self.night(18, hour=2, claude_agent=agent).run()
+        t = db.get(self.conn, tid)
+        self.assertEqual((stats["done"], t["backend"]), (1, "claude_agent"))
+        self.assertEqual(agent.cwd, os.path.join(self.tmp, "work", str(tid)))
+        self.assertIn("unattended", agent.calls[0][1])
+        self.assertIn("- out.json", open(t["result_path"]).read())
+        self.assertEqual(len(self.fakes["claude_api"].calls), 0)  # no planner or reviewer
+
+    def test_agent_tier_waits_outside_window_and_auto_never_uses_agent(self):
+        self.cfg["backends"]["claude_agent"] = {"type": "command", "argv": ["x"], "window": [1, 5]}
+        a = db.add_task(self.conn, "agent job", tier="agent")
+        db.add_task(self.conn, "normal job")
+        agent = Fake("should not run")
+        stats = self.night(18, hour=12, claude_agent=agent).run()
+        self.assertEqual((stats["skipped"], stats["done"], db.get(self.conn, a)["status"]),
+                         (1, 1, "queued"))
+        self.assertEqual(agent.calls, [])
+
     def test_passed(self):
         self.assertTrue(passed("PASS\nok") and passed("\n pass"))
         self.assertFalse(passed("FAIL: nope"))
@@ -158,6 +184,17 @@ class MiscTests(Base):
             self.assertEqual(Command("c", {"argv": sh}).run("x").text, "unset kept")
             self.assertEqual(Command("c", {"argv": sh, "env_unset": []}).run("x").text, "sk-test kept")
 
+    def test_command_backend_cwd_and_timeout_kills_children(self):
+        self.assertEqual(Command("p", {"argv": ["pwd"]}).run("x", cwd=self.tmp).text,
+                         os.path.realpath(self.tmp))
+        mark = os.path.join(self.tmp, "mark")
+        slow = Command("s", {"argv": ["sh", "-c", f"(sleep 1; touch {mark}) & sleep 10"],
+                             "timeout": 0.3})
+        with self.assertRaises(BackendError):
+            slow.run("x")
+        time.sleep(1.5)
+        self.assertFalse(os.path.exists(mark))  # the background child was killed too
+
     def test_notify_failure_does_not_raise(self):
         self.cfg["notify"] = {"argv": ["sleep", "5"], "timeout": 0.2}
         notify.send(self.cfg, "digest")  # timeout is reported, not raised
@@ -168,6 +205,7 @@ class MiscTests(Base):
     def test_parse_inline(self):
         self.assertEqual(web.parse_inline("! opus: fix it"), ("fix it", 1, "frontier"))
         self.assertEqual(web.parse_inline("plain"), ("plain", 5, "auto"))
+        self.assertEqual(web.parse_inline("Agent: fetch it"), ("fetch it", 5, "agent"))
 
     def test_web_intake(self):
         self.cfg["paths"]["db"] = os.path.join(self.tmp, "q.db")
@@ -187,14 +225,18 @@ class MiscTests(Base):
         self.assertEqual(post("/tasks", body, js)[0], 401)
         self.assertEqual(post("/tasks", body, {**js, "Authorization": "Bearer s3cret-token-123456"})[0], 201)
         self.assertEqual(post("/tasks", b"{}", {**js, "Authorization": "Bearer s3cret-token-123456"})[0], 400)
+        shorthand = json.dumps({"prompt": "agent: run it"}).encode()
+        self.assertEqual(post("/tasks", shorthand, {**js, "Authorization": "Bearer s3cret-token-123456"})[0], 201)
         form = {"Content-Type": "application/x-www-form-urlencoded"}
         self.assertEqual(post("/sms?key=s3cret-token-123456", b"From=%2B19990000000&Body=hi", form)[0], 401)
         code, text = post("/sms?key=s3cret-token-123456", b"From=%2B15550001111&Body=%21urgent", form)
         self.assertEqual(code, 200)
-        self.assertIn("Queued #2", text)
+        self.assertIn("Queued #3", text)
         srv.shutdown()
         rows = db.list_tasks(db.connect(self.cfg["paths"]["db"]))
-        self.assertEqual([(r["source"], r["priority"]) for r in rows], [("sms", 1), ("web", 2)])
+        self.assertEqual([(r["source"], r["priority"], r["tier"], r["prompt"]) for r in rows],
+                         [("sms", 1, "auto", "urgent"), ("web", 5, "agent", "run it"),
+                          ("web", 2, "auto", "from web")])
 
 if __name__ == "__main__":
     unittest.main()

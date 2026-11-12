@@ -85,6 +85,9 @@ def route(task, cfg: dict, state: State, ok) -> Route | None:
     frontier = next((n for n in (r["frontier_api"], r["frontier_sub"]) if ok(n)), None)
     second = r["second_opinion"] if ok(r["second_opinion"]) else None
 
+    if task["tier"] == "agent":  # opt-in only: this backend can run commands
+        agent = r.get("agent")
+        return Route(None, agent, None) if agent and ok(agent) else None
     if task["tier"] == "local":
         return Route(None, local, None) if local else None
     if task["tier"] == "frontier":

@@ -4,7 +4,8 @@ import copy, os, tomllib
 from pathlib import Path
 
 DEFAULTS = {
-    "paths": {"db": "~/.night-elves/queue.db", "results": "~/.night-elves/results"},
+    "paths": {"db": "~/.night-elves/queue.db", "results": "~/.night-elves/results",
+              "work": "~/.night-elves/work"},  # agent-tier tasks each get work/<id>/
     "budget": {
         "monthly_credit_usd": 100.0,   # API credit that expires each cycle
         "cycle_day": 1,                # day of month the credit refreshes (1-28)
@@ -16,7 +17,7 @@ DEFAULTS = {
     },
     "limits": {"max_attempts": 3, "escalate_after": 2, "max_minutes": 360, "hard_priority": 3},
     "roles": {"local": "local", "frontier_api": "claude_api",
-              "frontier_sub": "claude_cli", "second_opinion": "codex"},
+              "frontier_sub": "claude_cli", "second_opinion": "codex", "agent": "claude_agent"},
     "backends": {},
     "web": {"host": "127.0.0.1", "port": 8377, "token_env": "ELVES_TOKEN", "sms_allow": []},
     "notify": {"argv": []},
@@ -37,7 +38,7 @@ def find_config(path: str | None = None) -> Path | None:
 def load(path: str | None = None) -> dict:
     p = find_config(path)
     cfg = _merge(DEFAULTS, tomllib.loads(p.read_text()) if p else {})
-    for k in ("db", "results"):
+    for k in ("db", "results", "work"):
         cfg["paths"][k] = str(Path(cfg["paths"][k]).expanduser())
     day = cfg["budget"]["cycle_day"]
     if not 1 <= day <= 28:
