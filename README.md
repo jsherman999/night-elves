@@ -197,9 +197,21 @@ from the network. It is opt-in per task and only runs through the
   fallback to unsandboxed commands
 - uses `--permission-mode dontAsk`, so anything not allowed is refused rather
   than waiting for a person
-- stops after 60 turns, or after `timeout` seconds, when its whole process
-  group is killed
+- never sees `ANTHROPIC_API_KEY` or `ELVES_TOKEN`, so it can't bill the API or
+  queue tasks for itself
+- stops after 200 turns, or after `timeout` seconds (90 minutes), when its
+  whole process group is killed
 - runs inside the subscription window, up to `max_runs_per_night`
+
+It is set up to build small apps in one go: the allowlist covers PyPI, npm,
+crates.io, GitHub and the common front-end CDNs; package caches (`uv`, `pip`,
+`npm`, `cargo`) point into the workspace through the backend's `env` table;
+`allowLocalBinding` lets it start a dev server and test against it; and the
+instructions it gets ask for a README, a passing build and tests, and no
+servers left running. It can only use the toolchains already installed
+(Node, Python via `uv`, Rust, Swift on the Studio), because it can't install
+Homebrew packages. `allowLocalBinding` also lets it reach other services on
+localhost, such as LM Studio's API.
 
 On the Studio, `sudo`, writes to the home folder, reads of `~/.ssh` and
 connections to unlisted hosts were all refused by the sandbox. A deny rule

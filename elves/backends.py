@@ -71,7 +71,8 @@ class Command:
     Put "{prompt}" in argv to pass the prompt as an argument; otherwise it goes on stdin.
     Runs without a shell. Flat-rate tools record $0 and are limited by runs per night.
     Variables in env_unset are removed first: with ANTHROPIC_API_KEY set, `claude -p` bills the
-    API instead of the subscription, and the ledger would record that spend as $0.
+    API instead of the subscription, and the ledger would record that spend as $0. ELVES_TOKEN
+    goes too, so a tool-using agent can't queue tasks for itself. `env` adds variables.
     It runs in its own process group, so a timeout also kills anything it started."""
     def __init__(self, name, c):
         self.name, self.c = name, c
@@ -80,8 +81,11 @@ class Command:
         argv = [os.path.expanduser(a) if a.startswith("~/") else a for a in self.c["argv"]]
         as_arg = any("{prompt}" in a for a in argv)
         argv = [a.replace("{prompt}", full) for a in argv]
-        drop = set(self.c.get("env_unset", ["ANTHROPIC_API_KEY"]))
+        drop = set(self.c.get("env_unset", ["ANTHROPIC_API_KEY", "ELVES_TOKEN"]))
         env = {k: v for k, v in os.environ.items() if k not in drop}
+        for k, v in self.c.get("env", {}).items():  # "{cwd}" is the task's workspace
+            if "{cwd}" not in v or cwd:
+                env[k] = os.path.expanduser(v.replace("{cwd}", cwd or ""))
         try:
             p = subprocess.Popen(argv, stdin=subprocess.DEVNULL if as_arg else subprocess.PIPE,
                                  stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True,

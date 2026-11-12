@@ -51,10 +51,18 @@ type = "command"                          # prompt goes on stdin; cwd is ~/.nigh
 argv = ["claude", "-p", "--restricted", "--strict-mcp-config",
         "--tools", "Bash,Read,Edit,Write,Glob,Grep,WebFetch",
         "--settings", "~/.night-elves/agent-settings.json",   # copy of agent-settings.example.json
-        "--permission-mode", "dontAsk", "--max-turns", "60"]
+        "--permission-mode", "dontAsk", "--max-turns", "200"]
 window = [1, 5]
 max_runs_per_night = 3
-timeout = 2700                            # then the whole process group is killed
+timeout = 5400                            # then the whole process group is killed
+
+[backends.claude_agent.env]               # caches live in the workspace, the only writable place
+UV_CACHE_DIR = "{cwd}/.cache/uv"
+PIP_CACHE_DIR = "{cwd}/.cache/pip"
+npm_config_cache = "{cwd}/.cache/npm"
+CARGO_HOME = "{cwd}/.cache/cargo"
+XDG_CACHE_HOME = "{cwd}/.cache"
+GIT_TEMPLATE_DIR = "{cwd}/.cache/git-template"   # git init then writes no hooks
 
 [backends.codex]                         # ChatGPT plan via Codex CLI, as a second-opinion reviewer
 type = "command"

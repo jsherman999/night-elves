@@ -11,10 +11,17 @@ PLAN_SYS = ("You are planning work that a smaller model will carry out. Do not d
 EXEC_SYS = "Complete the task fully and return only the finished result."
 REVIEW_SYS = ("You are reviewing another model's work against the task. The first line of your "
               "reply must be exactly PASS or FAIL. Then give brief reasons, and for FAIL the fixes needed.")
-AGENT_SYS = ("You are running unattended overnight and nobody can answer questions. The current "
-             "directory is this task's workspace: do the work there with the tools you have, and "
-             "save every file you create inside it, even if the task names another path. Finish "
-             "with a short summary of what you did and the files you produced.")
+AGENT_SYS = ("You are running unattended overnight and nobody can answer questions, so make "
+             "reasonable choices and carry on. The current directory is this task's workspace: do "
+             "the work there with the tools you have, and save every file you create inside it, "
+             "even if the task names another path. Commands run in a sandbox: only the workspace "
+             "is writable, and the network is limited to package registries and a few sites. "
+             "When you build software, keep dependencies local (a .venv or node_modules), use "
+             "`git init` and `cargo new --vcs none` rather than tools that write git hooks, run "
+             "the build and tests and fix what fails, stop any server you start (by its PID), "
+             "and write a README.md saying how to run it. Finish with a short summary of what "
+             "you did, what you verified, and anything left undone.")
+SKIP_LISTING = {"node_modules", "target", "__pycache__", "venv"}  # plus anything hidden
 RETRY_DELAY = timedelta(minutes=30)  # before a scheduled task is tried again after an error
 DOWN_AFTER = 3  # consecutive errors before a backend is skipped for the rest of the run
 
@@ -102,7 +109,9 @@ class Night:
         path = out / f"{tid}.md"
         files = ""
         if work:
-            names = sorted(str(p.relative_to(work)) for p in work.rglob("*") if p.is_file())
+            rels = (p.relative_to(work) for p in work.rglob("*") if p.is_file())
+            names = sorted(str(r) for r in rels
+                           if not any(s.startswith(".") or s in SKIP_LISTING for s in r.parts))
             files = (f"\n## Files in {work}\n\n" + "".join(f"- {n}\n" for n in names[:200])
                      if names else f"\n## Files\n\nNothing was saved in {work}.\n")
         path.write_text(f"# Task {tid}\n\n{task['prompt']}\n\n## Result ({r.executor})\n\n{answer}\n"

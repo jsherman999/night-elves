@@ -147,6 +147,9 @@ class DispatchTests(Base):
         tid = db.add_task(self.conn, "capture something", tier="agent")
         def work(prompt, system):
             open(os.path.join(agent.cwd, "out.json"), "w").write("{}")
+            for d in ("node_modules/x", ".cache"):
+                os.makedirs(os.path.join(agent.cwd, d))
+                open(os.path.join(agent.cwd, d, "junk"), "w").write("")
             return "saved out.json"
         agent = Fake(work)
         stats = self.night(18, hour=2, claude_agent=agent).run()
@@ -154,7 +157,9 @@ class DispatchTests(Base):
         self.assertEqual((stats["done"], t["backend"]), (1, "claude_agent"))
         self.assertEqual(agent.cwd, os.path.join(self.tmp, "work", str(tid)))
         self.assertIn("unattended", agent.calls[0][1])
-        self.assertIn("- out.json", open(t["result_path"]).read())
+        listing = open(t["result_path"]).read()
+        self.assertIn("- out.json", listing)
+        self.assertNotIn("junk", listing)
         self.assertEqual(len(self.fakes["claude_api"].calls), 0)  # no planner or reviewer
 
     def test_agent_tier_waits_outside_window_and_auto_never_uses_agent(self):
@@ -246,9 +251,19 @@ class MiscTests(Base):
 
     def test_command_backend_drops_api_key(self):
         sh = ["sh", "-c", 'echo "${ANTHROPIC_API_KEY:-unset} ${ELVES_KEEP:-unset}"']
-        with mock.patch.dict(os.environ, ANTHROPIC_API_KEY="sk-test", ELVES_KEEP="kept"):
+        with mock.patch.dict(os.environ, ANTHROPIC_API_KEY="sk-test", ELVES_KEEP="kept",
+                             ELVES_TOKEN="t"):
             self.assertEqual(Command("c", {"argv": sh}).run("x").text, "unset kept")
             self.assertEqual(Command("c", {"argv": sh, "env_unset": []}).run("x").text, "sk-test kept")
+            tok = Command("c", {"argv": ["sh", "-c", 'echo "${ELVES_TOKEN:-unset}"']})
+            self.assertEqual(tok.run("x").text, "unset")
+
+    def test_command_backend_env_with_workspace(self):
+        c = Command("c", {"argv": ["sh", "-c", 'echo "$UV_CACHE_DIR|${PLAIN:-}"'],
+                          "env": {"UV_CACHE_DIR": "{cwd}/.cache/uv", "PLAIN": "yes"}})
+        self.assertEqual(c.run("x", cwd=self.tmp).text, f"{self.tmp}/.cache/uv|yes")
+        with mock.patch.dict(os.environ, {"UV_CACHE_DIR": "outer"}):
+            self.assertEqual(c.run("x").text, "outer|yes")  # no workspace: {cwd} entries skipped
 
     def test_command_backend_cwd_and_timeout_kills_children(self):
         self.assertEqual(Command("p", {"argv": ["pwd"]}).run("x", cwd=self.tmp).text,
