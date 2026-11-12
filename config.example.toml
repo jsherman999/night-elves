@@ -62,7 +62,6 @@ PIP_CACHE_DIR = "{cwd}/.cache/pip"
 npm_config_cache = "{cwd}/.cache/npm"
 CARGO_HOME = "{cwd}/.cache/cargo"
 XDG_CACHE_HOME = "{cwd}/.cache"
-GIT_TEMPLATE_DIR = "{cwd}/.cache/git-template"   # git init then writes no hooks
 
 [backends.codex]                         # ChatGPT plan via Codex CLI, as a second-opinion reviewer
 type = "command"

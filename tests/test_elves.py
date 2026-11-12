@@ -1,4 +1,5 @@
-import contextlib, io, json, os, tempfile, threading, time, unittest, urllib.error, urllib.request
+import contextlib, io, json, os, subprocess, tempfile, threading, time, unittest
+import urllib.error, urllib.request
 from unittest import mock
 from datetime import date, datetime, timezone
 from http.server import ThreadingHTTPServer
@@ -160,6 +161,10 @@ class DispatchTests(Base):
         listing = open(t["result_path"]).read()
         self.assertIn("- out.json", listing)
         self.assertNotIn("junk", listing)
+        self.assertIn("Committed to git", listing)
+        tracked = subprocess.run(["git", "-C", agent.cwd, "ls-files"], capture_output=True,
+                                 text=True, check=True).stdout.split()
+        self.assertEqual(tracked, ["out.json"])  # caches and node_modules stay out
         self.assertEqual(len(self.fakes["claude_api"].calls), 0)  # no planner or reviewer
 
     def test_agent_tier_waits_outside_window_and_auto_never_uses_agent(self):

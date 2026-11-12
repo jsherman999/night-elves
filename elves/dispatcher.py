@@ -1,6 +1,6 @@
 """The nightly run: drain the queue through plan -> execute -> review."""
 from __future__ import annotations
-import time
+import subprocess, time
 from datetime import datetime, timedelta
 from pathlib import Path
 from . import db, policy
@@ -16,12 +16,32 @@ AGENT_SYS = ("You are running unattended overnight and nobody can answer questio
              "the work there with the tools you have, and save every file you create inside it, "
              "even if the task names another path. Commands run in a sandbox: only the workspace "
              "is writable, and the network is limited to package registries and a few sites. "
-             "When you build software, keep dependencies local (a .venv or node_modules), use "
-             "`git init` and `cargo new --vcs none` rather than tools that write git hooks, run "
+             "When you build software, keep dependencies local (a .venv or node_modules), run "
              "the build and tests and fix what fails, stop any server you start (by its PID), "
-             "and write a README.md saying how to run it. Finish with a short summary of what "
-             "you did, what you verified, and anything left undone.")
+             "and write a README.md saying how to run it. Don't run `git init` (the sandbox "
+             "blocks it, so use `cargo new --vcs none`); the workspace is committed to git for "
+             "you when you finish. Finish with a short summary of what you did, what you "
+             "verified, and anything left undone.")
 SKIP_LISTING = {"node_modules", "target", "__pycache__", "venv"}  # plus anything hidden
+GIT_EXCLUDE = ".cache/\n.claude/\nnode_modules/\ntarget/\n.venv/\nvenv/\n__pycache__/\n.DS_Store\n"
+
+def commit_workspace(work: Path, message: str) -> str:
+    """Put an agent's workspace under git, outside the sandbox. Returns a line for the result."""
+    def git(*args):
+        return subprocess.run(["git", "-C", str(work), "-c", "user.name=night-elves",
+                               "-c", "user.email=night-elves@localhost", *args],
+                              capture_output=True, text=True, timeout=120, check=True)
+    try:
+        if not (work / ".git").exists():
+            git("init", "-q")
+            (work / ".git" / "info").mkdir(parents=True, exist_ok=True)
+            (work / ".git" / "info" / "exclude").write_text(GIT_EXCLUDE)
+        git("add", "-A")
+        if git("status", "--porcelain").stdout.strip():
+            git("commit", "-q", "-m", message)
+        return f"Committed to git in {work} ({git('rev-parse', '--short', 'HEAD').stdout.strip()})."
+    except (OSError, subprocess.SubprocessError) as e:
+        return f"Could not commit the workspace to git: {e}"
 RETRY_DELAY = timedelta(minutes=30)  # before a scheduled task is tried again after an error
 DOWN_AFTER = 3  # consecutive errors before a backend is skipped for the rest of the run
 
@@ -114,6 +134,9 @@ class Night:
                            if not any(s.startswith(".") or s in SKIP_LISTING for s in r.parts))
             files = (f"\n## Files in {work}\n\n" + "".join(f"- {n}\n" for n in names[:200])
                      if names else f"\n## Files\n\nNothing was saved in {work}.\n")
+            if names:
+                title = " ".join(task["prompt"].split())[:60]
+                files += "\n" + commit_workspace(work, f"Task {tid}: {title}") + "\n"
         path.write_text(f"# Task {tid}\n\n{task['prompt']}\n\n## Result ({r.executor})\n\n{answer}\n"
                         + files
                         + (f"\n## Review ({r.reviewer})\n\n{review}\n" if review else ""))

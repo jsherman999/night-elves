@@ -208,7 +208,9 @@ crates.io, GitHub and the common front-end CDNs; package caches (`uv`, `pip`,
 `npm`, `cargo`) point into the workspace through the backend's `env` table;
 `allowLocalBinding` lets it start a dev server and test against it; and the
 instructions it gets ask for a README, a passing build and tests, and no
-servers left running. It can only use the toolchains already installed
+servers left running. The sandbox never lets it write `.git/config` or hooks,
+so it can't `git init`; night-elves commits the workspace to git itself when
+the task finishes, leaving out caches, `node_modules`, `target` and venvs. It can only use the toolchains already installed
 (Node, Python via `uv`, Rust, Swift on the Studio), because it can't install
 Homebrew packages. `allowLocalBinding` also lets it reach other services on
 localhost, such as LM Studio's API.
