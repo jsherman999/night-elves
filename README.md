@@ -186,7 +186,13 @@ Set `[notify].argv` to any command that can deliver text. For iMessage, use
 argv = ["osascript", "/Users/YOU/night-elves/scripts/imessage.applescript", "+16125550123", "{text}"]
 ```
 
-Messages must be signed in to iMessage on the Mac that runs the queue. The
+Set `[web].public_url` to the address the phone pages are reached at (your
+Tailscale name, for example) and each finished or failed task in the digest
+gets a link to its result page.
+
+Messages must be signed in to iMessage on the Mac that runs the queue. If it
+is signed in to your own Apple ID and the recipient is you, the digest lands
+in your conversation with yourself, which iOS doesn't notify for. The
 first send from launchd asks for permission to control Messages: approve it
 on that Mac's screen (Screen Sharing works), or allow it later in System
 Settings > Privacy & Security > Automation. Until then the send fails, the

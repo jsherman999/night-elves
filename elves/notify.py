@@ -14,11 +14,14 @@ def digest(cfg, conn, since: str, now: datetime | None = None) -> str:
     lines = [f"night-elves {now:%a %b %d}: "
              f"{sum(r['status'] == 'done' for r in rows)} done, "
              f"{sum(r['status'] == 'failed' for r in rows)} failed, {queued} still queued"]
+    base = cfg["web"].get("public_url", "").rstrip("/")
     for r in rows:
         if r["status"] in ("done", "failed"):
             title = " ".join(r["prompt"].split())[:60]
             tail = f" ({r['last_error'][:60]})" if r["status"] == "failed" and r["last_error"] else ""
             lines.append(f"  #{r['id']} {r['status']} [{r['backend'] or '-'}] {title}{tail}")
+            if base:  # on its own line so Messages makes it tappable
+                lines.append(f"  {base}/t/{r['id']}")
     lines.append(f"API credit: ${st.tonight_spent:.2f} tonight, ${st.spent:.2f} of "
                  f"${st.credit:.0f} this cycle, {st.days_left}d left ({st.mode})")
     return "\n".join(lines)

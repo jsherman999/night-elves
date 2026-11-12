@@ -19,7 +19,8 @@ DEFAULTS = {
     "roles": {"local": "local", "frontier_api": "claude_api",
               "frontier_sub": "claude_cli", "second_opinion": "codex", "agent": "claude_agent"},
     "backends": {},
-    "web": {"host": "127.0.0.1", "port": 8377, "token_env": "ELVES_TOKEN", "sms_allow": []},
+    "web": {"host": "127.0.0.1", "port": 8377, "token_env": "ELVES_TOKEN", "sms_allow": [],
+            "public_url": ""},  # e.g. the Tailscale address; digests link each result there
     "notify": {"argv": []},
 }
 

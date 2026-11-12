@@ -142,6 +142,10 @@ class DispatchTests(Base):
         self.assertEqual(db.get(self.conn, tid)["status"], "done")
         text = notify.digest(self.cfg, self.conn, stats["run_start"], at(5)())
         self.assertIn("1 done, 0 failed", text)
+        self.assertNotIn("/t/", text)
+        self.cfg["web"]["public_url"] = "https://studio.example.ts.net/"
+        text = notify.digest(self.cfg, self.conn, stats["run_start"], at(5)())
+        self.assertIn(f"interrupted\n  https://studio.example.ts.net/t/{tid}", text)
 
     def test_agent_tier_runs_in_its_workspace(self):
         self.cfg["backends"]["claude_agent"] = {"type": "command", "argv": ["x"], "window": [1, 5]}

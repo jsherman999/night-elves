@@ -82,6 +82,7 @@ host = "127.0.0.1"           # keep on loopback; publish through Tailscale or a 
 port = 8377
 token_env = "ELVES_TOKEN"
 sms_allow = []               # e.g. ["+16125550123"]
+public_url = ""              # e.g. "https://studio.tailnet-name.ts.net": digests then link each result
 
 [notify]
 # Command that receives the morning digest. "{text}" is replaced with the digest;
