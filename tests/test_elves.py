@@ -158,6 +158,13 @@ class MiscTests(Base):
             self.assertEqual(Command("c", {"argv": sh}).run("x").text, "unset kept")
             self.assertEqual(Command("c", {"argv": sh, "env_unset": []}).run("x").text, "sk-test kept")
 
+    def test_notify_failure_does_not_raise(self):
+        self.cfg["notify"] = {"argv": ["sleep", "5"], "timeout": 0.2}
+        notify.send(self.cfg, "digest")  # timeout is reported, not raised
+        self.cfg["notify"] = {"argv": ["/nonexistent/notifier", "{text}"]}
+        notify.send(self.cfg, "digest")
+        self.assertTrue(any(f.startswith("digest-") for f in os.listdir(self.tmp)))
+
     def test_parse_inline(self):
         self.assertEqual(web.parse_inline("! opus: fix it"), ("fix it", 1, "frontier"))
         self.assertEqual(web.parse_inline("plain"), ("plain", 5, "auto"))

@@ -123,15 +123,19 @@ Two ways:
 
 ### Morning digest
 
-Set `[notify].argv` to any command that can deliver text. For iMessage to
-yourself, something like this (not tested here; the Messages scripting syntax
-varies between macOS versions):
+Set `[notify].argv` to any command that can deliver text. For iMessage, use
+`scripts/imessage.applescript` with the recipient's phone number or Apple ID:
 
 ```toml
-argv = ["osascript", "-e", "on run a", "-e",
-        'tell application "Messages" to send (item 1 of a) to buddy "+16125550123"',
-        "-e", "end run", "{text}"]
+[notify]
+argv = ["osascript", "/Users/YOU/night-elves/scripts/imessage.applescript", "+16125550123", "{text}"]
 ```
+
+Messages must be signed in to iMessage on the Mac that runs the queue. The
+first send from launchd asks for permission to control Messages: approve it
+on that Mac's screen (Screen Sharing works), or allow it later in System
+Settings > Privacy & Security > Automation. Until then the send fails, the
+failure is logged, and the digest is still written to the results folder.
 
 ## Backends
 

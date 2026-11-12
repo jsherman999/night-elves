@@ -1,6 +1,6 @@
 """Morning digest: what finished, what failed, what was spent."""
 from __future__ import annotations
-import subprocess
+import subprocess, sys
 from datetime import datetime
 from pathlib import Path
 from . import policy
@@ -31,5 +31,11 @@ def send(cfg, text: str) -> None:
     if not argv:
         return
     as_arg = any("{text}" in a for a in argv)
-    subprocess.run([a.replace("{text}", text) for a in argv],
-                   input=None if as_arg else text, text=True, timeout=60, check=False)
+    try:
+        p = subprocess.run([a.replace("{text}", text) for a in argv], input=None if as_arg else text,
+                           text=True, timeout=cfg["notify"].get("timeout", 60), check=False)
+    except (OSError, subprocess.TimeoutExpired) as e:
+        print(f"notify failed: {e}", file=sys.stderr)  # the digest file is already written
+        return
+    if p.returncode != 0:
+        print(f"notify failed: {argv[0]} exited {p.returncode}", file=sys.stderr)
