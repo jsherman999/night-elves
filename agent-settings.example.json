@@ -10,7 +10,7 @@
     "network": {
       "allowedDomains": ["pypi.org", "files.pythonhosted.org", "github.com", "api.github.com",
                          "raw.githubusercontent.com", "objects.githubusercontent.com",
-                         "bsky.social", "*.bsky.app", "*.bsky.network"]
+                         "bsky.social", "*.bsky.app", "bsky.network", "*.bsky.network"]
     }
   },
   "permissions": {
