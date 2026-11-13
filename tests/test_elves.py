@@ -29,6 +29,7 @@ def make_cfg(tmp):
         "claude_api": {"type": "anthropic_api"},
         "claude_cli": {"type": "command", "argv": ["x"], "window": [1, 5], "max_runs_per_night": 2},
     }
+    cfg["roles"]["classifier"] = "off"  # SizeUpTests turn it on
     return cfg
 
 def at(day, hour=2):
@@ -1097,3 +1098,175 @@ class MarkdownTests(unittest.TestCase):
         self.assertEqual(hrefs, ["https://ok.example/p_(1)", "https://ok.example/?a=1&amp;b=&quot;2"])
         self.assertNotIn("&amp;quot;", out)
         self.assertNotIn("onmouseover=\"", out)
+
+class SizeUpAndUsageTests(Base):
+    def test_auto_tasks_are_sized_up_once(self):
+        self.cfg["roles"]["classifier"] = ""  # the local model
+        self.cfg["backends"]["claude_agent"] = {"type": "command", "argv": ["x"], "window": [1, 5]}
+        build = db.add_task(self.conn, "clone github.com/x/y and add a dark mode")
+        news = db.add_task(self.conn, "find reviews of the new show")
+        poem = db.add_task(self.conn, "write a haiku")
+        verdicts = {"clone": "AGENT", "reviews": "**WEB**", "haiku": "ANSWER, clearly"}
+        def local(prompt, system):
+            if system and system.startswith("Sort a task"):
+                return next(v for k, v in verdicts.items() if k in prompt)
+            return "local answer"
+        agent = Fake("built it\nSTATUS: DONE\nCHECK: none")
+        self.night(18, hour=2, local=Fake(local), claude_agent=agent).run()
+        b, n, p = (db.get(self.conn, i) for i in (build, news, poem))
+        self.assertEqual((b["tier"], b["needs"], b["backend"]), ("agent", "agent", "claude_agent"))
+        self.assertEqual((n["tier"], n["needs"], n["backend"]), ("auto", "web", "claude_api"))
+        self.assertEqual((p["needs"], p["backend"]), ("answer", "local"))
+        sorts = [c for c in self.fakes["local"].calls if c[1].startswith("Sort a task")]
+        self.assertEqual(len(sorts), 3)
+        db.change(self.conn, poem, ("done",), prompt="write two haiku")  # an edit sizes it up again
+        self.assertIsNone(db.get(self.conn, poem)["needs"])
+
+    def test_web_tasks_wait_for_claude_rather_than_go_local(self):
+        tid = db.add_task(self.conn, "latest news")
+        db.update(self.conn, tid, needs="web")
+        self.cfg["budget"]["conserve_night_cap_usd"] = 0.0  # no API allowance tonight
+        self.cfg["budget"]["per_night_cap_usd"] = 0.0
+        self.cfg["backends"]["claude_cli"]["window"] = [1, 2]
+        stats = self.night(18, hour=3).run()
+        self.assertEqual((stats["skipped"], db.get(self.conn, tid)["status"]), (1, "queued"))
+
+    def test_time_tokens_and_cost_are_recorded_and_shown(self):
+        tid = db.add_task(self.conn, "x", tier="frontier")
+        self.night(18, hour=2).run()
+        t = db.get(self.conn, tid)
+        self.assertIsNotNone(t["secs"])
+        u = db.usage(self.conn, [tid])[tid]
+        self.assertEqual((u["in"], u["out"], u["usd"], u["est"]), (10, 20, 0.5, 0.5))
+        html_ = pages.task(t, "done", usage=u)
+        self.assertIn("<b>Tokens</b> 30 (10 in, 20 out)", html_)
+        self.assertIn("$0.50 API credit", html_)
+        self.assertIn("30 tok · $0.50", pages.row(t, u))
+        db.record_spend(self.conn, "claude_agent", tid, "execute", 1000, 50, 0.0, est_usd=1.25)
+        u = db.usage(self.conn, [tid])[tid]
+        self.assertIn("≈$1.25 at API prices", pages.cost(u))
+        self.assertEqual(pages.cost({"usd": 0.0, "est": 0.0}), "$0 (local)")
+        self.assertEqual((pages.duration(59), pages.duration(754), pages.duration(4000)),
+                         ("59s", "12m 34s", "1h 06m"))
+
+    def test_claude_and_opencode_json_output(self):
+        r = backends.parse_output("claude-json", 'noise\n' + json.dumps(
+            {"result": "pong\nSTATUS: DONE", "total_cost_usd": 0.11, "usage": {
+                "input_tokens": 2, "cache_read_input_tokens": 100, "cache_creation_input_tokens": 50,
+                "output_tokens": 4}}))
+        self.assertEqual((r.text, r.tokens_in, r.tokens_out, r.usd, r.est_usd),
+                         ("pong\nSTATUS: DONE", 152, 4, 0.0, 0.11))
+        lines = [{"type": "text", "part": {"text": "\n\nhello"}},
+                 {"type": "step_finish", "part": {"cost": 0, "tokens": {"input": 70, "output": 4,
+                                                  "reasoning": 6, "cache": {"read": 10, "write": 0}}}},
+                 {"type": "text", "part": {"text": "STATUS: DONE"}},
+                 {"type": "step_finish", "part": {"tokens": {"input": 90, "output": 1}}}]
+        r = backends.parse_output("opencode-json", "\n".join(json.dumps(x) for x in lines))
+        self.assertEqual((r.text, r.tokens_in, r.tokens_out), ("hello\n\nSTATUS: DONE", 170, 11))
+        self.assertEqual(backends.parse_output("text", " plain \n").text, "plain")
+
+    def test_api_continues_paused_turns_and_explains_an_empty_reply(self):
+        api = backends.AnthropicAPI("claude_api", {"model": "m", "price_in": 4.0, "price_out": 20.0,
+                                                  "server_tools": ["web_search", "web_fetch"],
+                                                  "effort": "high"})
+        paused = {"stop_reason": "pause_turn", "content": [{"type": "server_tool_use", "id": "s"}],
+                  "usage": {"input_tokens": 100, "output_tokens": 10,
+                            "server_tool_use": {"web_search_requests": 2}}}
+        final = {"stop_reason": "end_turn", "content": [{"type": "text", "text": "answer"}],
+                 "usage": {"input_tokens": 200, "output_tokens": 20}}
+        with mock.patch.dict(os.environ, {"ANTHROPIC_API_KEY": "k"}), \
+             mock.patch.object(backends, "_post", side_effect=[paused, final]) as post:
+            res = api.run("q")
+        self.assertEqual((res.text, res.tokens_in, res.tokens_out), ("answer", 300, 30))
+        self.assertAlmostEqual(res.usd, (300 * 4 + 30 * 20) / 1e6 + 0.02)
+        body = post.call_args_list[1].args[2]
+        self.assertEqual([t["name"] for t in body["tools"]], ["web_search", "web_fetch"])
+        self.assertEqual(body["output_config"], {"effort": "high"})
+        self.assertEqual(body["max_tokens"], 32000)
+        self.assertEqual(body["messages"][1]["role"], "assistant")  # the paused turn went back
+        thought = {"stop_reason": "max_tokens", "content": [{"type": "thinking", "thinking": ""}],
+                   "usage": {"input_tokens": 50, "output_tokens": 32000}}
+        with mock.patch.dict(os.environ, {"ANTHROPIC_API_KEY": "k"}), \
+             mock.patch.object(backends, "_post", return_value=thought):
+            with self.assertRaises(backends.SpentError) as cm:
+                api.run("q")
+        self.assertIn("used all 32000 output tokens", str(cm.exception))
+        self.assertEqual(cm.exception.result.tokens_out, 32000)
+
+    def test_a_failed_billed_call_is_still_recorded(self):
+        tid = db.add_task(self.conn, "x", tier="frontier")
+        class Spent:
+            def run(self, *a, **k):
+                raise backends.SpentError("claude_api: used all", Result("", 5, 9, 0.25))
+        self.night(18, hour=2, claude_api=Spent()).run()
+        u = db.usage(self.conn, [tid])[tid]
+        self.assertEqual((u["in"], u["out"], u["usd"]), (5, 9, 0.25))
+
+class PushTests(Base):
+    def git(self, *args, cwd=None):
+        return subprocess.run(["git", "-c", "user.name=t", "-c", "user.email=t@t", *args], cwd=cwd,
+                              capture_output=True, text=True, check=True).stdout.strip()
+
+    def setUp(self):
+        super().setUp()
+        from elves import push
+        self.push = push
+        self.remote = os.path.join(self.tmp, "remote.git")
+        self.git("init", "-q", "--bare", "-b", "main", self.remote)
+        seed = os.path.join(self.tmp, "seed")
+        self.git("clone", "-q", self.remote, seed)
+        open(os.path.join(seed, "a.txt"), "w").write("1\n")
+        self.git("add", "a.txt", cwd=seed)
+        self.git("commit", "-qm", "one", cwd=seed)
+        self.git("push", "-q", "origin", "HEAD:main", cwd=seed)
+        self.work = os.path.join(self.tmp, "work", "1")
+        os.makedirs(self.work)
+        self.clone = os.path.join(self.work, "app")
+        self.git("clone", "-q", self.remote, self.clone)
+        self.git("remote", "set-url", "origin", "https://github.com/jsherman999/app.git", cwd=self.clone)
+        open(os.path.join(self.clone, "a.txt"), "w").write("2\n")
+        self.git("commit", "-qam", "two", cwd=self.clone)
+        self.cfg["push"]["owners"] = ["jsherman999"]
+
+    def run_push(self, prompt="change it, commit and push", answer="PUSH: app main\nSTATUS: DONE"):
+        from pathlib import Path
+        with mock.patch.object(self.push, "DEST", self.remote):  # instead of GitHub
+            return self.push.run(self.cfg, Path(self.work), prompt, answer, dict(os.environ))
+
+    def test_a_requested_push_goes_from_the_host(self):
+        note = self.run_push()
+        self.assertIn("Pushed `main` to jsherman999/app", note)
+        self.assertEqual(self.git("--git-dir", self.remote, "log", "-1", "--format=%s", "main"), "two")
+
+    def test_hooks_in_the_agents_clone_never_run_on_the_host(self):
+        hook = os.path.join(self.clone, ".git", "hooks", "pre-push")
+        flag = os.path.join(self.tmp, "hook-ran")
+        open(hook, "w").write(f"#!/bin/sh\ntouch {flag}\n")
+        os.chmod(hook, 0o755)
+        self.git("config", "core.fsmonitor", f"touch {flag}", cwd=self.clone)
+        self.assertIn("Pushed", self.run_push())
+        self.assertFalse(os.path.exists(flag))
+
+    def test_pushes_that_are_not_allowed(self):
+        self.assertIn("didn't, so nothing", self.run_push(prompt="change it"))
+        self.assertIn("no PUSH line", self.run_push(answer="STATUS: DONE"))
+        self.assertIn("outside the workspace", self.run_push(answer="PUSH: ../.. main"))
+        self.assertIn("not a valid branch", self.run_push(answer="PUSH: app ..bad"))
+        self.cfg["push"]["owners"] = ["someone-else"]
+        self.assertIn("not under an owner", self.run_push())
+        self.cfg["push"]["owners"] = []
+        self.assertIn("Pushes are off", self.run_push())
+        self.assertEqual(self.git("--git-dir", self.remote, "log", "-1", "--format=%s", "main"), "one")
+
+    def test_a_non_fast_forward_push_is_refused(self):
+        self.git("reset", "-q", "--hard", "HEAD~1", cwd=self.clone)
+        open(os.path.join(self.clone, "b.txt"), "w").write("x\n")
+        self.git("add", "b.txt", cwd=self.clone)
+        self.git("commit", "-qm", "other", cwd=self.clone)
+        self.run_push()  # fast-forward from one: fine
+        self.git("reset", "-q", "--hard", "HEAD~1", cwd=self.clone)
+        open(os.path.join(self.clone, "c.txt"), "w").write("y\n")
+        self.git("add", "c.txt", cwd=self.clone)
+        self.git("commit", "-qm", "diverged", cwd=self.clone)
+        self.assertIn("failed", self.run_push())
+        self.assertEqual(self.git("--git-dir", self.remote, "log", "-1", "--format=%s", "main"), "other")

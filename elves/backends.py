@@ -6,12 +6,23 @@ from dataclasses import dataclass
 class BackendError(RuntimeError):
     pass
 
+class SpentError(BackendError):
+    """A call that failed after it was billed; result holds the tokens and cost to record."""
+    def __init__(self, msg, result):
+        super().__init__(msg)
+        self.result = result
+
 @dataclass
 class Result:
     text: str
     tokens_in: int = 0
     tokens_out: int = 0
-    usd: float = 0.0
+    usd: float = 0.0          # billed against the API credit (anthropic_api only)
+    est_usd: float | None = None  # what the work would cost at API prices; None = usd
+
+SERVER_TOOLS = {"web_search": "web_search_20260209", "web_fetch": "web_fetch_20260209"}
+SEARCH_USD = 0.01  # per web search request
+MAX_CONTINUES = 8  # pause_turn continuations of one request (long server-tool loops)
 
 def _post(url: str, headers: dict, body: dict, timeout: int) -> dict:
     req = urllib.request.Request(url, data=json.dumps(body).encode(),
@@ -88,17 +99,50 @@ class AnthropicAPI:
                 content.append({"type": kind, "source": {"type": "base64", "media_type": media,
                                                          "data": data}})
             content.append({"type": "text", "text": prompt})
-        body = {"model": self.c["model"], "max_tokens": self.c.get("max_tokens", 4096),
-                "messages": [{"role": "user", "content": content}]}
+        messages = [{"role": "user", "content": content}]
+        # Thinking is always on for current Opus models and counts against max_tokens, so
+        # leave plenty: 8k was used up by thinking before any answer on hard tasks.
+        body = {"model": self.c["model"], "max_tokens": self.c.get("max_tokens", 32000),
+                "messages": messages}
+        if self.c.get("effort"):
+            body["output_config"] = {"effort": self.c["effort"]}
         if system:
             body["system"] = system
-        d = _post("https://api.anthropic.com/v1/messages",
-                  {"x-api-key": key, "anthropic-version": "2023-06-01"},
-                  body, self.c.get("timeout", 900))
-        text = "".join(b.get("text", "") for b in d.get("content", []) if b.get("type") == "text")
-        u = d.get("usage") or {}
-        tin, tout = u.get("input_tokens", 0), u.get("output_tokens", 0)
-        usd = (tin * self.c.get("price_in", 0.0) + tout * self.c.get("price_out", 0.0)) / 1e6
+        tools = [{"type": SERVER_TOOLS[t], "name": t, "max_uses": self.c.get("max_tool_uses", 20)}
+                 for t in self.c.get("server_tools", []) if t in SERVER_TOOLS]
+        if tools:
+            body["tools"] = tools
+        headers = {"x-api-key": key, "anthropic-version": "2023-06-01"}
+        if self.c.get("fallbacks", True):  # a declined request is re-run on another model
+            headers["anthropic-beta"] = "server-side-fallback-2026-07-01"
+            body["fallbacks"] = "default"
+        tin = tout = searches = 0
+        for _ in range(MAX_CONTINUES + 1):
+            d = _post("https://api.anthropic.com/v1/messages", headers, body,
+                      self.c.get("timeout", 1800))
+            u = d.get("usage") or {}
+            tin += (u.get("input_tokens", 0) + u.get("cache_read_input_tokens", 0)
+                    + u.get("cache_creation_input_tokens", 0))
+            tout += u.get("output_tokens", 0)
+            searches += (u.get("server_tool_use") or {}).get("web_search_requests", 0)
+            if d.get("stop_reason") != "pause_turn":  # a long server-tool turn: send it back
+                break
+            messages.append({"role": "assistant", "content": d.get("content", [])})
+        usd = ((tin * self.c.get("price_in", 0.0) + tout * self.c.get("price_out", 0.0)) / 1e6
+               + searches * SEARCH_USD)
+        blocks = d.get("content", [])
+        text = "".join(b.get("text", "") for b in blocks if b.get("type") == "text")
+        if not text.strip():
+            stop = d.get("stop_reason")
+            if stop == "max_tokens":
+                why = (f"used all {body['max_tokens']} output tokens (thinking counts) before "
+                       "answering; raise max_tokens")
+            elif stop == "refusal":
+                det = d.get("stop_details") or {}
+                why = f"declined ({det.get('category') or 'no category'}): {det.get('explanation') or ''}"
+            else:
+                why = f"no text in the reply (stop_reason {stop})"
+            raise SpentError(f"{self.name}: {why}", Result("", tin, tout, usd))
         return Result(text, tin, tout, usd)
 
 class Command:
@@ -141,10 +185,48 @@ class Command:
             os.killpg(p.pid, signal.SIGKILL)
         except (ProcessLookupError, PermissionError):
             pass
+        res = parse_output(self.c.get("output", "text"), out)
         if p.returncode != 0:  # `claude -p` prints some errors ("Reached max turns") on stdout
-            detail = (err.strip() or out.strip())[-500:]
-            raise BackendError(f"{self.name}: exit {p.returncode}: {detail}")
-        return Result(out.strip())
+            detail = (err.strip() or res.text.strip() or out.strip())[-500:]
+            raise SpentError(f"{self.name}: exit {p.returncode}: {detail}", res)
+        return res
+
+def parse_output(kind: str, out: str) -> Result:
+    """A command's stdout as a Result. "claude-json" is `claude -p --output-format json`;
+    "opencode-json" is `opencode run --format json` (one event per line). Their token counts
+    and API-price estimates are recorded; a flat-rate tool bills nothing (usd 0)."""
+    if kind == "claude-json":
+        try:
+            d = json.loads(out.strip().splitlines()[-1])
+        except (ValueError, IndexError):
+            return Result(out.strip())
+        u = d.get("usage") or {}
+        tin = (u.get("input_tokens", 0) + u.get("cache_read_input_tokens", 0)
+               + u.get("cache_creation_input_tokens", 0))
+        return Result(str(d.get("result") or "").strip(), tin, u.get("output_tokens", 0), 0.0,
+                      float(d.get("total_cost_usd") or 0.0))
+    if kind == "opencode-json":
+        texts, tin, tout, cost, other = [], 0, 0, 0.0, []
+        for line in out.splitlines():
+            try:
+                ev = json.loads(line)
+            except ValueError:
+                if line.strip():
+                    other.append(line)
+                continue
+            part = ev.get("part") or {}
+            if ev.get("type") == "text" and part.get("text"):
+                texts.append(part["text"].strip())
+            elif ev.get("type") == "step_finish":
+                t = part.get("tokens") or {}
+                c = t.get("cache") or {}
+                tin += t.get("input", 0) + c.get("read", 0) + c.get("write", 0)
+                tout += t.get("output", 0) + t.get("reasoning", 0)
+                cost += float(part.get("cost") or 0.0)
+            elif ev.get("type") == "error":
+                texts.append(f"Error: {json.dumps(ev.get('error') or ev)[:500]}")
+        return Result("\n\n".join(texts + other).strip(), tin, tout, 0.0, cost)
+    return Result(out.strip())
 
 def environ(c: dict, cwd: str | None) -> dict:
     """The environment a command backend (and an agent's check) runs with: env_unset removed,

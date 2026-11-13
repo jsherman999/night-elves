@@ -56,6 +56,11 @@ max-width:18em;overflow-wrap:break-word}
 .imgs{display:grid;grid-template-columns:repeat(auto-fill,minmax(120px,1fr));gap:8px;margin:.6em 0}
 .imgs img{width:100%;height:160px;object-fit:cover;object-position:top;border-radius:9px;
 border:1px solid var(--line);background:var(--card);display:block}
+.use{font-size:.85em;color:var(--mute);margin:.2em 0}.use b{color:var(--ink);font-weight:600}
+@media (min-width:900px){main{max-width:min(1400px,94vw);padding:24px 32px 64px}
+.home{display:grid;grid-template-columns:minmax(300px,24em) minmax(0,1fr);gap:28px;align-items:start}
+.home>form{position:sticky;top:16px}.home h2:first-child{margin-top:.2em}
+.imgs{grid-template-columns:repeat(auto-fill,minmax(180px,1fr))}.imgs img{height:220px}}
 """
 
 def page(title: str, body: str, msg: str | None = None) -> str:
@@ -108,15 +113,61 @@ def tier_select(current="auto") -> str:
 def tier_help(current="auto") -> str:
     return f"<p class=hint id=tierhelp>{e(TIER_HELP.get(current, ''))}</p>"
 
-def home(rows, msg: str | None = None) -> str:
+def duration(secs) -> str:
+    if secs is None:
+        return ""
+    s = int(round(secs))
+    if s < 60:
+        return f"{s}s"
+    if s < 3600:
+        return f"{s // 60}m {s % 60:02d}s"
+    return f"{s // 3600}h {s % 3600 // 60:02d}m"
+
+def tokens(n: int) -> str:
+    return f"{n / 1e6:.1f}M" if n >= 10**6 else f"{n / 1e3:.1f}k" if n >= 10**4 else f"{n:,}"
+
+def cost(u) -> str:
+    """What the work cost: API credit billed, plus what subscription or flat-rate runs would
+    have cost at API prices. Local models cost nothing."""
+    parts = []
+    if u["usd"] >= 0.005:
+        parts.append(f"${u['usd']:.2f} API credit")
+    if u["est"] - u["usd"] >= 0.005:
+        parts.append(f"≈${u['est'] - u['usd']:.2f} at API prices (subscription, not billed)")
+    return " + ".join(parts) or "$0 (local)"
+
+def usage_line(t, u, short=False) -> str:
+    """Time, tokens and cost for a finished task; "" when nothing was recorded."""
+    took = duration(t["secs"] if "secs" in t.keys() else None)
+    if short:
+        bits = [took] if took else []
+        if u and u["in"] + u["out"]:
+            bits.append(f"{tokens(u['in'] + u['out'])} tok")
+        if u and u["est"] >= 0.005:
+            bits.append(f"${u['est']:.2f}" + ("" if u["usd"] >= 0.005 else " est"))
+        return " · ".join(bits)
+    if not took and not u:
+        return ""
+    bits = [f"<b>Time</b> {e(took or 'not recorded')}"]
+    if u:
+        bits.append(f"<b>Tokens</b> {u['in'] + u['out']:,} ({u['in']:,} in, {u['out']:,} out)")
+        bits.append(f"<b>Cost</b> {e(cost(u))}")
+        by = "; ".join(f"{e(b)} {tokens(v['in'] + v['out'])} tok"
+                       + (f" ${v['est']:.2f}" if v["est"] >= 0.005 else "")
+                       for b, v in u["by"].items())
+        return (f"<p class=use>{' · '.join(bits)}</p><p class=use>By model: {by}</p>")
+    return f"<p class=use>{' · '.join(bits)}</p>"
+
+def home(rows, msg: str | None = None, usage=None) -> str:
     waiting = sorted((t for t in rows if t["status"] == "queued"),
                      key=lambda t: (t["run_after"] is None, t["run_after"] or "", t["priority"], t["id"]))
     running = [t for t in rows if t["status"] in db.ACTIVE]
     recent = [t for t in rows if t["status"] not in ("queued", *db.ACTIVE)][:30]
+    usage = usage or {}
     def section(name, items, empty):
-        inner = "".join(row(t) for t in items) or f'<div class="row mute">{empty}</div>'
+        inner = "".join(row(t, usage.get(t["id"])) for t in items) or f'<div class="row mute">{empty}</div>'
         return f"<h2>{name}</h2><div class='card list'>{inner}</div>"
-    return page("Night Elves", f"""<h1>night-elves</h1>
+    return page("Night Elves", f"""<h1>night-elves</h1><div class=home>
 <form method=post action=/tasks class=card enctype=multipart/form-data>
 <textarea name=prompt rows=4 placeholder="What should the elves do?" required></textarea>
 <div class=two>{tier_select()}<input name=priority type=number min=1 max=9 value=5 aria-label=priority></div>
@@ -128,31 +179,38 @@ def home(rows, msg: str | None = None) -> str:
 <input id=files name=files type=file multiple>
 <p class=hint>Text files up to 200 KB work with any tier. Images and PDFs need Claude or the
 local vision model. Bigger or other kinds of files need agent.</p>
-<button>Queue it</button></form>
+<button>Queue it</button></form><div>
 {section("Running", running, "Nothing running.") if running else ""}
 {section("Waiting", waiting, "The queue is empty.")}
 {section("Recent", recent, "Nothing yet.")}
-<form method=post action=/logout><button class=quiet>Sign out</button></form>""", msg)
+<form method=post action=/logout><button class=quiet>Sign out</button></form></div></div>""", msg)
 
-def row(t) -> str:
+def row(t, u=None) -> str:
     pri = f" · p{t['priority']}" if t["priority"] != 5 else ""
     n = len(attachments.files(t))
     pri += f" · {n} file{'s' if n > 1 else ''}" if n else ""
+    if t["status"] in ("done", "failed") and (use := usage_line(t, u, short=True)):
+        pri += f" · {use}"
     return (f"<a class=row href=/t/{t['id']}><div class=top><b>#{t['id']}</b>"
             f"<span class='pill {e(t['status'])}'>{e(t['status'])}</span>"
             f"<span>{e(t['tier'])}{pri} · {e(when_text(t))}</span></div>"
             f"<div class=txt>{e(' '.join(t['prompt'].split())[:140])}</div></a>")
 
-def task(t, result: str | None, msg: str | None = None, raw: bool = False, shots=()) -> str:
+def task(t, result: str | None, msg: str | None = None, raw: bool = False, shots=(),
+         usage=None) -> str:
     tid, status = t["id"], t["status"]
     facts = [f"tier {t['tier']}", f"priority {t['priority']}", f"from {t['source']}",
              f"added {local(t['created_at']):%a %b %d %H:%M}"]
     if t["backend"]:
         facts.append(f"ran on {t['backend']}")
+    if "needs" in t.keys() and t["needs"]:
+        facts.append(f"sized up as {t['needs']}")
     if t["attempts"]:
         facts.append(f"{t['attempts']} attempt(s)")
     head = (f"<h1>#{tid} <span class='pill {e(status)}'>{e(status)}</span></h1>"
             f"<p class=mute>{e(' · '.join(facts))}</p>")
+    if status not in ("queued", *db.ACTIVE):
+        head += usage_line(t, usage)
     if status == "queued":
         head += f"<p><b>Runs {e(when_text(t))}</b></p>"
     if t["criteria"]:

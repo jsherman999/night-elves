@@ -3,8 +3,8 @@ from __future__ import annotations
 import re, subprocess, time, uuid
 from datetime import datetime, timedelta
 from pathlib import Path
-from . import attachments, backends, db, policy, verify
-from .backends import BackendError
+from . import attachments, backends, db, policy, push, verify
+from .backends import BackendError, SpentError
 
 PLAN_SYS = ("You are planning work that a smaller model will carry out. Do not do the task. "
             "Write a short numbered plan and the pitfalls to avoid. End with a section that starts "
@@ -25,6 +25,10 @@ AGENT_SYS = ("You are running unattended overnight and nobody can answer questio
              "CONNECT): the private ranges are in NO_PROXY, so override that (`curl --noproxy "
              "''`) and have scripts connect through the proxy. Ping, UDP, mDNS and packet "
              "capture are blocked; `arp -an` works. "
+             "Before deciding something can't be done, look for the tool: `ls /opt/homebrew/bin` "
+             "lists what is installed. Nothing can be installed system-wide. macOS won't start a "
+             "sandbox inside this one, so build Swift packages with `swift build "
+             "--disable-sandbox` (and `swift test --disable-sandbox`). "
              "When you build software, keep dependencies local (a .venv or node_modules), run "
              "the build and tests and fix what fails, stop any server you start (by its PID), "
              "and write a README.md saying how to run it. Don't run `git init` (the sandbox "
@@ -40,6 +44,15 @@ CONTRACT = ("End your reply with these two lines:\n"
             "a script that checks what you produced. Put anything longer than one line in a script "
             "(check.sh) and run that. It must not install anything, and it must start and stop any "
             "server it needs. Write CHECK: none only when no command could test the result.")
+CLASSIFY_SYS = (
+    "Sort a task by what it needs. Reply with exactly one word.\n"
+    "AGENT: it needs tools: running commands or programs; cloning, downloading, building, "
+    "testing, changing or deploying code or a repository; creating or editing files, apps, "
+    "sites, images, audio or video; committing or pushing; working through big data files.\n"
+    "WEB: a written answer is enough, but it needs current or specific information from the "
+    "internet: searching, reviews, news, prices, reading web pages or a repository's contents.\n"
+    "ANSWER: a written answer from general knowledge and the task's own text or attachments.")
+NEEDS = re.compile(r"\b(AGENT|WEB|ANSWER)\b")
 CONTINUE = ("This continues your earlier work on the task below, in the same workspace; your "
             "files from before are still there.")
 NOT_ACCEPTED = "not accepted: "  # starts last_error when feedback holds the reason
@@ -50,6 +63,7 @@ def commit_workspace(work: Path, message: str) -> str:
     """Put an agent's workspace under git, outside the sandbox. Returns a line for the result."""
     def git(*args):
         return subprocess.run(["git", "-C", str(work), "-c", "user.name=night-elves",
+                               "-c", "core.hooksPath=/dev/null", "-c", "core.fsmonitor=false",
                                "-c", "user.email=night-elves@localhost", *args],
                               capture_output=True, text=True, timeout=120, check=True)
     try:
@@ -105,23 +119,53 @@ class Night:
 
     def call(self, name, task_id, role, prompt, system, cwd=None, files=(), args=()):
         kw = {k: v for k, v in (("cwd", cwd), ("files", files), ("args", args)) if v}
+        t0 = time.monotonic()
+        def spent(res):
+            db.record_spend(self.conn, name, task_id, role, res.tokens_in, res.tokens_out,
+                            res.usd, ts=db.iso(self.now()), est_usd=res.est_usd,
+                            secs=round(time.monotonic() - t0, 1))
         try:
             res = self.backends[name].run(prompt, system, **kw)
-        except BackendError:
+        except BackendError as e:
+            if isinstance(e, SpentError):  # failed, but the tokens were used (and billed)
+                spent(e.result)
             self.errors[name] = self.errors.get(name, 0) + 1
             if self.errors[name] >= DOWN_AFTER:
                 self.down.add(name)
                 self.log(f"  {name} marked down for this run")
             raise
         self.errors[name] = 0
-        db.record_spend(self.conn, name, task_id, role, res.tokens_in, res.tokens_out, res.usd,
-                        ts=db.iso(self.now()))
+        spent(res)
         if not res.text.strip():
             raise BackendError(f"{name}: empty response")
         return res.text
 
+    def size_up(self, task):
+        """An auto task is sorted once, by a cheap local call: one that needs tools becomes an
+        agent task, one that needs the web goes to Claude with web search. Returns the task."""
+        if task["tier"] != "auto" or task["needs"]:
+            return task
+        name = self.cfg["roles"].get("classifier") or self.cfg["roles"]["local"]
+        if name == "off" or not self.ok(name):
+            return task
+        try:
+            reply = self.call(name, task["id"], "classify", f"Task:\n{task['prompt']}",
+                              CLASSIFY_SYS)
+        except BackendError as e:
+            self.log(f"  #{task['id']}: couldn't size it up ({e}); treating it as an answer")
+            return task
+        m = NEEDS.search(reply.upper())
+        needs = m.group(1).lower() if m else "answer"
+        fields = {"needs": needs}
+        if needs == "agent":
+            fields["tier"] = "agent"
+        db.update(self.conn, task["id"], **fields)
+        self.log(f"  #{task['id']} needs: {needs}")
+        return db.get(self.conn, task["id"])
+
     def process(self, task) -> str:
         """Returns the task's new status, or 'skipped' if nothing can take it tonight."""
+        task = self.size_up(task)
         tid = task["id"]
         r = policy.route(task, self.cfg, self.state(), self.ok)
         if r is None:
@@ -129,6 +173,14 @@ class Night:
         self.log(f"#{tid} plan={r.planner} exec={r.executor} review={r.reviewer}")
         if not db.claim(self.conn, tid, "planning" if r.planner else "running"):
             return "skipped"  # cancelled or changed since it was picked
+        t0 = time.monotonic()
+        try:
+            return self._process(task, r)
+        finally:
+            db.add_secs(self.conn, tid, round(time.monotonic() - t0, 1))
+
+    def _process(self, task, r) -> str:
+        tid = task["id"]
         try:
             work, cwd, send = None, None, []
             if task["tier"] == "agent":
@@ -154,7 +206,11 @@ class Night:
                                        accepted=False)
                     return self._retry(task, feedback=feedback,
                                        error=NOT_ACCEPTED + feedback.split("\n")[0][:200])
-                self._write_result(task, r.executor, answer, work, check=check)
+                env = backends.environ(self.cfg["backends"].get(r.executor, {}), str(work))
+                pushed = push.run(self.cfg, work, task["prompt"], answer, env)
+                if pushed:
+                    self.log(f"  #{tid} push: {pushed.splitlines()[0][:120]}")
+                self._write_result(task, r.executor, answer, work, check=check, pushed=pushed)
                 return self._done(task)
             if task["feedback"]:
                 prompt += f"\n\nA previous attempt was rejected. Reviewer feedback:\n{task['feedback']}"
@@ -201,6 +257,8 @@ class Night:
         its config) and this task has one, so a retry picks up where the last run stopped."""
         c, tid = self.cfg["backends"].get(executor, {}), task["id"]
         contract = CONTRACT.format(minutes=max(self.cfg["limits"]["check_timeout"] // 60, 1))
+        if push.asked(task["prompt"]):
+            contract += "\n\n" + push.NOTE
         system = AGENT_SYS + (f" {c['notes']}" if c.get("notes") else "") + "\n\n" + contract
         fresh = c.get("session_args")
         resume = c.get("resume_args", fresh)
@@ -258,7 +316,7 @@ class Night:
                 f"output ended:\n{out}")
 
     def _write_result(self, task, executor, answer, work, review="", reviewer=None, check=None,
-                      accepted=True):
+                      accepted=True, pushed=""):
         tid = task["id"]
         out = Path(self.cfg["paths"]["results"])
         out.mkdir(parents=True, exist_ok=True)
@@ -283,6 +341,7 @@ class Night:
         path.write_text(f"# Task {tid}\n\n{task['prompt']}\n\n{crit}{attached}"
                         f"## Result ({executor}{verdict})\n\n{answer}\n"
                         + (f"\n## Check\n\n{check}\n" if check else "")
+                        + (f"\n## Push\n\n{pushed}\n" if pushed else "")
                         + files
                         + (f"\n## Review ({reviewer})\n\n{review}\n" if review else ""))
         db.update(self.conn, tid, result_path=str(path))

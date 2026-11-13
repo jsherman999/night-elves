@@ -315,7 +315,8 @@ def make_handler(cfg: dict, token: str):
                     return self._send(200, pages.login(), HTML)
                 conn = db.connect(cfg["paths"]["db"])
                 try:
-                    return self._send(200, pages.home(db.list_tasks(conn, limit=300), msg), HTML)
+                    rows = db.list_tasks(conn, limit=300)
+                    return self._send(200, pages.home(rows, msg, db.usage(conn, [t["id"] for t in rows])), HTML)
                 finally:
                     conn.close()
             if u.path == "/tasks" or (m and m.group(1) == "tasks"):
@@ -335,11 +336,12 @@ def make_handler(cfg: dict, token: str):
                     return self._send(404, {"error": "no such task"})
                 if m.re is FILE_PATH:
                     return self._file(t, int(m.group(3)))
+                use = db.usage(conn, [t["id"]]).get(t["id"])
                 if m.group(1) == "tasks":
-                    return self._send(200, {**task_json(t), "result": self._result(t)})
+                    return self._send(200, {**task_json(t), "result": self._result(t), "usage": use})
                 raw = parse_qs(u.query).get("raw", [""])[0] == "1"
                 shots = attachments.work_images(cfg, t["id"]) if t["tier"] == "agent" else []
-                return self._send(200, pages.task(t, self._result(t), msg, raw, shots), HTML)
+                return self._send(200, pages.task(t, self._result(t), msg, raw, shots, use), HTML)
             finally:
                 conn.close()
 

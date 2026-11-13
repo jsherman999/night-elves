@@ -9,7 +9,11 @@
       },
       "models": {
         "qwen3.8-27b": {
-          "name": "Qwen3.8 27B (local)"
+          "name": "Qwen3.8 27B (local)",
+          "limit": {
+            "context": 65536,
+            "output": 16384
+          }
         }
       }
     }

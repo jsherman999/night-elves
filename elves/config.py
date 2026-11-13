@@ -22,7 +22,9 @@ DEFAULTS = {
               "frontier_sub": "claude_cli", "second_opinion": "codex", "agent": "claude_agent",
               "local_vision": "",  # a local model that sees images, e.g. "local_vision"
               "local_review": "",  # reviews local answers; "" = the local model itself
-              "local_agent": ""},  # agent tasks try this first, e.g. "local_agent" (opencode)
+              "local_agent": "",  # agent tasks try this first, e.g. "local_agent" (opencode)
+              "classifier": ""},  # sizes up auto tasks (agent, web or answer); "" = local, "off"
+    "push": {"owners": []},  # GitHub owners an agent's PUSH may go to; [] = no pushes
     "backends": {},
     "web": {"host": "127.0.0.1", "port": 8377, "token_env": "ELVES_TOKEN", "sms_allow": [],
             "max_upload_mb": 2048,  # one task's files, sent through the web intake

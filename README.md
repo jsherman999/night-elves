@@ -32,8 +32,14 @@ In every mode:
   no allowance left tonight it stays queued.
 - A task with `--tier agent` goes to an agent with tools, in a sandbox: the local
   agent first if one is set up, else Claude Code (see [Agent tier](#agent-tier)).
-  Nothing else is ever routed there. Its work is accepted only when its own check
-  passes.
+  Its work is accepted only when its own check passes.
+- An `auto` task is sized up once, before its first run, by a short call to the
+  local model (`roles.classifier`; `"off"` turns it off). One that needs tools
+  (clone, build, test, change or push code, make files or media) becomes an agent
+  task. One that needs current information from the web goes to `claude_api`,
+  which searches and fetches pages itself (`server_tools`), and waits for tonight's
+  allowance rather than let a local model answer from memory. The rest are routed
+  as below. The task page says what it was sized up as.
 - A task can say when it's done (`--done-when`). The executor, the reviewer and
   the agent are all held to it; without one, the planner writes some.
 - A task that fails locally twice is escalated to the frontier model. Failing
@@ -305,7 +311,19 @@ failure is logged, and the digest is still written to the results folder.
 |---|---|---|
 | `openai_compat` | any OpenAI-compatible local server | tokens only |
 | `anthropic_api` | Claude API key | dollars, from token counts and your prices |
-| `command` | any CLI that takes a prompt and prints an answer | runs per night |
+| `command` | any CLI that takes a prompt and prints an answer | runs per night; tokens and API-price estimates with `output = "claude-json"` or `"opencode-json"` |
+
+Every call's time, tokens and cost go in the ledger, and each finished or failed
+task shows them in the web UI: wall-clock time over all attempts, tokens in and
+out, the API credit billed, and, for subscription runs (`claude -p` with
+`--output-format json`), what the same work would have cost at API prices. Local
+models cost $0.
+
+`claude_api` runs with thinking on (Opus can't turn it off), and thinking counts
+against `max_tokens`, so keep that high (32000): at 8192, hard tasks used the
+whole budget thinking and came back empty. An empty reply now says why (out of
+tokens, or declined). `effort` sets how hard it thinks, and `fallbacks` (on
+unless set to false) reruns a declined request on another model.
 
 A `command` backend passes the prompt as an argument where `{prompt}` appears
 in `argv`, or on stdin if it does not. Nothing goes through a shell.
@@ -362,6 +380,32 @@ On the Studio, `sudo`, writes to the home folder, reads of `~/.ssh` and
 connections to unlisted hosts were all refused by the sandbox. A deny rule
 alone is not a boundary (`sh -c "sudo …"` gets past it); the sandbox is what
 stopped it. Add hosts a task needs to `allowedDomains`.
+
+### Pushing to GitHub
+
+The sandbox has no GitHub credentials, and won't get any. When a task asks for a
+push, the agent is told to commit in its clone and end with
+`PUSH: <clone folder> <branch>`. Once its check passes, night-elves pushes that
+branch from the host with your own git credentials, if:
+
+- the task's text asks for a push,
+- the clone's origin is on GitHub under an owner in `[push].owners`, and
+- the push is a fast-forward (it is never forced).
+
+Git is not run on the host inside the agent's clone, whose config and hooks the
+agent controls: the branch is bundled inside the check sandbox, fetched into a
+fresh repository, and pushed from there. The result file says what was pushed.
+
+### Tools and network
+
+Agents can use whatever is installed on the Mac (`ls /opt/homebrew/bin`), but
+can't install anything system-wide; on the Studio that includes Node, Python
+(`uv`), Rust, Go, Swift, Java, ffmpeg and ImageMagick. macOS won't nest
+sandboxes, so SwiftPM needs `--disable-sandbox`, which the agents are told. The
+sandbox can't allow every site: `allowedDomains` takes names and `*.name`
+wildcards but refuses `*`, so the examples list package registries, GitHub,
+Hugging Face, docs sites and CDNs. Claude's agent also has `WebFetch` and
+`WebSearch`, which reach any site outside the shell sandbox.
 
 ### Done means checked
 

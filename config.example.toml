@@ -41,11 +41,15 @@ timeout = 3600
 type = "anthropic_api"
 model = "claude-opus-5-5"
 api_key_env = "ANTHROPIC_API_KEY"        # key from the Console org linked to your plan
-max_tokens = 8192
-# USD per million tokens. PLACEHOLDERS: set these from the current pricing page,
-# or the pacing maths will be wrong.
-price_in = 5.0
-price_out = 25.0
+max_tokens = 32000                       # thinking always counts against this; 8k ran dry
+effort = "high"                          # low | medium (the model's default) | high | xhigh | max
+server_tools = ["web_search", "web_fetch"]  # Anthropic-run tools; searches cost $0.01 each
+max_tool_uses = 20                       # per tool, per request
+timeout = 1800
+# fallbacks = false                      # on by default: a declined request reruns on another model
+# USD per million tokens, from the current pricing page; the pacing maths depends on them.
+price_in = 4.0
+price_out = 20.0
 
 [backends.claude_cli]                     # Claude Code headless, on your subscription limits
 type = "command"
@@ -59,9 +63,10 @@ timeout = 1800
 [backends.claude_agent]                   # agent tier only: Claude Code that may run commands
 type = "command"                          # prompt goes on stdin; cwd is ~/.night-elves/work/<id>
 argv = ["claude", "-p", "--restricted", "--strict-mcp-config",
-        "--tools", "Bash,Read,Edit,Write,Glob,Grep,WebFetch",
+        "--tools", "Bash,Read,Edit,Write,Glob,Grep,WebFetch,WebSearch",
         "--settings", "~/.night-elves/agent-settings.json",   # copy of agent-settings.example.json
-        "--permission-mode", "dontAsk", "--max-turns", "200"]
+        "--permission-mode", "dontAsk", "--max-turns", "200", "--output-format", "json"]
+output = "claude-json"                    # records its tokens and what they'd cost at API prices
 session_args = ["--session-id", "{session}"]   # first run: a session id night-elves keeps
 resume_args = ["--resume", "{session}"]        # later runs of the task continue that session
 window = [1, 5]
@@ -79,7 +84,9 @@ XDG_CACHE_HOME = "{cwd}/.cache"
 [backends.local_agent]                    # agent tier, tried before Claude when roles.local_agent
 type = "command"                          # names it: opencode driving a local model, inside
 argv = ["srt", "--settings", "~/.night-elves/srt-settings.json", "--",  # Anthropic's sandbox
-        "opencode", "run", "--standalone", "--auto", "-m", "lmstudio/qwen3.8-27b"]  # runtime
+        "opencode", "run", "--standalone", "--auto", "--format", "json",  # runtime
+        "-m", "lmstudio/qwen3.8-27b"]
+output = "opencode-json"                  # records its token counts
 session_args = ["--session", "ses_{session_hex}"]  # the same id creates, then continues, a session
 max_runs_per_night = 10                   # no window: it runs any time, like the local model
 timeout = 5400
@@ -114,6 +121,10 @@ agent = "claude_agent"
 local_vision = ""            # "local_vision" to use the block above
 local_review = ""            # reviews local answers when no other reviewer is free; "" = local itself
 local_agent = ""             # "local_agent": agent tasks try it first (see Agent tier)
+classifier = ""              # sizes up auto tasks as agent / web / answer; "" = local, "off"
+
+[push]
+owners = []                  # GitHub owners an agent may push to, e.g. ["your-user"]; [] = none
 
 [web]
 host = "127.0.0.1"           # keep on loopback; publish through Tailscale or a tunnel

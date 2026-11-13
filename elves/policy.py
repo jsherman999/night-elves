@@ -89,6 +89,15 @@ def route(task, cfg: dict, state: State, ok) -> Route | None:
         return agent_route(task, cfg, ok)
     fs = attachments.files(task)
     kinds = {f["kind"] for f in fs}
+    needs = task["needs"] if "needs" in task.keys() else None
+    if task["tier"] == "auto" and needs == "web" and "data" not in kinds:
+        # Only Claude can search the web (claude_api with server_tools); wait for it rather
+        # than let a local model answer from memory, unless no Claude backend is set up.
+        if frontier:
+            return Route(None, frontier, None)
+        if any(cfg["backends"].get(n, {}).get("enabled", True) and n in cfg["backends"]
+               for n in (r["frontier_api"], r["frontier_sub"])):
+            return None
     if "data" in kinds:  # only the agent can work on these; intake already insists on it
         return None
     if kinds & attachments.VISUAL:  # images or PDFs: Claude, or a local vision model

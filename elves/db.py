@@ -24,7 +24,9 @@ CREATE TABLE IF NOT EXISTS tasks (
   images TEXT,                               -- 0.4.0 only; moved to files
   files TEXT,                                -- JSON [{name, kind, size}] in attachments/<id>/
   criteria TEXT,                             -- "done when": what the result must satisfy
-  session TEXT                               -- "<backend> <id>" of the agent session to resume
+  session TEXT,                              -- "<backend> <id>" of the agent session to resume
+  needs TEXT,                                -- auto tier: agent | web | answer, decided once
+  secs REAL                                  -- wall-clock seconds spent on it, all attempts
 );
 CREATE INDEX IF NOT EXISTS tasks_status ON tasks(status, priority, id);
 CREATE TABLE IF NOT EXISTS spend (
@@ -34,7 +36,9 @@ CREATE TABLE IF NOT EXISTS spend (
   role TEXT,                                 -- plan | execute | review
   tokens_in INTEGER NOT NULL DEFAULT 0,
   tokens_out INTEGER NOT NULL DEFAULT 0,
-  usd REAL NOT NULL DEFAULT 0
+  usd REAL NOT NULL DEFAULT 0,               -- billed against the API credit
+  est_usd REAL,                              -- the same work at API prices (NULL = usd)
+  secs REAL                                  -- how long the call took
 );
 CREATE INDEX IF NOT EXISTS spend_ts ON spend(backend, ts);
 """
@@ -53,9 +57,15 @@ def connect(path: str) -> sqlite3.Connection:
     conn.execute("PRAGMA journal_mode=WAL")
     conn.executescript(SCHEMA)
     cols = {r[1] for r in conn.execute("PRAGMA table_info(tasks)")}
-    for col in ("run_after", "images", "files", "criteria", "session"):  # before 0.2/0.4/0.5/0.7
+    for col, kind in (("run_after", "TEXT"), ("images", "TEXT"), ("files", "TEXT"),
+                      ("criteria", "TEXT"), ("session", "TEXT"),  # before 0.2/0.4/0.5/0.7
+                      ("needs", "TEXT"), ("secs", "REAL")):  # before 0.9
         if col not in cols:
-            conn.execute(f"ALTER TABLE tasks ADD COLUMN {col} TEXT")
+            conn.execute(f"ALTER TABLE tasks ADD COLUMN {col} {kind}")
+    scols = {r[1] for r in conn.execute("PRAGMA table_info(spend)")}
+    for col in ("est_usd", "secs"):
+        if col not in scols:
+            conn.execute(f"ALTER TABLE spend ADD COLUMN {col} REAL")
     old = conn.execute("SELECT id, images FROM tasks WHERE images IS NOT NULL AND files IS NULL")
     for tid, images in old.fetchall():  # 0.4.0 kept a list of image names
         conn.execute("UPDATE tasks SET files=? WHERE id=?", (json.dumps(
@@ -119,6 +129,8 @@ def change(conn, task_id: int, allowed=EDITABLE, vision=False, **fields) -> None
         fields["priority"] = int(fields["priority"])
     if "criteria" in fields:
         fields["criteria"] = (fields["criteria"] or "").strip() or None
+    if "prompt" in fields or "tier" in fields:
+        fields["needs"] = None  # an edited auto task is sized up again
     fields["updated_at"] = iso()
     sets = ", ".join(f"{k}=?" for k in fields)
     marks = ",".join("?" * len(allowed))
@@ -172,10 +184,37 @@ def requeue_stale(conn) -> int:
     conn.commit()
     return cur.rowcount
 
-def record_spend(conn, backend, task_id, role, tokens_in=0, tokens_out=0, usd=0.0, ts=None):
-    conn.execute("INSERT INTO spend VALUES (?,?,?,?,?,?,?)",
-                 (ts or iso(), backend, task_id, role, tokens_in, tokens_out, usd))
+def record_spend(conn, backend, task_id, role, tokens_in=0, tokens_out=0, usd=0.0, ts=None,
+                 est_usd=None, secs=None):
+    conn.execute("INSERT INTO spend (ts, backend, task_id, role, tokens_in, tokens_out, usd,"
+                 " est_usd, secs) VALUES (?,?,?,?,?,?,?,?,?)",
+                 (ts or iso(), backend, task_id, role, tokens_in, tokens_out, usd, est_usd, secs))
     conn.commit()
+
+def add_secs(conn, task_id: int, secs: float) -> None:
+    conn.execute("UPDATE tasks SET secs=COALESCE(secs,0)+? WHERE id=?", (secs, task_id))
+    conn.commit()
+
+def usage(conn, task_ids) -> dict:
+    """Per task: {"in", "out", "usd" (billed), "est" (at API prices), "calls", "by": {backend:
+    {"in", "out", "est"}}}, from the spend ledger."""
+    ids = list(task_ids)
+    out: dict = {}
+    if not ids:
+        return out
+    marks = ",".join("?" * len(ids))
+    for r in conn.execute(
+            "SELECT task_id, backend, SUM(tokens_in), SUM(tokens_out), SUM(usd), "
+            f"SUM(COALESCE(est_usd, usd)), COUNT(*) FROM spend WHERE task_id IN ({marks}) "
+            "GROUP BY task_id, backend ORDER BY MIN(ts)", ids):
+        u = out.setdefault(r[0], {"in": 0, "out": 0, "usd": 0.0, "est": 0.0, "calls": 0, "by": {}})
+        u["in"] += r[2] or 0
+        u["out"] += r[3] or 0
+        u["usd"] += r[4] or 0.0
+        u["est"] += r[5] or 0.0
+        u["calls"] += r[6]
+        u["by"][r[1]] = {"in": r[2] or 0, "out": r[3] or 0, "est": r[5] or 0.0}
+    return out
 
 def usd_since(conn, backend: str, since: str) -> float:
     return conn.execute("SELECT COALESCE(SUM(usd),0) FROM spend WHERE backend=? AND ts>=?",
