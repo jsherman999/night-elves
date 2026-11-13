@@ -45,14 +45,21 @@ CONTRACT = ("End your reply with these two lines:\n"
             "(check.sh) and run that. It must not install anything, and it must start and stop any "
             "server it needs. Write CHECK: none only when no command could test the result.")
 CLASSIFY_SYS = (
-    "Sort a task by what it needs. Reply with exactly one word.\n"
-    "AGENT: it needs tools: running commands or programs; cloning, downloading, building, "
-    "testing, changing or deploying code or a repository; creating or editing files, apps, "
-    "sites, images, audio or video; committing or pushing; working through big data files.\n"
-    "WEB: a written answer is enough, but it needs current or specific information from the "
-    "internet: searching, reviews, news, prices, reading web pages or a repository's contents.\n"
-    "ANSWER: a written answer from general knowledge and the task's own text or attachments.")
-NEEDS = re.compile(r"\b(AGENT|WEB|ANSWER)\b")
+    "Sort a task by what it needs to be done well. Reply with exactly one of these words: "
+    "AGENT, WEB or ANSWER.\n"
+    "AGENT: doing it takes tools. It asks to clone, download, run, build, test, install, fix, "
+    "change, add to, port or deploy code, an app or a repository; to create or edit files, "
+    "sites, images, audio or video; to commit or push; or to work through big data files. "
+    "Answer AGENT whenever the task asks for something to be made or changed, even if it also "
+    "needs the web.\n"
+    "WEB: only a written answer is wanted, but it needs current or specific information from "
+    "the internet: searching, reviews, news, prices, or reading web pages or a repository.\n"
+    "ANSWER: a written answer from general knowledge and the task's own text or attachments.\n"
+    "Examples: 'clone this repo and find bugs' AGENT; 'add a GitHub Pages version of this app' "
+    "AGENT; 'make a video about this app' AGENT; 'find reviews of this product' WEB; 'what "
+    "does this GitHub repo do' WEB; 'explain how TCP works' ANSWER.")
+NEEDS = re.compile(r"\b(AGENT|TOOLS?|WEB|SEARCH|ANSWER)\b")
+NEEDS_MAP = {"TOOL": "agent", "TOOLS": "agent", "SEARCH": "web"}
 CONTINUE = ("This continues your earlier work on the task below, in the same workspace; your "
             "files from before are still there.")
 NOT_ACCEPTED = "not accepted: "  # starts last_error when feedback holds the reason
@@ -155,7 +162,7 @@ class Night:
             self.log(f"  #{task['id']}: couldn't size it up ({e}); treating it as an answer")
             return task
         m = NEEDS.search(reply.upper())
-        needs = m.group(1).lower() if m else "answer"
+        needs = NEEDS_MAP.get(m.group(1), m.group(1).lower()) if m else "answer"
         fields = {"needs": needs}
         if needs == "agent":
             fields["tier"] = "agent"
