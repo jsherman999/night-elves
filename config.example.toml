@@ -19,7 +19,8 @@ conserve_night_cap_usd = 2.0 # early-cycle ceiling (frontier-tier tasks and esca
 max_attempts = 3             # then the task is marked failed
 escalate_after = 2           # failed local attempts before the frontier model takes over
 max_minutes = 360            # stop starting new tasks after this long
-hard_priority = 3            # priority <= this counts as "hard" in endgame mode
+hard_priority = 3            # priority <= this counts as "hard": endgame tasks, Claude's agent
+check_timeout = 600          # seconds an agent's CHECK command may run when night-elves re-runs it
 
 [backends.local]
 type = "openai_compat"
@@ -61,9 +62,12 @@ argv = ["claude", "-p", "--restricted", "--strict-mcp-config",
         "--tools", "Bash,Read,Edit,Write,Glob,Grep,WebFetch",
         "--settings", "~/.night-elves/agent-settings.json",   # copy of agent-settings.example.json
         "--permission-mode", "dontAsk", "--max-turns", "200"]
+session_args = ["--session-id", "{session}"]   # first run: a session id night-elves keeps
+resume_args = ["--resume", "{session}"]        # later runs of the task continue that session
 window = [1, 5]
 max_runs_per_night = 3
 timeout = 5400                            # then the whole process group is killed
+# notes = "..."                           # added to the agent's instructions (see local_agent)
 
 [backends.claude_agent.env]               # caches live in the workspace, the only writable place
 UV_CACHE_DIR = "{cwd}/.cache/uv"
@@ -71,6 +75,28 @@ PIP_CACHE_DIR = "{cwd}/.cache/pip"
 npm_config_cache = "{cwd}/.cache/npm"
 CARGO_HOME = "{cwd}/.cache/cargo"
 XDG_CACHE_HOME = "{cwd}/.cache"
+
+[backends.local_agent]                    # agent tier, tried before Claude when roles.local_agent
+type = "command"                          # names it: opencode driving a local model, inside
+argv = ["srt", "--settings", "~/.night-elves/srt-settings.json", "--",  # Anthropic's sandbox
+        "opencode", "run", "--standalone", "--auto", "-m", "lmstudio/qwen3.8-27b"]  # runtime
+session_args = ["--session", "ses_{session_hex}"]  # the same id creates, then continues, a session
+max_runs_per_night = 10                   # no window: it runs any time, like the local model
+timeout = 5400
+notes = """Playwright 1.65.0 and its Chromium are installed on this Mac. Use exactly that \
+version (npm i -D playwright@1.65.0): another would try to download a browser and fail. In this \
+sandbox Chromium only starts as chromium.launch({ args: ['--single-process'] })."""
+
+[backends.local_agent.env]                # opencode's config, sessions and caches
+OPENCODE_CONFIG = "~/.night-elves/opencode.json"   # copy of opencode.example.json
+XDG_CONFIG_HOME = "{cwd}/.cache/config"
+XDG_DATA_HOME = "{cwd}/.cache/data"       # sessions live here, so a retry can continue one
+XDG_STATE_HOME = "{cwd}/.cache/state"
+XDG_CACHE_HOME = "{cwd}/.cache"
+UV_CACHE_DIR = "{cwd}/.cache/uv"
+PIP_CACHE_DIR = "{cwd}/.cache/pip"
+npm_config_cache = "{cwd}/.cache/npm"
+CARGO_HOME = "{cwd}/.cache/cargo"
 
 [backends.codex]                         # ChatGPT plan via Codex CLI, as a second-opinion reviewer
 type = "command"
@@ -86,6 +112,8 @@ frontier_sub = "claude_cli"
 second_opinion = "codex"
 agent = "claude_agent"
 local_vision = ""            # "local_vision" to use the block above
+local_review = ""            # reviews local answers when no other reviewer is free; "" = local itself
+local_agent = ""             # "local_agent": agent tasks try it first (see Agent tier)
 
 [web]
 host = "127.0.0.1"           # keep on loopback; publish through Tailscale or a tunnel

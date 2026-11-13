@@ -49,6 +49,34 @@ def files(task) -> list[dict]:
 def kinds(task) -> set[str]:
     return {f["kind"] for f in files(task)}
 
+WORK_SKIP = {"node_modules", "target", "__pycache__", "venv"}  # plus anything hidden
+WORK_IMAGES = 24
+
+def work_images(cfg: dict, tid: int) -> list[str]:
+    """Images an agent saved in its workspace (screenshots, say), as paths relative to it."""
+    root = Path(cfg["paths"]["work"]) / str(tid)
+    if not root.is_dir():
+        return []
+    found = []
+    for dirpath, dirs, names in os.walk(root):
+        dirs[:] = sorted(d for d in dirs if not d.startswith(".") and d not in WORK_SKIP)
+        for n in sorted(names):
+            if not n.startswith(".") and n.rsplit(".", 1)[-1].lower() in TYPES | {"jpeg": ""}:
+                found.append(str((Path(dirpath) / n).relative_to(root)))
+                if len(found) >= WORK_IMAGES:
+                    return found
+    return found
+
+def work_image(cfg: dict, tid: int, rel: str) -> Path | None:
+    """One of those images, or None if rel leads anywhere else."""
+    root = (Path(cfg["paths"]["work"]) / str(tid)).resolve()
+    p = (root / rel).resolve()
+    if (not p.is_relative_to(root) or not p.is_file()
+            or p.suffix.lstrip(".").lower() not in TYPES | {"jpeg": ""}
+            or any(s.startswith(".") or s in WORK_SKIP for s in p.relative_to(root).parts)):
+        return None
+    return p
+
 def task_dir(cfg: dict, tid: int) -> Path:
     return Path(cfg["paths"]["attachments"]) / str(tid)
 

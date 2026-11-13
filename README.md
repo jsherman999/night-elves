@@ -22,17 +22,24 @@ remain.
 
 | Mode | When | Planner | Executor | Reviewer |
 |---|---|---|---|---|
-| conserve | first half of the cycle | none | local | codex, if enabled |
-| pace | second half | frontier | local | frontier |
+| conserve | first half of the cycle | none | local | codex if enabled, else a local model |
+| pace | second half | frontier | local | frontier (local if tonight's allowance is gone) |
 | endgame | last 7 days | frontier | frontier for priority 1-3, else local | frontier |
 
 In every mode:
 
 - A task with `--tier frontier` goes straight to the frontier model. If there is
   no allowance left tonight it stays queued.
-- A task with `--tier agent` goes to Claude Code with tools, in a sandbox (see
-  [Agent tier](#agent-tier)). Nothing else is ever routed there.
-- A task that fails locally twice is escalated to the frontier model.
+- A task with `--tier agent` goes to an agent with tools, in a sandbox: the local
+  agent first if one is set up, else Claude Code (see [Agent tier](#agent-tier)).
+  Nothing else is ever routed there. Its work is accepted only when its own check
+  passes.
+- A task can say when it's done (`--done-when`). The executor, the reviewer and
+  the agent are all held to it; without one, the planner writes some.
+- A task that fails locally twice is escalated to the frontier model. Failing
+  includes a reviewer's FAIL, so local answers get a review even in conserve
+  mode: by codex if it's enabled, else by `roles.local_review` (or the local
+  model itself).
 - "Frontier" means the API credit first. When tonight's allowance is used up,
   it falls back to `claude -p`, which only runs inside its time window and up
   to its nightly run cap, so the subscription is fresh in the morning.
@@ -73,6 +80,8 @@ elf add "Summarise the open issues in ~/notes/issues.md"
 elf add -p 1 -t frontier "Design the schema for the access-review tool"
 elf add -t agent "Capture 5 seconds of the Bluesky firehose to a JSON file"
 elf add --at 01:30 -t agent "Record which hosts answer ping on the LAN"
+elf add -t agent --done-when "a screenshot of each form is in shots/" \
+        "Clone github.com/me/app, run it, and screenshot its forms with Playwright"
 cat spec.md | elf add -
 elf list
 elf show 3
@@ -81,7 +90,7 @@ elf run --dry-run       # show how each queued task would be routed
 elf run                 # work the queue now
 elf retry 3             # requeue a failed, cancelled or finished task
 elf cancel 4 5          # take queued tasks out of the queue
-elf edit 4 -t agent -p 2 --at 01:30    # also --prompt "...", --now, --tonight
+elf edit 4 -t agent -p 2 --at 01:30    # also --prompt, --done-when, --now, --tonight
 ```
 
 `elf edit` and `elf cancel` only touch tasks that haven't started (queued, failed
@@ -158,12 +167,12 @@ the token (HttpOnly, SameSite=Strict, Secure over HTTPS), so changing
 
 | Request | Does |
 |---|---|
-| `POST /tasks` `{"prompt", "priority", "tier", "at"}` | queue a task |
+| `POST /tasks` `{"prompt", "priority", "tier", "at", "criteria"}` | queue a task (`criteria`: done when) |
 | `POST /tasks` as `multipart/form-data`, same fields plus `files` | queue a task with files |
 | `GET /tasks` | the latest 100 tasks |
 | `GET /tasks/<id>` | one task, with its result text and its files |
 | `GET /tasks/<id>/f/<n>` | its nth file (1-based) |
-| `POST /tasks/<id>` `{"action": "save", "prompt", "tier", "priority", "at"}` | edit it (`"at": ""` clears the time) |
+| `POST /tasks/<id>` `{"action": "save", "prompt", "tier", "priority", "at", "criteria"}` | edit it (`"at": ""` clears the time) |
 | `POST /tasks/<id>` `{"action": "now" \| "cancel" \| "retry"}` | run it within a minute, cancel it, requeue it |
 
 A change to a task a run has already started returns 409.
@@ -290,9 +299,18 @@ list.
 ## Agent tier
 
 Most tasks are text in, text out. A task queued with `--tier agent` instead
-runs `claude -p` with tools, so it can run commands, write files and fetch
-from the network. It is opt-in per task and only runs through the
-`claude_agent` backend in `config.example.toml`, which:
+runs an agent with tools, so it can run commands, write files and fetch from
+the network. It is opt-in per task. Two agents can take it:
+
+- **The local agent** (`local_agent` in `config.example.toml`, used when
+  `roles.local_agent` names it): opencode driving a local model (Qwen3.8-27B on
+  the Studio), inside Anthropic's sandbox runtime. It runs any time, so an agent
+  task set to run now during the day starts within a minute. It goes first.
+- **Claude Code** (`claude_agent`): takes a task after the local agent has
+  failed it twice (`escalate_after`), and takes priority 1-3 tasks
+  (`hard_priority`) from the start. Without a local agent it takes them all.
+
+The `claude_agent` backend:
 
 - runs in `~/.night-elves/work/<id>/`, and the result file lists what was saved there
 - uses `--restricted`, so your user, project and local Claude settings,
@@ -327,10 +345,84 @@ connections to unlisted hosts were all refused by the sandbox. A deny rule
 alone is not a boundary (`sh -c "sudo …"` gets past it); the sandbox is what
 stopped it. Add hosts a task needs to `allowedDomains`.
 
+### Done means checked
+
+An agent doesn't get to declare itself finished. Its instructions end with a
+contract: the last two lines of its reply must be
+
+```
+STATUS: DONE            (or INCOMPLETE)
+CHECK: <one shell command that exits 0 only when the work is right>
+```
+
+When the agent exits, night-elves runs the `CHECK` command itself, from the
+workspace, under `sandbox-exec` with its own profile: writes only in the
+workspace and the temp folders, no network except localhost, no secrets, and
+`sudo`, `osascript`, `security`, `launchctl` and `ssh` refused. It gets
+`check_timeout` seconds (10 minutes), and anything it leaves running is killed.
+The work is accepted only on `STATUS: DONE` and a check that exits 0. A missing
+STATUS line, `INCOMPLETE`, or a failing check counts as a failed attempt, and the
+next attempt is told why, including the end of the check's output. The task's
+`--done-when` text, if it has one, is in the agent's instructions too, and the
+check should test it. `CHECK: none` is accepted, for tasks that only gather
+information; the result says so.
+
+The result file has a **Check** section with the command, its exit code and
+the end of its output. A rejected attempt's result is kept too, marked "not
+accepted", and the workspace is committed to git after every attempt, so you
+can see what each one did.
+
+### Retries continue the session
+
+A retry doesn't start over. Each agent task keeps a session id
+(`session_args`/`resume_args` on the backend): Claude Code gets `--session-id`,
+then `--resume`, and opencode gets `--session ses_…`, which creates the session
+the first time and continues it after. So an agent that hit its time limit or
+turn limit, or whose check failed, carries on with everything it knew, and is
+told what went wrong. If the session has gone (Claude prints "No conversation
+found"), it starts a new one in the same workspace, told that the earlier files
+are there. A task that moves from the local agent to Claude starts a Claude
+session, with the same workspace and the same feedback.
+
+### Setting up the local agent
+
+On the Studio this needs opencode, LM Studio with the model loaded, and
+Anthropic's [sandbox runtime](https://www.npmjs.com/package/@anthropic-ai/sandbox-runtime):
+
+```sh
+npm i -g @anthropic-ai/sandbox-runtime          # the srt command
+cp srt-settings.example.json ~/.night-elves/srt-settings.json
+cp opencode.example.json ~/.night-elves/opencode.json
+```
+
+Then copy the `[backends.local_agent]` block from `config.example.toml` and set
+`roles.local_agent = "local_agent"`. `srt-settings.json` matches the sandbox in
+`agent-settings.example.json`: writes only in the workspace (`"."`, as srt runs
+there), the same denied reads, and the same domain allowlist; keep the two in
+step. opencode runs with `--standalone`, so its tools run in srt with it rather
+than in opencode's background service, and with `--auto`, as nobody is there to
+approve anything. Its config, sessions and caches are pointed into the
+workspace by the backend's `env` table.
+
+### Browsers
+
+Playwright's Chromium is installed for the agents to use
+(`npx playwright@1.65.0 install chromium`, into `~/Library/Caches/ms-playwright`).
+Agents can't download a browser themselves, so their `notes` (added to their
+instructions) tell them to use that exact Playwright version, and to launch
+Chromium with `--single-process`: inside the sandbox it can't register the Mach
+port its helper processes need, and fails with `bootstrap_check_in ...
+Permission denied` otherwise. The check sandbox doesn't have that limit.
+
+Images an agent saves in its workspace (screenshots, say) are shown on the
+task's page, up to 24 of them; hidden folders, `node_modules` and the like are
+left out, and only PNG, JPEG, GIF and WebP files are served.
+
 ### Home network
 
 `scripts/allow-lan.py` adds every address on the Mac's local subnets to
-`allowedDomains` in `~/.night-elves/agent-settings.json` (the sandbox has no
+`allowedDomains` in `~/.night-elves/agent-settings.json`, and in
+`srt-settings.json` for the local agent if it's there (the sandbox has no
 CIDR syntax, so it's one entry per host; `--remove` takes them out, and a
 re-run refreshes them after the network changes). What agent tasks can then do
 on the LAN, as tested on the Studio:
@@ -348,7 +440,11 @@ measure how much traffic each device sends; that needs your router's stats.
 ## Limits to know about
 
 - **Only agent-tier tasks use tools.** The local and API backends do not
-  run commands or touch files.
+  run commands or touch files. A reviewer only reads the answer; only an
+  agent's check actually runs anything.
+- **A check is only as good as the agent makes it.** night-elves runs it and
+  believes its exit code; a weak check (`CHECK: test -f README.md`) passes weak
+  work. `--done-when` is the way to say what the check should prove.
 - **Subscription usage is not measured.** Neither Claude nor ChatGPT plan
   limits are read; those backends are held back by a time window and a run
   count. Only the API credit is paced in dollars.
@@ -356,7 +452,8 @@ measure how much traffic each device sends; that needs your router's stats.
   elsewhere, lower `monthly_credit_usd` to what you want night-elves to have.
 - **The SMS webhook checks a shared secret and a sender allowlist.** It does
   not verify Twilio's request signature.
-- **One task at a time.** A lock file stops two runs overlapping, and tasks are
+- **One task at a time.** A lock file stops two runs overlapping (the nightly run
+  waits for a daytime one, such as a long local agent task, to finish), and tasks are
   worked serially. `parent_id` is in the schema for splitting a task into
   subtasks, but the dispatcher does not do that yet.
 - **Provider billing rules change.** How `claude -p` and third-party tools are

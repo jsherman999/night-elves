@@ -22,7 +22,9 @@ CREATE TABLE IF NOT EXISTS tasks (
   last_error TEXT,
   run_after TEXT,                            -- UTC; not started before this time
   images TEXT,                               -- 0.4.0 only; moved to files
-  files TEXT                                 -- JSON [{name, kind, size}] in attachments/<id>/
+  files TEXT,                                -- JSON [{name, kind, size}] in attachments/<id>/
+  criteria TEXT,                             -- "done when": what the result must satisfy
+  session TEXT                               -- "<backend> <id>" of the agent session to resume
 );
 CREATE INDEX IF NOT EXISTS tasks_status ON tasks(status, priority, id);
 CREATE TABLE IF NOT EXISTS spend (
@@ -51,7 +53,7 @@ def connect(path: str) -> sqlite3.Connection:
     conn.execute("PRAGMA journal_mode=WAL")
     conn.executescript(SCHEMA)
     cols = {r[1] for r in conn.execute("PRAGMA table_info(tasks)")}
-    for col in ("run_after", "images", "files"):  # queues made before 0.2, 0.4 and 0.5
+    for col in ("run_after", "images", "files", "criteria", "session"):  # before 0.2/0.4/0.5/0.7
         if col not in cols:
             conn.execute(f"ALTER TABLE tasks ADD COLUMN {col} TEXT")
     old = conn.execute("SELECT id, images FROM tasks WHERE images IS NOT NULL AND files IS NULL")
@@ -62,7 +64,8 @@ def connect(path: str) -> sqlite3.Connection:
     return conn
 
 def add_task(conn, prompt: str, source="cli", priority=5, tier="auto", parent_id=None,
-             run_after: str | None = None, files=(), on_insert=None, vision=False) -> int:
+             run_after: str | None = None, files=(), on_insert=None, vision=False,
+             criteria: str | None = None) -> int:
     """on_insert(id) runs before the commit (attachments use it to move their files into
     place), so other connections never see the task without them. If it raises, nothing is
     added."""
@@ -72,9 +75,9 @@ def add_task(conn, prompt: str, source="cli", priority=5, tier="auto", parent_id
     try:
         cur = conn.execute(
             "INSERT INTO tasks (created_at, updated_at, source, prompt, priority, tier, parent_id,"
-            " run_after, files) VALUES (?,?,?,?,?,?,?,?,?)",
+            " run_after, files, criteria) VALUES (?,?,?,?,?,?,?,?,?,?)",
             (now, now, source, prompt, int(priority), tier, parent_id, run_after,
-             json.dumps(list(files)) if files else None))
+             json.dumps(list(files)) if files else None, (criteria or "").strip() or None))
         if on_insert:
             on_insert(cur.lastrowid)
     except BaseException:
@@ -114,6 +117,8 @@ def change(conn, task_id: int, allowed=EDITABLE, vision=False, **fields) -> None
         fields["prompt"] = fields["prompt"].strip()
     if "priority" in fields:
         fields["priority"] = int(fields["priority"])
+    if "criteria" in fields:
+        fields["criteria"] = (fields["criteria"] or "").strip() or None
     fields["updated_at"] = iso()
     sets = ", ".join(f"{k}=?" for k in fields)
     marks = ",".join("?" * len(allowed))

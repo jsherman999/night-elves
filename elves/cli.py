@@ -20,6 +20,8 @@ def main(argv=None) -> int:
     a.add_argument("-t", "--tier", choices=db.TIERS, default="auto")
     a.add_argument("--source", default="cli")
     a.add_argument("--at", help="not before this local time: 01:30, 2pm, or 2026-11-12 01:30")
+    a.add_argument("--done-when", "--criteria", dest="criteria", metavar="TEXT",
+                   help="what the result must satisfy; the reviewer and the agent are held to it")
     a.add_argument("-f", "--file", "-i", "--image", dest="files", action="append", default=[],
                    metavar="FILE", help=f"attach a file (repeatable, up to {attachments.MAX_FILES})")
     l = sub.add_parser("list", help="show recent tasks")
@@ -35,6 +37,8 @@ def main(argv=None) -> int:
     e.add_argument("--prompt", help="new prompt ('-' reads it from stdin)")
     e.add_argument("-p", "--priority", type=int)
     e.add_argument("-t", "--tier", choices=db.TIERS)
+    e.add_argument("--done-when", "--criteria", dest="criteria", metavar="TEXT",
+                   help="what the result must satisfy ('' clears it)")
     w = e.add_mutually_exclusive_group()
     w.add_argument("--at", help="run at this local time instead")
     w.add_argument("--now", action="store_true", help="run within a minute (the backend's window still applies)")
@@ -61,7 +65,8 @@ def main(argv=None) -> int:
         text = sys.stdin.read() if args.prompt == ["-"] else " ".join(args.prompt)
         try:
             after = db.iso(when.parse_at(args.at, now)) if args.at else None
-            kw = dict(source=args.source, priority=args.priority, tier=args.tier, run_after=after)
+            kw = dict(source=args.source, priority=args.priority, tier=args.tier, run_after=after,
+                      criteria=args.criteria)
             if args.files:
                 with attachments.Staged(cfg) as staged:
                     for f in args.files:
@@ -97,8 +102,8 @@ def main(argv=None) -> int:
                     db.cancel(conn, tid)
                     print(f"cancelled #{tid}")
             else:
-                fields = {k: v for k, v in (("priority", args.priority), ("tier", args.tier))
-                          if v is not None}
+                fields = {k: v for k, v in (("priority", args.priority), ("tier", args.tier),
+                                            ("criteria", args.criteria)) if v is not None}
                 if args.prompt is not None:
                     fields["prompt"] = sys.stdin.read() if args.prompt == "-" else args.prompt
                 if args.at:
@@ -138,8 +143,10 @@ def main(argv=None) -> int:
         except OSError:
             if args.due_only:  # the nightly run is working; it picks up due tasks itself
                 return 0
-            print("another run is already in progress", file=sys.stderr)
-            return 1
+            # A daytime run (a local agent task, say) may still be going at 01:00: wait for it
+            # rather than skip the night.
+            print("waiting for the run in progress to finish", file=sys.stderr, flush=True)
+            fcntl.flock(lock, fcntl.LOCK_EX)
         stats = night.run(args.max_tasks, due_only=args.due_only)
         if args.due_only and not stats["done"] + stats["failed"] + stats["retried"]:
             return 0

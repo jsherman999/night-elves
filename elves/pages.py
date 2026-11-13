@@ -3,6 +3,7 @@ from __future__ import annotations
 import json
 from datetime import datetime
 from html import escape as e
+from urllib.parse import quote
 from . import attachments, db, md
 
 CSS = """
@@ -89,8 +90,10 @@ TIER_HELP = {
     "local": "Only the Studio's local models. Free, runs any time. Images and PDFs of up to 20 "
              "pages go to the local vision model, if one is set up.",
     "frontier": "Claude does the whole task, in the overnight window while tonight's allowance lasts.",
-    "agent": "Claude Code with tools in a sandbox: runs commands, writes files, builds small apps, "
-             "works through big data files. Overnight window only, a few per night.",
+    "agent": "An agent with tools in a sandbox: runs commands, writes files, builds small apps, "
+             "works through big data files, and must pass its own check. The local agent goes "
+             "first when one is set up; Claude Code takes priority 1-3 tasks and ones the local "
+             "agent failed twice, in the overnight window, a few per night.",
 }
 TIER_OPTS = tuple(TIER_HELP)
 _TIER_JS = ("var h={" + ",".join(f"{t}:{json.dumps(v)}" for t, v in TIER_HELP.items()) + "};"
@@ -119,6 +122,7 @@ def home(rows, msg: str | None = None) -> str:
 <div class=two>{tier_select()}<input name=priority type=number min=1 max=9 value=5 aria-label=priority></div>
 {tier_help()}
 <input name=at placeholder="run at (optional): 01:30, 2pm, 2026-11-20 07:05">
+<textarea name=criteria rows=2 placeholder="Done when (optional): e.g. the tests pass and there is a screenshot of each form"></textarea>
 <label for=files>Files or images (optional, up to {attachments.MAX_FILES})</label>
 <input id=files name=files type=file multiple>
 <p class=hint>Text files up to 200 KB work with any tier. Images and PDFs need Claude or the
@@ -138,7 +142,7 @@ def row(t) -> str:
             f"<span>{e(t['tier'])}{pri} · {e(when_text(t))}</span></div>"
             f"<div class=txt>{e(' '.join(t['prompt'].split())[:140])}</div></a>")
 
-def task(t, result: str | None, msg: str | None = None, raw: bool = False) -> str:
+def task(t, result: str | None, msg: str | None = None, raw: bool = False, shots=()) -> str:
     tid, status = t["id"], t["status"]
     facts = [f"tier {t['tier']}", f"priority {t['priority']}", f"from {t['source']}",
              f"added {local(t['created_at']):%a %b %d %H:%M}"]
@@ -150,6 +154,8 @@ def task(t, result: str | None, msg: str | None = None, raw: bool = False) -> st
             f"<p class=mute>{e(' · '.join(facts))}</p>")
     if status == "queued":
         head += f"<p><b>Runs {e(when_text(t))}</b></p>"
+    if t["criteria"]:
+        head += f"<p><b>Done when:</b> {e(t['criteria'])}</p>"
     if t["last_error"]:
         head += f"<p class=err>Last error: {e(t['last_error'])}</p>"
     if fs := attachments.files(t):
@@ -180,6 +186,8 @@ def task(t, result: str | None, msg: str | None = None, raw: bool = False) -> st
 <div><label for=priority>Priority (1 = first)</label>
 <input id=priority name=priority type=number min=1 max=9 value={t['priority']}></div></div>
 {tier_help(t['tier'])}
+<label for=criteria>Done when (optional)</label>
+<textarea id=criteria name=criteria rows=2>{e(t['criteria'] or '')}</textarea>
 <label for=at>Run at (empty = the nightly run)</label>
 <input id=at name=at value="{e(at)}" placeholder="01:30, 2pm, 2026-11-20 07:05">
 <button>Save changes</button></form>"""
@@ -198,5 +206,9 @@ def task(t, result: str | None, msg: str | None = None, raw: bool = False) -> st
         shown = f"<pre>{e(result)}</pre>" if raw else md.render(result)
         body += (f"<h2>Result</h2><div class='card{'' if raw else ' md'}'>{shown}</div>"
                  f"<p class=mute>Show as {switch}</p>")
+    if shots:
+        body += ("<h2>Images in the workspace</h2><div class=imgs>" + "".join(
+            f"<a href=/t/{tid}/w/{e(quote(s))}><img src=/t/{tid}/w/{e(quote(s))} alt='{e(s)}' "
+            f"title='{e(s)}' loading=lazy></a>" for s in shots) + "</div>")
     body += "<p><a href=/>&larr; Queue</a></p>"
     return page(f"Task {tid}", body, msg)

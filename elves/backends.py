@@ -111,16 +111,13 @@ class Command:
     It runs in its own process group, so a timeout also kills anything it started."""
     def __init__(self, name, c):
         self.name, self.c = name, c
-    def run(self, prompt, system=None, cwd=None) -> Result:
+    def run(self, prompt, system=None, cwd=None, args=()) -> Result:
+        """args: extra arguments put after argv, such as a session id."""
         full = f"{system}\n\n{prompt}" if system else prompt
         argv = [os.path.expanduser(a) if a.startswith("~/") else a for a in self.c["argv"]]
         as_arg = any("{prompt}" in a for a in argv)
-        argv = [a.replace("{prompt}", full) for a in argv]
-        drop = set(self.c.get("env_unset", ["ANTHROPIC_API_KEY", "ELVES_TOKEN"]))
-        env = {k: v for k, v in os.environ.items() if k not in drop}
-        for k, v in self.c.get("env", {}).items():  # "{cwd}" is the task's workspace
-            if "{cwd}" not in v or cwd:
-                env[k] = os.path.expanduser(v.replace("{cwd}", cwd or ""))
+        argv = [a.replace("{prompt}", full) for a in argv] + list(args)
+        env = environ(self.c, cwd)
         try:
             p = subprocess.Popen(argv, stdin=subprocess.DEVNULL if as_arg else subprocess.PIPE,
                                  stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True,
@@ -140,9 +137,24 @@ class Command:
                 except subprocess.TimeoutExpired:
                     continue
             raise BackendError(f"{self.name}: {e}") from e
-        if p.returncode != 0:
-            raise BackendError(f"{self.name}: exit {p.returncode}: {err.strip()[:500]}")
+        try:  # a server an agent forgot to stop would hold its port when the check runs
+            os.killpg(p.pid, signal.SIGKILL)
+        except (ProcessLookupError, PermissionError):
+            pass
+        if p.returncode != 0:  # `claude -p` prints some errors ("Reached max turns") on stdout
+            detail = (err.strip() or out.strip())[-500:]
+            raise BackendError(f"{self.name}: exit {p.returncode}: {detail}")
         return Result(out.strip())
+
+def environ(c: dict, cwd: str | None) -> dict:
+    """The environment a command backend (and an agent's check) runs with: env_unset removed,
+    then the backend's env table added, with "{cwd}" replaced by the task's workspace."""
+    drop = set(c.get("env_unset", ["ANTHROPIC_API_KEY", "ELVES_TOKEN"]))
+    env = {k: v for k, v in os.environ.items() if k not in drop}
+    for k, v in c.get("env", {}).items():
+        if "{cwd}" not in v or cwd:
+            env[k] = os.path.expanduser(v.replace("{cwd}", cwd or ""))
+    return env
 
 TYPES = {"openai_compat": OpenAICompat, "anthropic_api": AnthropicAPI, "command": Command}
 

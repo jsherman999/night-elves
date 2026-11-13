@@ -5,14 +5,14 @@ from datetime import date, datetime, timezone
 from http.server import ThreadingHTTPServer
 from elves import attachments, backends, cli, config, db, notify, pages, policy, web, when
 from elves.backends import BackendError, Command, Result
-from elves.dispatcher import Night, passed
+from elves.dispatcher import Night, passed, plan_criteria
 
 class Fake:
     def __init__(self, reply="ok", usd=0.0, fail=0):
         self.reply, self.usd, self.fail, self.calls = reply, usd, fail, []
-    def run(self, prompt, system=None, cwd=None, files=()):
+    def run(self, prompt, system=None, cwd=None, files=(), args=()):
         self.calls.append((prompt, system))
-        self.cwd, self.files = cwd, list(files)
+        self.cwd, self.files, self.args = cwd, list(files), list(args)
         if self.fail:
             self.fail -= 1
             raise BackendError("boom")
@@ -157,7 +157,7 @@ class DispatchTests(Base):
             for d in ("node_modules/x", ".cache"):
                 os.makedirs(os.path.join(agent.cwd, d))
                 open(os.path.join(agent.cwd, d, "junk"), "w").write("")
-            return "saved out.json"
+            return "saved out.json\nSTATUS: DONE\nCHECK: test -f out.json"
         agent = Fake(work)
         stats = self.night(18, hour=2, claude_agent=agent).run()
         t = db.get(self.conn, tid)
@@ -168,6 +168,7 @@ class DispatchTests(Base):
         self.assertIn("- out.json", listing)
         self.assertNotIn("junk", listing)
         self.assertIn("Committed to git", listing)
+        self.assertIn("`test -f out.json` exited 0", listing)
         tracked = subprocess.run(["git", "-C", agent.cwd, "ls-files"], capture_output=True,
                                  text=True, check=True).stdout.split()
         self.assertEqual(tracked, ["out.json"])  # caches and node_modules stay out
@@ -183,9 +184,154 @@ class DispatchTests(Base):
                          (1, 1, "queued"))
         self.assertEqual(agent.calls, [])
 
+    def agent_cfg(self, **extra):
+        self.cfg["backends"]["claude_agent"] = {"type": "command", "argv": ["x"], "window": [1, 5],
+                                                "max_runs_per_night": 9,
+                                                "session_args": ["--session-id", "{session}"],
+                                                "resume_args": ["--resume", "{session}"], **extra}
+
+    def test_agent_check_failure_is_fed_back_and_the_session_resumed(self):
+        self.agent_cfg()
+        tid = db.add_task(self.conn, "make out.txt say hi", tier="agent")
+        def work(prompt, system):
+            n = len(agent.calls)
+            open(os.path.join(agent.cwd, "out.txt"), "w").write("hi" if n > 1 else "nope")
+            return "made it\nSTATUS: DONE\nCHECK: `grep -qx hi out.txt`"
+        agent = Fake(work)
+        stats = self.night(18, hour=2, claude_agent=agent).run()
+        t = db.get(self.conn, tid)
+        self.assertEqual((stats["done"], t["status"], t["attempts"]), (1, "done", 1))
+        self.assertEqual(len(agent.calls), 2)
+        first, second = agent.calls
+        self.assertIn("STATUS: DONE", first[1])  # the contract is in the system prompt
+        sid = t["session"].split()[1]
+        self.assertEqual(t["session"], f"claude_agent {sid}")
+        self.assertEqual(agent.args, ["--resume", sid])
+        self.assertIsNone(second[1])  # a resumed session already has its instructions
+        self.assertIn("This continues your earlier work", second[0])
+        self.assertIn("`grep -qx hi out.txt` exited 1", second[0])
+        self.assertIn("exited 0", open(t["result_path"]).read())
+
+    def test_agent_incomplete_or_silent_is_not_accepted(self):
+        self.agent_cfg()
+        a = db.add_task(self.conn, "a", tier="agent")
+        b = db.add_task(self.conn, "b", tier="agent")
+        replies = {"a": "half done\nSTATUS: INCOMPLETE\nCHECK: none", "b": "all done, trust me"}
+        agent = Fake(lambda p, s: replies["a" if "Task:\na" in p else "b"])
+        stats = self.night(18, hour=2, claude_agent=agent).run()
+        self.assertEqual(stats["failed"], 2)
+        ta, tb = db.get(self.conn, a), db.get(self.conn, b)
+        self.assertEqual((ta["attempts"], tb["attempts"]), (3, 3))
+        self.assertIn("INCOMPLETE", ta["feedback"])
+        self.assertIn("didn't end with the STATUS", tb["feedback"])
+        self.assertTrue(ta["last_error"].startswith("not accepted"))
+        self.assertIn("not accepted", open(ta["result_path"]).read())  # last attempt is kept
+
+    def test_agent_check_none_is_accepted_and_a_check_is_sandboxed(self):
+        self.agent_cfg()
+        a = db.add_task(self.conn, "look something up", tier="agent")
+        b = db.add_task(self.conn, "sneaky", tier="agent")
+        outside = os.path.join(os.path.expanduser("~"), f".elves-test-{os.getpid()}")
+        agent = Fake(lambda p, s: "found it\nSTATUS: DONE\nCHECK: none" if "look" in p else
+                     f"STATUS: DONE\nCHECK: touch {outside}")
+        self.night(18, hour=2, claude_agent=agent).run()
+        self.assertEqual(db.get(self.conn, a)["status"], "done")
+        self.assertIn("CHECK: none", open(db.get(self.conn, a)["result_path"]).read())
+        self.assertFalse(os.path.exists(outside))  # the check can't write outside the workspace
+        self.assertIn("Operation not permitted", db.get(self.conn, b)["feedback"])
+
+    def test_agent_gone_session_starts_fresh(self):
+        self.agent_cfg()
+        tid = db.add_task(self.conn, "x", tier="agent")
+        db.update(self.conn, tid, session="claude_agent 1234", attempts=1, last_error="timed out")
+        def work(prompt, system):
+            if agent.args[0] == "--resume":
+                raise BackendError("claude_agent: exit 1: No conversation found with session ID: 1234")
+            return "STATUS: DONE\nCHECK: true"
+        agent = Fake(work)
+        self.night(18, hour=2, claude_agent=agent).run()
+        t = db.get(self.conn, tid)
+        self.assertEqual(t["status"], "done")
+        self.assertEqual(agent.args[0], "--session-id")
+        self.assertNotEqual(t["session"], "claude_agent 1234")
+        self.assertIn("stopped before it finished: timed out", agent.calls[-1][0])
+
+    def test_local_agent_goes_first_then_claude(self):
+        self.agent_cfg()
+        self.cfg["backends"]["local_agent"] = {"type": "command", "argv": ["x"],
+                                               "session_args": ["--session", "ses_{session_hex}"],
+                                               "notes": "Playwright is installed."}
+        self.cfg["roles"]["local_agent"] = "local_agent"
+        easy = db.add_task(self.conn, "easy", tier="agent")
+        hard = db.add_task(self.conn, "hard", tier="agent", priority=2)
+        la = Fake("STATUS: INCOMPLETE")  # never finishes
+        claude = Fake("STATUS: DONE\nCHECK: true")
+        self.night(18, hour=2, claude_agent=claude, local_agent=la).run()
+        self.assertEqual(len(la.calls), 2)  # escalate_after
+        self.assertIn("Playwright is installed.", la.calls[0][1])
+        self.assertTrue(la.args[1].startswith("ses_") and "-" not in la.args[1])
+        self.assertEqual(len(claude.calls), 2)  # the hard task, and the easy one after escalating
+        self.assertTrue(db.get(self.conn, easy)["session"].startswith("claude_agent "))
+        self.assertEqual([db.get(self.conn, i)["backend"] for i in (easy, hard)],
+                         ["claude_agent", "claude_agent"])
+        # By day, Claude's window is shut but the local agent runs.
+        day = db.add_task(self.conn, "by day", tier="agent")
+        self.night(18, hour=12, local_agent=Fake("STATUS: DONE\nCHECK: true")).run()
+        self.assertEqual(db.get(self.conn, day)["backend"], "local_agent")
+
     def test_passed(self):
-        self.assertTrue(passed("PASS\nok") and passed("\n pass"))
-        self.assertFalse(passed("FAIL: nope"))
+        self.assertTrue(passed("PASS\nok") and passed("\n pass") and passed("`PASS`"))
+        self.assertTrue(passed("Looks fine to me."))  # no verdict at all: don't fail the work
+        for review in ("FAIL: nope", "**FAIL**\nmissing tests", "## Verdict: FAIL",
+                       "**Verdict:** FAIL", "Here is my review.\nIt FAILS the second check.",
+                       "> FAIL"):
+            self.assertFalse(passed(review), review)
+
+    def test_conserve_mode_reviews_local_work_locally(self):
+        tid = db.add_task(self.conn, "summarise logs")
+        reviews = []
+        def reply(prompt, system):
+            if "reviewing" not in system:
+                return "answer"
+            reviews.append(prompt)
+            return "FAIL\nno numbers" if len(reviews) == 1 else "PASS"
+        local = Fake(reply)
+        stats = self.night(5, hour=12, local=local).run()
+        self.assertEqual(stats["done"], 1)
+        systems = [s for _, s in local.calls]
+        self.assertEqual(sum("reviewing" in s for s in systems), 2)  # rejected once, then passed
+        self.assertIn("no numbers", local.calls[2][0])  # the retry carried the feedback
+        t = db.get(self.conn, tid)
+        self.assertEqual((t["attempts"], t["feedback"]), (1, None))  # cleared once it was done
+        self.assertEqual(len(self.fakes["claude_api"].calls), 0)
+
+    def test_local_review_role_picks_the_reviewer(self):
+        self.cfg["backends"]["qwen"] = {"type": "openai_compat"}
+        self.cfg["roles"]["local_review"] = "qwen"
+        db.add_task(self.conn, "summarise logs")
+        qwen = Fake("PASS")
+        self.night(5, hour=12, qwen=qwen).run()
+        self.assertEqual(len(qwen.calls), 1)
+        self.assertIn("reviewing", qwen.calls[0][1])
+        self.assertEqual(len(self.fakes["local"].calls), 1)
+
+    def test_criteria_reach_the_executor_and_reviewer(self):
+        db.add_task(self.conn, "write a script", criteria="it prints the total")
+        self.night(5, hour=12).run()
+        execute, review = self.fakes["local"].calls
+        self.assertIn("done only when:\nit prints the total", execute[0])
+        self.assertIn("Done when:\nit prints the total", review[0])
+
+    def test_planner_writes_criteria_when_there_are_none(self):
+        self.assertEqual(plan_criteria("1. a\n2. b\n\n**Done when:**\n- it runs\n- it's fast"),
+                         "- it runs\n- it's fast")
+        self.assertEqual(plan_criteria("## Done when: tests pass"), "tests pass")
+        self.assertEqual(plan_criteria("1. just a plan"), "")
+        db.add_task(self.conn, "write a script")
+        api = Fake(lambda p, s: "1. do it\nDone when:\n- exits 0" if "planning" in s else "PASS",
+                   usd=0.1)
+        self.night(18, hour=12, claude_api=api).run()
+        self.assertIn("Done when:\n- exits 0\n\nResult:", api.calls[1][0])
 
 class ScheduleTests(Base):
     def clock(self, day, hour, minute=0):
@@ -291,9 +437,10 @@ class ChangeTests(Base):
         out, err = io.StringIO(), io.StringIO()
         with contextlib.redirect_stdout(out), contextlib.redirect_stderr(err):
             cli.main(["-c", path, "add", "--at", "03:15", "scheduled thing"])
-            cli.main(["-c", path, "add", "other"])
+            cli.main(["-c", path, "add", "--done-when", " the tests pass ", "other"])
             self.assertEqual(cli.main(["-c", path, "edit", "1", "-t", "agent", "-p", "1",
-                                       "--prompt", "new words", "--tonight"]), 0)
+                                       "--prompt", "new words", "--tonight",
+                                       "--done-when", "a screenshot exists"]), 0)
             self.assertEqual(cli.main(["-c", path, "edit", "2", "--now"]), 0)
             self.assertEqual(cli.main(["-c", path, "edit", "2"]), 2)
             self.assertEqual(cli.main(["-c", path, "cancel", "1", "2"]), 0)
@@ -305,6 +452,10 @@ class ChangeTests(Base):
                          ("cancelled", "agent", 1, "new words", None))
         self.assertEqual(two["status"], "queued")
         self.assertIsNotNone(two["run_after"])
+        self.assertEqual((one["criteria"], two["criteria"]), ("a screenshot exists", "the tests pass"))
+        with contextlib.redirect_stdout(io.StringIO()):
+            cli.main(["-c", path, "edit", "2", "--done-when", ""])
+        self.assertIsNone(db.get(conn, 2)["criteria"])
         self.assertIn("no task #7", err.getvalue())
         self.assertIn("cancelled #2", out.getvalue())
 
@@ -314,6 +465,10 @@ class MiscTests(Base):
         self.assertEqual(Command("c", {"argv": ["cat"]}).run("via stdin", "sys").text, "sys\n\nvia stdin")
         with self.assertRaises(BackendError):
             Command("f", {"argv": ["false"]}).run("x")
+        with self.assertRaisesRegex(BackendError, "exit 1: Error: Reached max turns"):
+            Command("m", {"argv": ["sh", "-c", "echo 'Error: Reached max turns (200)'; exit 1"]}).run("x")
+        self.assertEqual(Command("a", {"argv": ["echo"]}).run("x", args=["--session", "s"]).text,
+                         "--session s")  # prompt on stdin, args after argv
 
     def test_command_backend_drops_api_key(self):
         sh = ["sh", "-c", 'echo "${ANTHROPIC_API_KEY:-unset} ${ELVES_KEEP:-unset}"']
@@ -341,6 +496,44 @@ class MiscTests(Base):
             slow.run("x")
         time.sleep(1.5)
         self.assertFalse(os.path.exists(mark))  # the background child was killed too
+
+    def test_contract_parsing(self):
+        from elves import verify
+        self.assertEqual(verify.contract("did it\n\n**STATUS:** DONE\nCHECK: `npm test`"),
+                         ("DONE", "npm test"))
+        self.assertEqual(verify.contract("STATUS: INCOMPLETE\nCHECK: none."), ("INCOMPLETE", ""))
+        self.assertEqual(verify.contract("- STATUS: done\n- CHECK: sh check.sh"), ("DONE", "sh check.sh"))
+        self.assertEqual(verify.contract("just a summary"), (None, None))
+        self.assertEqual(verify.contract("STATUS: DONE"), ("DONE", None))
+
+    def test_check_sandbox(self):
+        from elves import verify
+        if not os.path.exists(verify.SANDBOX):
+            self.skipTest("needs macOS sandbox-exec")
+        work = os.path.join(self.tmp, "w")
+        os.makedirs(work)
+        secret = os.path.join(self.tmp, "secret")
+        open(secret, "w").write("s3cret")
+        def run(cmd, timeout=20):
+            return verify.run_check(cmd, work, dict(os.environ), timeout, [secret])
+        self.assertEqual(run("echo hi > f && cat f"), (0, "hi"))
+        code, out = run(f"cat {secret}")
+        self.assertNotEqual(code, 0)
+        self.assertNotIn("s3cret", out)
+        outside = os.path.join(os.path.expanduser("~"), f".elves-test-{os.getpid()}")
+        self.assertNotEqual(run(f"touch {outside}")[0], 0)  # (temp folders are writable)
+        self.assertFalse(os.path.exists(outside))
+        self.assertNotEqual(run("sh -c 'sudo -n true'")[0], 0)
+        self.assertNotEqual(run("curl -s -m 5 https://example.com")[0], 0)
+        code, out = run("python3 -c \"import socket,threading;s=socket.socket();s.bind(('127.0.0.1',0));"
+                        "s.listen();socket.create_connection(s.getsockname()).close();print('local ok')\"")
+        self.assertEqual((code, out), (0, "local ok"))
+        mark = os.path.join(work, "mark")
+        start = time.monotonic()
+        self.assertEqual(run(f"(sleep 2; touch {mark}) & sleep 30", timeout=0.5)[0], None)
+        self.assertLess(time.monotonic() - start, 10)
+        time.sleep(2.5)
+        self.assertFalse(os.path.exists(mark))  # what it left running was killed
 
     def test_notify_failure_does_not_raise(self):
         self.cfg["notify"] = {"argv": ["sleep", "5"], "timeout": 0.2}
@@ -460,9 +653,27 @@ class MiscTests(Base):
         self.assertEqual(db.get(conn, waiting)["status"], "cancelled")
         code, text, _ = call(f"/tasks/{done}", headers={"Authorization": "Bearer s3cret-token-123456"})
         self.assertEqual(json.loads(text)["result"], "# the answer <script>")
-        code, _, h = call("/tasks", b"prompt=agent%3A+from+the+page&priority=5&at=", {**form, **me})
+        code, _, h = call("/tasks", b"prompt=agent%3A+from+the+page&priority=5&at=&criteria=it+runs",
+                          {**form, **me})
         self.assertEqual((code, h["Location"]), (303, "/?m=Queued%20%234"))
-        self.assertEqual(db.get(conn, 4)["tier"], "agent")
+        self.assertEqual((db.get(conn, 4)["tier"], db.get(conn, 4)["criteria"]), ("agent", "it runs"))
+        self.assertIn("<b>Done when:</b> it runs", call("/t/4", headers=me)[1])
+        # images the agent saved in its workspace show on the task's page, and nothing else does
+        work = os.path.join(self.cfg["paths"]["work"], "4")
+        for rel in ("shots/sign in.png", ".cache/hidden.png", "node_modules/x.png"):
+            os.makedirs(os.path.dirname(os.path.join(work, rel)), exist_ok=True)
+            open(os.path.join(work, rel), "wb").write(PNG)
+        open(os.path.join(work, "page.svg"), "w").write("<svg onload=alert(1)>")
+        os.symlink("/etc/hosts", os.path.join(work, "hosts.png"))
+        page = call("/t/4", headers=me)[1]
+        self.assertIn("src=/t/4/w/shots/sign%20in.png", page)
+        self.assertNotIn("hidden.png", page)
+        self.assertNotIn("node_modules", page)
+        code, body, h = call("/t/4/w/shots/sign%20in.png", headers=me)
+        self.assertEqual((code, h["Content-Type"]), (200, "image/png"))
+        for bad in ("page.svg", "hosts.png", ".cache/hidden.png", "..%2F..%2Fq.db", "%2Fetc%2Fhosts"):
+            self.assertEqual(call(f"/t/4/w/{bad}", headers=me)[0], 404, bad)
+        self.assertEqual(call("/t/4/w/shots/sign%20in.png")[0], 303)  # not signed in
         srv.shutdown()
 
 if __name__ == "__main__":
@@ -573,7 +784,7 @@ class FileTests(Base):
         tid = self.add(("big.bin", b"\x00" * 1000), ("shot.png", PNG), tier="agent")
         def work(prompt, system):
             open(os.path.join(agent.cwd, "input", "1-big.bin"), "wb").write(b"changed")
-            return "done"
+            return "done\nSTATUS: DONE\nCHECK: none"
         agent = Fake(work)
         self.night(18, hour=2, claude_agent=agent).run()
         self.assertIn("input/1-big.bin (data, 1000 bytes)", agent.calls[0][0])

@@ -5,7 +5,7 @@ from datetime import datetime
 from http.cookies import SimpleCookie
 from pathlib import Path
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
-from urllib.parse import parse_qs, quote, urlparse
+from urllib.parse import parse_qs, quote, unquote, urlparse
 from . import attachments, db, pages, policy, when
 
 MAX_BODY = 64 * 1024
@@ -43,6 +43,7 @@ def queued_msg(tid: int, after: str | None) -> str:
 COOKIE = "elves"
 TASK_PATH = re.compile(r"^/(t|tasks)/(\d+)$")
 FILE_PATH = re.compile(r"^/(t|tasks)/(\d+)/f/(\d+)$")
+WORK_PATH = re.compile(r"^/t/(\d+)/w/(.+)$")  # an image an agent saved in its workspace
 
 def read_multipart(rfile, length: int, boundary: str, new_file, parts: list | None = None) -> dict:
     """Stream a multipart/form-data body. File parts are written straight to the paths
@@ -118,14 +119,14 @@ def act(cfg: dict, conn, tid: int, d: dict) -> str:
     if action == "now":
         db.change(conn, tid, ("queued",), run_after=db.iso())
         t, now = db.get(conn, tid), datetime.now()
-        back = cfg["roles"].get("agent") if t["tier"] == "agent" else None
-        window = cfg["backends"].get(back, {}).get("window") if back else None
+        r = policy.agent_route(t, cfg, lambda b: b in cfg["backends"]) if t["tier"] == "agent" else None
+        window = cfg["backends"][r.executor].get("window") if r else None
         if window and not policy.in_window(window, now.hour):
             return f"#{tid} will start at {window[0]:02d}:00, when agent tasks may run"
         return f"#{tid} will start within a minute"
     if action != "save":
         raise ValueError(f"unknown action {action!r}")
-    fields = {k: d[k] for k in ("prompt", "tier", "priority") if k in d}
+    fields = {k: d[k] for k in ("prompt", "tier", "priority", "criteria") if k in d}
     if "priority" in fields:
         try:
             fields["priority"] = int(fields["priority"])
@@ -268,9 +269,22 @@ def make_handler(cfg: dict, token: str):
             return text[:MAX_RESULT] + ("\n\n[cut short; the rest is in the file]"
                                         if len(text) > MAX_RESULT else "")
 
+        def _work_image(self, tid: int, rel: str):
+            p = attachments.work_image(cfg, tid, unquote(rel))
+            if p is None:
+                return self._send(404, {"error": "no such file"})
+            ext = p.suffix.lstrip(".").lower()
+            self._send(200, p.read_bytes(), attachments.TYPES.get(ext, "image/jpeg"),
+                       [("Cache-Control", "private, max-age=60"),
+                        ("X-Content-Type-Options", "nosniff")])
+
         def do_GET(self):
             u = urlparse(self.path)
             msg = parse_qs(u.query).get("m", [None])[0]
+            if w := WORK_PATH.match(u.path):
+                if not self._cookie_ok():
+                    return self._redirect("/")
+                return self._work_image(int(w.group(1)), w.group(2))
             m = TASK_PATH.match(u.path) or FILE_PATH.match(u.path)
             if u.path in ICON_PATHS:  # no sign-in: iOS fetches it when adding to the Home Screen
                 return self._send(200, ICON.read_bytes(), "image/png",
@@ -303,7 +317,8 @@ def make_handler(cfg: dict, token: str):
                 if m.group(1) == "tasks":
                     return self._send(200, {**task_json(t), "result": self._result(t)})
                 raw = parse_qs(u.query).get("raw", [""])[0] == "1"
-                return self._send(200, pages.task(t, self._result(t), msg, raw), HTML)
+                shots = attachments.work_images(cfg, t["id"]) if t["tier"] == "agent" else []
+                return self._send(200, pages.task(t, self._result(t), msg, raw, shots), HTML)
             finally:
                 conn.close()
 
@@ -345,7 +360,8 @@ def make_handler(cfg: dict, token: str):
                             tier = d["tier"]
                         after = run_after(d.get("at") or at)
                         kw = dict(source="web", tier=tier, run_after=after,
-                                  priority=int(d.get("priority") or priority))
+                                  priority=int(d.get("priority") or priority),
+                                  criteria=str(d.get("criteria") or ""))
                         nfiles = len(staged.files) if staged else 0
                         tid = (attachments.add_task(cfg, conn, text, staged, **kw) if nfiles
                                else db.add_task(conn, text, **kw))

@@ -1,16 +1,20 @@
 """The nightly run: drain the queue through plan -> execute -> review."""
 from __future__ import annotations
-import subprocess, time
+import re, subprocess, time, uuid
 from datetime import datetime, timedelta
 from pathlib import Path
-from . import attachments, db, policy
+from . import attachments, backends, db, policy, verify
 from .backends import BackendError
 
 PLAN_SYS = ("You are planning work that a smaller model will carry out. Do not do the task. "
-            "Write a short numbered plan, the pitfalls to avoid, and how to tell the result is right.")
+            "Write a short numbered plan and the pitfalls to avoid. End with a section that starts "
+            "with the line 'Done when:' and lists the conditions a reviewer can check the result "
+            "against.")
 EXEC_SYS = "Complete the task fully and return only the finished result."
 REVIEW_SYS = ("You are reviewing another model's work against the task. The first line of your "
-              "reply must be exactly PASS or FAIL. Then give brief reasons, and for FAIL the fixes needed.")
+              "reply must be exactly PASS or FAIL. Check the result against the task and, when "
+              "they are given, every 'Done when' condition: FAIL if any of them is not met. Then "
+              "give brief reasons, and for FAIL the fixes needed.")
 AGENT_SYS = ("You are running unattended overnight and nobody can answer questions, so make "
              "reasonable choices and carry on. The current directory is this task's workspace: do "
              "the work there with the tools you have, and save every file you create inside it, "
@@ -27,6 +31,18 @@ AGENT_SYS = ("You are running unattended overnight and nobody can answer questio
              "blocks it, so use `cargo new --vcs none`); the workspace is committed to git for "
              "you when you finish. Finish with a short summary of what you did, what you "
              "verified, and anything left undone.")
+CONTRACT = ("End your reply with these two lines:\n"
+            "STATUS: DONE   (or STATUS: INCOMPLETE if anything asked for isn't done or doesn't work)\n"
+            "CHECK: <one shell command>\n"
+            "When you have finished, night-elves runs the CHECK command itself, from the workspace, "
+            "in a sandbox with no network except localhost, for at most {minutes} minutes, and "
+            "accepts the work only if it exits 0. Make it prove the task is done: run the tests, or "
+            "a script that checks what you produced. Put anything longer than one line in a script "
+            "(check.sh) and run that. It must not install anything, and it must start and stop any "
+            "server it needs. Write CHECK: none only when no command could test the result.")
+CONTINUE = ("This continues your earlier work on the task below, in the same workspace; your "
+            "files from before are still there.")
+NOT_ACCEPTED = "not accepted: "  # starts last_error when feedback holds the reason
 SKIP_LISTING = {"node_modules", "target", "__pycache__", "venv"}  # plus anything hidden
 GIT_EXCLUDE = ".cache/\n.claude/\nnode_modules/\ntarget/\n.venv/\nvenv/\n__pycache__/\n.DS_Store\n"
 
@@ -50,9 +66,22 @@ def commit_workspace(work: Path, message: str) -> str:
 RETRY_DELAY = timedelta(minutes=30)  # before a scheduled task is tried again after an error
 DOWN_AFTER = 3  # consecutive errors before a backend is skipped for the rest of the run
 
+VERDICT_LINE = re.compile(r"^[\W_]*(?:verdict|result|review)?[\W_]*(PASS|FAIL)", re.I)
+VERDICT_WORD = re.compile(r"\b(PASS|FAIL)(?:ED|ES|S)?\b", re.I)
+DONE_WHEN = re.compile(r"^[#*_\s]*done when[*_\s]*:?[*_]*[ \t]*", re.I | re.M)
+
 def passed(review: str) -> bool:
-    first = next((ln.strip().upper() for ln in review.splitlines() if ln.strip()), "")
-    return not first.startswith("FAIL")
+    """The reviewer's verdict: PASS or FAIL on the first line, even dressed up as **FAIL** or
+    "Verdict: FAIL"; failing that, the first PASS or FAIL in the reply. No verdict at all
+    counts as a pass, so a reviewer that ignores the format can't fail good work."""
+    first = next((ln for ln in review.splitlines() if ln.strip()), "")
+    m = VERDICT_LINE.match(first) or VERDICT_WORD.search(review)
+    return not (m and m.group(1).upper() == "FAIL")
+
+def plan_criteria(plan: str) -> str:
+    """The 'Done when:' section a planner wrote, if it wrote one."""
+    m = DONE_WHEN.search(plan)
+    return plan[m.end():].strip() if m else ""
 
 class Night:
     def __init__(self, cfg, conn, backends, now_fn=None, log=print):
@@ -74,8 +103,8 @@ class Night:
         return name in self.backends and policy.available(
             name, self.cfg, self.conn, self.state(), self.period_start, self.now(), self.down)
 
-    def call(self, name, task_id, role, prompt, system, cwd=None, files=()):
-        kw = {k: v for k, v in (("cwd", cwd), ("files", files)) if v}
+    def call(self, name, task_id, role, prompt, system, cwd=None, files=(), args=()):
+        kw = {k: v for k, v in (("cwd", cwd), ("files", files), ("args", args)) if v}
         try:
             res = self.backends[name].run(prompt, system, **kw)
         except BackendError:
@@ -93,7 +122,7 @@ class Night:
 
     def process(self, task) -> str:
         """Returns the task's new status, or 'skipped' if nothing can take it tonight."""
-        tid, lim = task["id"], self.cfg["limits"]
+        tid = task["id"]
         r = policy.route(task, self.cfg, self.state(), self.ok)
         if r is None:
             return "skipped"
@@ -106,33 +135,131 @@ class Night:
                 work = Path(self.cfg["paths"]["work"]) / str(tid)
                 work.mkdir(parents=True, exist_ok=True)
                 cwd = work
+            crit = (task["criteria"] or "").strip()
             prompt = f"Task:\n{task['prompt']}"
+            if crit:
+                prompt += f"\n\nThe task is done only when:\n{crit}"
             if attachments.files(task):
                 prompt, cwd, send = self._attach(task, r.executor, prompt, work, cwd)
             if r.planner:
                 plan = self.call(r.planner, tid, "plan", prompt, PLAN_SYS)
                 prompt += f"\n\nPlan to follow:\n{plan}"
+                crit = crit or plan_criteria(plan)
+            db.update(self.conn, tid, status="running", backend=r.executor)
+            if work:
+                answer = self._agent(task, r.executor, prompt, cwd)
+                ok, check, feedback = self._verify(r.executor, work, answer)
+                if not ok:
+                    self._write_result(task, r.executor, answer, work, check=check,
+                                       accepted=False)
+                    return self._retry(task, feedback=feedback,
+                                       error=NOT_ACCEPTED + feedback.split("\n")[0][:200])
+                self._write_result(task, r.executor, answer, work, check=check)
+                return self._done(task)
             if task["feedback"]:
                 prompt += f"\n\nA previous attempt was rejected. Reviewer feedback:\n{task['feedback']}"
-            db.update(self.conn, tid, status="running", backend=r.executor)
-            answer = self.call(r.executor, tid, "execute", prompt, AGENT_SYS if work else EXEC_SYS,
+            answer = self.call(r.executor, tid, "execute", prompt, EXEC_SYS,
                                cwd=str(cwd) if cwd else None, files=send)
             review = ""
             if r.reviewer and self.ok(r.reviewer):
                 db.update(self.conn, tid, status="review")
+                done_when = f"\n\nDone when:\n{crit}" if crit else ""
                 review = self.call(r.reviewer, tid, "review",
-                                   f"Task:\n{task['prompt']}\n\nResult:\n{answer}", REVIEW_SYS)
+                                   f"Task:\n{task['prompt']}{done_when}\n\nResult:\n{answer}",
+                                   REVIEW_SYS)
                 if not passed(review):
-                    return self._retry(task, feedback=review, error="rejected by reviewer")
+                    return self._retry(task, feedback=review,
+                                       error=NOT_ACCEPTED + "rejected by the reviewer")
         except BackendError as e:
             # One error attempt per run, so an outage can't use up every attempt in seconds.
-            # Reviewer rejections above retry straight away, carrying the feedback.
+            # Rejections (reviewer, agent check) retry straight away, carrying the feedback.
             # Scheduled tasks are also picked up by the every-minute job, so push them back.
             self.held.add(tid)
             outcome = self._retry(task, error=str(e))
             if task["run_after"] and outcome == "retried":
                 db.update(self.conn, tid, run_after=db.iso(self.now() + RETRY_DELAY))
             return outcome
+        self._write_result(task, r.executor, answer, None, review=review, reviewer=r.reviewer)
+        return self._done(task)
+
+    def _done(self, task) -> str:
+        db.update(self.conn, task["id"], status="done", last_error=None, feedback=None)
+        return "done"
+
+    def _why(self, task) -> str:
+        """What happened to the attempts before this one, for an agent that tries again."""
+        why = []
+        if task["feedback"]:
+            why.append(f"Your last attempt was not accepted:\n{task['feedback']}")
+        err = task["last_error"] or ""
+        if err and not err.startswith(NOT_ACCEPTED):
+            why.append(f"Your last run stopped before it finished: {err}")
+        return "\n\n".join(why)
+
+    def _agent(self, task, executor, prompt, cwd) -> str:
+        """Run an agent, continuing its earlier session when the backend can (session_args in
+        its config) and this task has one, so a retry picks up where the last run stopped."""
+        c, tid = self.cfg["backends"].get(executor, {}), task["id"]
+        contract = CONTRACT.format(minutes=max(self.cfg["limits"]["check_timeout"] // 60, 1))
+        system = AGENT_SYS + (f" {c['notes']}" if c.get("notes") else "") + "\n\n" + contract
+        fresh = c.get("session_args")
+        resume = c.get("resume_args", fresh)
+        def fill(args, sid):
+            return [a.replace("{session}", sid).replace("{session_hex}", sid.replace("-", ""))
+                    for a in args]
+        held, _, sid = (task["session"] or "").partition(" ")
+        if resume and sid and held == executor:
+            why = self._why(task) or ("The task was queued again, and may have been edited. "
+                                      "Check your earlier work against it and finish what's left.")
+            try:
+                return self.call(executor, tid, "execute",
+                                 f"{CONTINUE}\n\n{why}\n\n{prompt}\n\n{contract}", None,
+                                 cwd=str(cwd), args=fill(resume, sid))
+            except BackendError as e:
+                if "no conversation found" not in str(e).lower():
+                    raise
+                self.log(f"  #{tid}: session {sid} is gone, starting a new one")
+        args = []
+        if fresh:
+            sid = str(uuid.uuid4())
+            db.update(self.conn, tid, session=f"{executor} {sid}")  # before: a timeout keeps it
+            args = fill(fresh, sid)
+        if why := self._why(task):
+            prompt += f"\n\nEarlier attempts left their files in this workspace.\n\n{why}"
+        return self.call(executor, tid, "execute", prompt, system, cwd=str(cwd), args=args)
+
+    def _verify(self, executor, work: Path, answer: str) -> tuple[bool, str, str]:
+        """Hold the agent to its STATUS and CHECK lines. Returns (accepted, a note for the
+        result file, feedback for the next attempt if not accepted)."""
+        status, check = verify.contract(answer)
+        if status is None:
+            return (False, "The reply didn't end with a STATUS line.",
+                    "Your reply didn't end with the STATUS and CHECK lines, so the work couldn't "
+                    "be accepted. Finish the task, then end with them.")
+        if status == "INCOMPLETE":
+            return (False, "The agent reported STATUS: INCOMPLETE.",
+                    "You reported STATUS: INCOMPLETE. Finish what's left. Your summary then "
+                    f"ended:\n{answer.strip()[-1500:]}")
+        if check is None or not check:
+            return True, ("No check command was given, so nothing was re-run." if check is None
+                          else "The agent said nothing could be checked by a command (CHECK: none)."), ""
+        limit = self.cfg["limits"]["check_timeout"]
+        env = backends.environ(self.cfg["backends"].get(executor, {}), str(work))
+        try:
+            code, out = verify.run_check(check, work, env, limit, verify.secrets(self.cfg))
+        except OSError as e:
+            return True, f"The check `{check}` was not run: {e}", ""
+        what = f"timed out after {limit} s" if code is None else f"exited {code}"
+        note = f"`{check}` {what}.\n\n```\n{out or '(no output)'}\n```"
+        if code == 0:
+            return True, note, ""
+        return (False, note, f"You reported STATUS: DONE, but your check `{check}` {what} when "
+                f"night-elves ran it. Fix the work (or the check, if the check is wrong). Its "
+                f"output ended:\n{out}")
+
+    def _write_result(self, task, executor, answer, work, review="", reviewer=None, check=None,
+                      accepted=True):
+        tid = task["id"]
         out = Path(self.cfg["paths"]["results"])
         out.mkdir(parents=True, exist_ok=True)
         path = out / f"{tid}.md"
@@ -145,17 +272,20 @@ class Night:
                      if names else f"\n## Files\n\nNothing was saved in {work}.\n")
             if names:
                 title = " ".join(task["prompt"].split())[:60]
-                files += "\n" + commit_workspace(work, f"Task {tid}: {title}") + "\n"
+                attempt = f" (attempt {task['attempts'] + 1})" if task["attempts"] else ""
+                files += "\n" + commit_workspace(work, f"Task {tid}: {title}{attempt}") + "\n"
         attached = ""
         if attachments.files(task):
             attached = (f"Attached, in {attachments.task_dir(self.cfg, tid)}:"
                         + attachments.listing(task) + "\n\n")
-        path.write_text(f"# Task {tid}\n\n{task['prompt']}\n\n{attached or ''}"
-                        f"## Result ({r.executor})\n\n{answer}\n"
+        crit = f"Done when: {task['criteria'].strip()}\n\n" if task["criteria"] else ""
+        verdict = "" if accepted else ", not accepted"
+        path.write_text(f"# Task {tid}\n\n{task['prompt']}\n\n{crit}{attached}"
+                        f"## Result ({executor}{verdict})\n\n{answer}\n"
+                        + (f"\n## Check\n\n{check}\n" if check else "")
                         + files
-                        + (f"\n## Review ({r.reviewer})\n\n{review}\n" if review else ""))
-        db.update(self.conn, tid, status="done", result_path=str(path), last_error=None)
-        return "done"
+                        + (f"\n## Review ({reviewer})\n\n{review}\n" if review else ""))
+        db.update(self.conn, tid, result_path=str(path))
 
     def _attach(self, task, executor, prompt, work, cwd):
         """Give the executor the task's files. Returns (prompt, cwd, files to send)."""

@@ -16,10 +16,13 @@ DEFAULTS = {
         "per_night_cap_usd": 15.0,
         "conserve_night_cap_usd": 2.0, # early-cycle cap, for escalations only
     },
-    "limits": {"max_attempts": 3, "escalate_after": 2, "max_minutes": 360, "hard_priority": 3},
+    "limits": {"max_attempts": 3, "escalate_after": 2, "max_minutes": 360, "hard_priority": 3,
+               "check_timeout": 600},  # seconds an agent's CHECK command may run
     "roles": {"local": "local", "frontier_api": "claude_api",
               "frontier_sub": "claude_cli", "second_opinion": "codex", "agent": "claude_agent",
-              "local_vision": ""},  # a local model that sees images, e.g. "local_vision"
+              "local_vision": "",  # a local model that sees images, e.g. "local_vision"
+              "local_review": "",  # reviews local answers; "" = the local model itself
+              "local_agent": ""},  # agent tasks try this first, e.g. "local_agent" (opencode)
     "backends": {},
     "web": {"host": "127.0.0.1", "port": 8377, "token_env": "ELVES_TOKEN", "sms_allow": [],
             "max_upload_mb": 2048,  # one task's files, sent through the web intake

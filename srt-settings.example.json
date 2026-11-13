@@ -1,0 +1,44 @@
+{
+  "network": {
+    "allowedDomains": [
+      "pypi.org",
+      "files.pythonhosted.org",
+      "registry.npmjs.org",
+      "*.npmjs.org",
+      "registry.yarnpkg.com",
+      "crates.io",
+      "index.crates.io",
+      "static.crates.io",
+      "github.com",
+      "api.github.com",
+      "codeload.github.com",
+      "raw.githubusercontent.com",
+      "objects.githubusercontent.com",
+      "cdn.jsdelivr.net",
+      "unpkg.com",
+      "cdnjs.cloudflare.com",
+      "bsky.social",
+      "*.bsky.app",
+      "bsky.network",
+      "*.bsky.network"
+    ],
+    "deniedDomains": [],
+    "allowLocalBinding": true
+  },
+  "filesystem": {
+    "denyRead": [
+      "~/.ssh",
+      "~/.gnupg",
+      "~/.aws",
+      "~/.config",
+      "~/.night-elves/env",
+      "~/.night-elves/queue.db",
+      "~/Library/Keychains",
+      "~/Library/Messages"
+    ],
+    "allowWrite": [
+      "."
+    ],
+    "denyWrite": []
+  }
+}
