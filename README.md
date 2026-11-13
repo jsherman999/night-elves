@@ -82,6 +82,7 @@ elf add -t agent "Capture 5 seconds of the Bluesky firehose to a JSON file"
 elf add --at 01:30 -t agent "Record which hosts answer ping on the LAN"
 elf add -t agent --done-when "a screenshot of each form is in shots/" \
         "Clone github.com/me/app, run it, and screenshot its forms with Playwright"
+elf add --from 9 "Using these 3B2 notes, build a quick-reference page"
 cat spec.md | elf add -
 elf list
 elf show 3
@@ -167,7 +168,7 @@ the token (HttpOnly, SameSite=Strict, Secure over HTTPS), so changing
 
 | Request | Does |
 |---|---|
-| `POST /tasks` `{"prompt", "priority", "tier", "at", "criteria"}` | queue a task (`criteria`: done when) |
+| `POST /tasks` `{"prompt", "priority", "tier", "at", "criteria", "from"}` | queue a task (`criteria`: done when; `from`: `"9, 12"` or `[9, 12]`) |
 | `POST /tasks` as `multipart/form-data`, same fields plus `files` | queue a task with files |
 | `GET /tasks` | the latest 100 tasks |
 | `GET /tasks/<id>` | one task, with its result text and its files |
@@ -176,6 +177,22 @@ the token (HttpOnly, SameSite=Strict, Secure over HTTPS), so changing
 | `POST /tasks/<id>` `{"action": "now" \| "cancel" \| "retry"}` | run it within a minute, cancel it, requeue it |
 
 A change to a task a run has already started returns 409.
+
+### Using an earlier task's result
+
+Every result is a Markdown file, `~/.night-elves/results/<id>.md` (an agent's
+other files are in `~/.night-elves/work/<id>/`, listed at the end of that
+file). To build on one, reference the task when you queue the next:
+
+- `elf add --from 9 "..."` (repeatable, or `--from 9,12`)
+- the web form's "Use results of tasks" box, or `"from": "9, 12"` in JSON
+- from the phone or SMS, start the prompt with `from #9:` (or `from #9, #12:`)
+
+Each result is attached to the new task as `task-<id>.md`: a copy taken at
+queue time, so rerunning task 9 later doesn't change it. As a text file it is
+pasted into the prompt for any tier, and an agent also gets it in `input/`. A
+task that has no result yet can't be referenced ("#9 has no result yet"), and
+results count towards the 200 KB of text a task can carry inline.
 
 ### Files and images
 
@@ -255,8 +272,9 @@ Two ways:
 - **Twilio-style webhook.** Point the number's webhook at
   `https://<your-tunnel>/sms?key=<ELVES_TOKEN>` and list your phone number in
   `web.sms_allow`. Start a message with `!` for priority 1, `opus:` to
-  request the frontier tier, `agent:` for the agent tier, or `at 1:30am` to
-  schedule it. These can be combined in any order. The same shorthand works
+  request the frontier tier, `agent:` for the agent tier, `at 1:30am` to
+  schedule it, or `from #9:` to attach task 9's result. These can be combined
+  in any order. The same shorthand works
   for prompts posted to `/tasks` without a `tier`.
 
 ### Morning digest

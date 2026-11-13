@@ -543,14 +543,18 @@ class MiscTests(Base):
         self.assertTrue(any(f.startswith("digest-") for f in os.listdir(self.tmp)))
 
     def test_parse_inline(self):
-        self.assertEqual(web.parse_inline("! opus: fix it"), ("fix it", 1, "frontier", None))
-        self.assertEqual(web.parse_inline("plain"), ("plain", 5, "auto", None))
-        self.assertEqual(web.parse_inline("Agent: fetch it"), ("fetch it", 5, "agent", None))
-        self.assertEqual(web.parse_inline("at 1:30am agent: capture"), ("capture", 5, "agent", "1:30am"))
-        self.assertEqual(web.parse_inline("agent: At 2 PM CST, scan it"), ("scan it", 5, "agent", "2 PM"))
-        self.assertEqual(web.parse_inline("! at 01:30: do it"), ("do it", 1, "auto", "01:30"))
-        self.assertEqual(web.parse_inline("At 5 companies, compare"), ("At 5 companies, compare", 5, "auto", None))
-        self.assertEqual(web.parse_inline("at 1:30 make tea"), ("make tea", 5, "auto", "1:30"))
+        self.assertEqual(web.parse_inline("! opus: fix it"), ("fix it", 1, "frontier", None, []))
+        self.assertEqual(web.parse_inline("plain"), ("plain", 5, "auto", None, []))
+        self.assertEqual(web.parse_inline("Agent: fetch it"), ("fetch it", 5, "agent", None, []))
+        self.assertEqual(web.parse_inline("at 1:30am agent: capture"), ("capture", 5, "agent", "1:30am", []))
+        self.assertEqual(web.parse_inline("agent: At 2 PM CST, scan it"), ("scan it", 5, "agent", "2 PM", []))
+        self.assertEqual(web.parse_inline("! at 01:30: do it"), ("do it", 1, "auto", "01:30", []))
+        self.assertEqual(web.parse_inline("At 5 companies, compare"), ("At 5 companies, compare", 5, "auto", None, []))
+        self.assertEqual(web.parse_inline("at 1:30 make tea"), ("make tea", 5, "auto", "1:30", []))
+        self.assertEqual(web.parse_inline("from #9: build it"), ("build it", 5, "auto", None, [9]))
+        self.assertEqual(web.parse_inline("agent: from #9, #12 and #9 build"),
+                         ("build", 5, "agent", None, [9, 12]))
+        self.assertEqual(web.parse_inline("From the top, again"), ("From the top, again", 5, "auto", None, []))
 
     def test_web_intake(self):
         self.cfg["paths"]["db"] = os.path.join(self.tmp, "q.db")
@@ -841,6 +845,79 @@ class FileTests(Base):
         with mock.patch.object(config, "load", return_value=self.cfg), \
              contextlib.redirect_stderr(io.StringIO()) as err:
             self.assertEqual(cli.main(["add", "-f", os.path.join(self.tmp, "nope"), "x"]), 2)
+
+    def test_results_of_earlier_tasks_can_be_attached(self):
+        self.cfg["paths"]["db"] = os.path.join(self.tmp, "q.db")
+        conn = db.connect(self.cfg["paths"]["db"])
+        nine = db.add_task(conn, "3B2 notes")
+        res = os.path.join(self.tmp, f"{nine}.md")
+        open(res, "w").write("# Task 1\n\nThe 3B2/400 ran System V.")
+        db.update(conn, nine, status="done", result_path=res)
+        pending = db.add_task(conn, "not done yet")
+        outside = db.add_task(conn, "elsewhere")
+        db.update(conn, outside, status="done", result_path="/etc/hosts")
+        self.assertEqual(attachments.parse_refs(["9,#12", " 12 ", 3]), [9, 12, 3])
+        with self.assertRaises(ValueError):
+            attachments.parse_refs("nine")
+        # CLI
+        with mock.patch.object(config, "load", return_value=self.cfg), \
+             contextlib.redirect_stdout(io.StringIO()) as out, \
+             contextlib.redirect_stderr(io.StringIO()) as err:
+            self.assertEqual(cli.main(["add", "--from", str(nine), "build an emulator"]), 0)
+            self.assertEqual(cli.main(["add", "--from", str(pending), "x"]), 2)
+            self.assertEqual(cli.main(["add", "--from", str(outside), "x"]), 2)
+            self.assertEqual(cli.main(["add", "--from", "99", "x"]), 2)
+        self.assertIn("with 1 file", out.getvalue())
+        self.assertIn(f"#{pending} has no result yet", err.getvalue())
+        self.assertIn(f"#{outside} has no result yet", err.getvalue())  # not under results/
+        self.assertIn("no task #99", err.getvalue())
+        t = db.list_tasks(conn)[0]
+        self.assertEqual(attachments.files(t)[0], {"name": "1-task-1.md", "kind": "text",
+                                                   "size": os.path.getsize(res)})
+        # The model gets it pasted in, like any text file.
+        night = self.night(5, hour=12)
+        night.conn = conn
+        night.run()
+        built = [c for c, _ in self.fakes["local"].calls if "build an emulator" in c][0]
+        self.assertIn("Attached file 1-task-1.md:\n```\n# Task 1\n\nThe 3B2/400 ran System V.", built)
+        # Web (JSON, a form with an upload, shorthand) and SMS
+        self.cfg["web"]["sms_allow"] = ["+15550001111"]
+        srv = ThreadingHTTPServer(("127.0.0.1", 0), web.make_handler(self.cfg, "s3cret-token-123456"))
+        threading.Thread(target=srv.serve_forever, daemon=True).start()
+        base = f"http://127.0.0.1:{srv.server_port}"
+        def post(path, data, headers):
+            req = urllib.request.Request(base + path, data=data, headers=headers)
+            try:
+                with urllib.request.urlopen(req) as r:
+                    return r.status, r.read().decode()
+            except urllib.error.HTTPError as e:
+                return e.code, e.read().decode()
+        auth = {"Authorization": "Bearer s3cret-token-123456"}
+        js = {**auth, "Content-Type": "application/json"}
+        code, text = post("/tasks", json.dumps({"prompt": "use it", "from": "1"}).encode(), js)
+        self.assertEqual((code, json.loads(text)["files"]), (201, 0))
+        self.assertTrue(json.loads(text)["message"].endswith("with the result of #1"))
+        code, text = post("/tasks", json.dumps({"prompt": "from #1: and this"}).encode(), js)
+        self.assertEqual(code, 201)
+        waiting = db.add_task(conn, "still waiting")  # the run above finished `pending`
+        code, text = post("/tasks", json.dumps({"prompt": "x", "from": [waiting]}).encode(), js)
+        self.assertEqual((code, json.loads(text)["message"]), (400, f"Not queued: #{waiting} has no result yet"))
+        body, ctype = multipart({"prompt": "both", "from": "1"}, [("notes.txt", b"mine")])
+        code, text = post("/tasks", body, {**auth, "Content-Type": ctype})
+        self.assertEqual(json.loads(text)["message"].split(" with ")[1], "1 file and the result of #1")
+        form = {"Content-Type": "application/x-www-form-urlencoded"}
+        code, text = post("/sms?key=s3cret-token-123456",
+                          b"From=%2B15550001111&Body=from+%231%3A+summarise", form)
+        self.assertIn("with the result of #1", text)
+        code, text = post("/sms?key=s3cret-token-123456",
+                          b"From=%2B15550001111&Body=from+%2399%3A+x", form)
+        self.assertIn("Not queued: no task #99", text)
+        srv.shutdown()
+        rows = db.list_tasks(conn, limit=6)
+        self.assertEqual([r["prompt"] for r in rows], ["summarise", "both", "still waiting",
+                                                       "and this", "use it", "build an emulator"])
+        self.assertEqual([f["name"] for f in attachments.files(rows[1])], ["1-notes.txt", "2-task-1.md"])
+        self.assertEqual(rows[0]["source"], "sms")
 
     def test_web_upload_and_view(self):
         self.cfg["paths"]["db"] = os.path.join(self.tmp, "q.db")

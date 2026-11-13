@@ -123,6 +123,7 @@ def home(rows, msg: str | None = None) -> str:
 {tier_help()}
 <input name=at placeholder="run at (optional): 01:30, 2pm, 2026-11-20 07:05">
 <textarea name=criteria rows=2 placeholder="Done when (optional): e.g. the tests pass and there is a screenshot of each form"></textarea>
+<input name=from placeholder="Use results of tasks (optional): 9, 12">
 <label for=files>Files or images (optional, up to {attachments.MAX_FILES})</label>
 <input id=files name=files type=file multiple>
 <p class=hint>Text files up to 200 KB work with any tier. Images and PDFs need Claude or the

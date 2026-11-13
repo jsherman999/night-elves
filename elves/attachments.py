@@ -284,6 +284,51 @@ class Staged:
     def discard(self) -> None:
         shutil.rmtree(self.dir, ignore_errors=True)  # nothing left to remove once committed
 
+REF = re.compile(r"^#?(\d+)$")
+
+def parse_refs(values) -> list[int]:
+    """Task ids from "9, #12", ["9", "12"], 9 and the like, without repeats."""
+    if values is None or values == "":
+        return []
+    items = []
+    for v in values if isinstance(values, (list, tuple)) else [values]:
+        items += v if isinstance(v, (list, tuple)) else [v]  # JSON may nest a list
+    out = []
+    for item in items:
+        for part in re.split(r"[\s,]+", str(item).strip()):
+            if not part:
+                continue
+            m = REF.match(part)
+            if not m:
+                raise ValueError(f"not a task number: {part!r}")
+            if int(m.group(1)) not in out:
+                out.append(int(m.group(1)))
+    return out
+
+def add_results(cfg: dict, conn, staged: Staged, refs) -> None:
+    """Attach the result files of earlier tasks, as task-<id>.md. A snapshot: a later rerun of
+    that task doesn't change what this one got."""
+    from . import db
+    results = Path(cfg["paths"]["results"]).resolve()
+    for tid in refs:
+        t = db.get(conn, tid)
+        if t is None:
+            raise ValueError(f"no task #{tid}")
+        p = Path(t["result_path"]).resolve() if t["result_path"] else None
+        if p is None or not p.is_relative_to(results) or not p.is_file():
+            raise ValueError(f"#{tid} has no result yet")
+        shutil.copyfile(p, staged.new_file(f"task-{tid}.md"))
+
+def queue(cfg: dict, conn, prompt: str, staged: Staged, refs=(), **kw) -> tuple[int, int]:
+    """Queue a task with whatever was staged (uploads, not yet finished) plus the results of
+    the tasks in refs. Returns (id, number of files kept)."""
+    from . import db
+    add_results(cfg, conn, staged, refs)
+    staged.finish()
+    if not staged.files:
+        return db.add_task(conn, prompt, **kw), 0
+    return add_task(cfg, conn, prompt, staged, **kw), len(staged.files)
+
 def add_task(cfg: dict, conn, prompt: str, staged: Staged, **kw) -> int:
     """db.add_task with the staged files: the row and the folder appear together or not at all."""
     from . import db

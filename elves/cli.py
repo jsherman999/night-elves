@@ -22,6 +22,8 @@ def main(argv=None) -> int:
     a.add_argument("--at", help="not before this local time: 01:30, 2pm, or 2026-11-12 01:30")
     a.add_argument("--done-when", "--criteria", dest="criteria", metavar="TEXT",
                    help="what the result must satisfy; the reviewer and the agent are held to it")
+    a.add_argument("--from", dest="refs", action="append", default=[], metavar="ID",
+                   help="attach the result of an earlier task (repeatable, or 9,12)")
     a.add_argument("-f", "--file", "-i", "--image", dest="files", action="append", default=[],
                    metavar="FILE", help=f"attach a file (repeatable, up to {attachments.MAX_FILES})")
     l = sub.add_parser("list", help="show recent tasks")
@@ -67,19 +69,16 @@ def main(argv=None) -> int:
             after = db.iso(when.parse_at(args.at, now)) if args.at else None
             kw = dict(source=args.source, priority=args.priority, tier=args.tier, run_after=after,
                       criteria=args.criteria)
-            if args.files:
-                with attachments.Staged(cfg) as staged:
-                    for f in args.files:
-                        staged.add_path(f)
-                    staged.finish()
-                    tid = attachments.add_task(cfg, conn, text, staged, **kw)
-            else:
-                tid = db.add_task(conn, text, **kw)
+            refs = attachments.parse_refs(args.refs)
+            with attachments.Staged(cfg) as staged:
+                for f in args.files:
+                    staged.add_path(f)
+                tid, nfiles = attachments.queue(cfg, conn, text, staged, refs, **kw)
         except (OSError, ValueError) as e:
             print(e, file=sys.stderr)
             return 2
         print(f"queued #{tid}" + (f" for {when.label(after)}" if after else "")
-              + (f" with {len(args.files)} file(s)" if args.files else ""))
+              + (f" with {nfiles} file(s)" if nfiles else ""))
     elif args.cmd == "list":
         for t in db.list_tasks(conn, args.status):
             print(describe(t))

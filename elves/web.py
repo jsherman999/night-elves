@@ -16,11 +16,13 @@ BAD_TOKEN = {"error": "unauthorized", "message": "Not queued: the token was wron
 MAX_RESULT = 256 * 1024  # bytes of a result file shown on its page
 
 AT = re.compile(rf"^at\s+({when.CLOCK})(?:\s*(?:cst|cdt|ct))?\s*[:,]?\s+", re.I)
+FROM = re.compile(r"^from\s+(#\d+(?:\s*(?:,|and|&)\s*#\d+)*)\s*[:,]?\s+", re.I)
 
-def parse_inline(text: str) -> tuple[str, int, str, str | None]:
+def parse_inline(text: str) -> tuple[str, int, str, str | None, list[int]]:
     """Phone shorthand, in any order at the start: '!' means priority 1, 'opus:' the frontier
-    tier, 'agent:' the agent tier, and 'at 1:30am' (a colon or am/pm is needed) not before then."""
-    text, priority, tier, at = text.strip(), 5, "auto", None
+    tier, 'agent:' the agent tier, 'at 1:30am' (a colon or am/pm is needed) not before then,
+    and 'from #9' (or 'from #9, #12') attaches those tasks' results."""
+    text, priority, tier, at, refs = text.strip(), 5, "auto", None, []
     while True:
         low = text.lower()
         if text.startswith("!"):
@@ -31,14 +33,35 @@ def parse_inline(text: str) -> tuple[str, int, str, str | None]:
             text, tier = text[6:].lstrip(), "agent"
         elif (m := AT.match(text)) and (m.group(3) or m.group(4)):
             text, at = text[m.end():], m.group(1).strip()
+        elif m := FROM.match(text):
+            text = text[m.end():]
+            for n in map(int, re.findall(r"\d+", m.group(1))):
+                if n not in refs:
+                    refs.append(n)
         else:
-            return text, priority, tier, at
+            return text, priority, tier, at, refs
 
 def run_after(at: str | None) -> str | None:
     return db.iso(when.parse_at(at, datetime.now().astimezone())) if at else None
 
-def queued_msg(tid: int, after: str | None) -> str:
-    return f"Queued #{tid}" + (f" for {when.label(after)}" if after else "")
+def queued_msg(tid: int, after: str | None, uploads: int = 0, refs=()) -> str:
+    parts = [f"{uploads} file{'s' if uploads > 1 else ''}"] if uploads else []
+    if refs:
+        parts.append(f"the result{'s' if len(refs) > 1 else ''} of "
+                     + ", ".join(f"#{r}" for r in refs))
+    return (f"Queued #{tid}" + (f" for {when.label(after)}" if after else "")
+            + (" with " + " and ".join(parts) if parts else ""))
+
+def queue(cfg: dict, conn, text: str, staged, refs, **kw) -> tuple[int, int]:
+    """Queue from the web or SMS: uploads (if staged) plus earlier tasks' results.
+    Returns (id, uploads kept)."""
+    st = staged if staged is not None else attachments.Staged(cfg)
+    try:
+        tid, nfiles = attachments.queue(cfg, conn, text, st, refs, **kw)
+    finally:
+        if staged is None:
+            st.discard()
+    return tid, nfiles - len(refs)
 
 COOKIE = "elves"
 TASK_PATH = re.compile(r"^/(t|tasks)/(\d+)$")
@@ -210,10 +233,8 @@ def make_handler(cfg: dict, token: str):
             if staged is not None:
                 if n > max_upload:
                     raise ValueError(f"the upload is over {max_upload // 2**20} MB")
-                d = read_multipart(self.rfile, n, self.headers.get_param("boundary") or "",
-                                   staged.new_file, self.parts)
-                staged.finish()
-                return d
+                return read_multipart(self.rfile, n, self.headers.get_param("boundary") or "",
+                                      staged.new_file, self.parts)  # queue() finishes it
             if n > MAX_BODY:
                 raise ValueError("body too large")
             raw = self.rfile.read(n).decode(errors="replace")
@@ -355,22 +376,20 @@ def make_handler(cfg: dict, token: str):
                     if not self._authed(d.get("token")):
                         return self._send(401, BAD_TOKEN)
                     try:
-                        text, priority, tier, at = parse_inline(str(d.get("prompt", "")))
+                        text, priority, tier, at, refs = parse_inline(str(d.get("prompt", "")))
+                        refs = attachments.parse_refs([*refs, d.get("from") or ""])
                         if d.get("tier") not in (None, "", "auto"):
                             tier = d["tier"]
                         after = run_after(d.get("at") or at)
                         kw = dict(source="web", tier=tier, run_after=after,
                                   priority=int(d.get("priority") or priority),
                                   criteria=str(d.get("criteria") or ""))
-                        nfiles = len(staged.files) if staged else 0
-                        tid = (attachments.add_task(cfg, conn, text, staged, **kw) if nfiles
-                               else db.add_task(conn, text, **kw))
-                    except ValueError as e:
+                        tid, nfiles = queue(cfg, conn, text, staged, refs, **kw)
+                    except (ValueError, OSError) as e:
                         if self._wants_json():
                             return self._send(400, {"error": str(e), "message": f"Not queued: {e}"})
                         return self._redirect("/?m=" + quote(f"Not queued: {e}"))
-                    msg = queued_msg(tid, after) + (f" with {nfiles} file"
-                                                    f"{'s' if nfiles > 1 else ''}" if nfiles else "")
+                    msg = queued_msg(tid, after, nfiles, refs)
                     named = staged is not None and any(n for _, n in staged.incoming)
                     if not nfiles and (named or any(d.get(k) for k in FILE_FIELDS)):
                         msg += ", but no file came through"  # sent as text, or empty
@@ -398,11 +417,14 @@ def make_handler(cfg: dict, token: str):
                     key = parse_qs(u.query).get("key", [None])[0]
                     if not self._token_ok(key) or d.get("From") not in cfg["web"]["sms_allow"]:
                         return self._send(401, {"error": "unauthorized"})
-                    text, priority, tier, at = parse_inline(d.get("Body", ""))
+                    text, priority, tier, at, refs = parse_inline(d.get("Body", ""))
                     after = run_after(at)
-                    tid = db.add_task(conn, text, source="sms", priority=priority, tier=tier,
-                                      run_after=after)
-                    msg = html.escape(queued_msg(tid, after))
+                    try:
+                        tid, _ = queue(cfg, conn, text, None, refs, source="sms",
+                                       priority=priority, tier=tier, run_after=after)
+                        msg = html.escape(queued_msg(tid, after, refs=refs))
+                    except ValueError as e:
+                        msg = html.escape(f"Not queued: {e}")
                     return self._send(200, f"<Response><Message>{msg}</Message></Response>",
                                       "text/xml")
                 self._send(404, {"error": "not found"})
