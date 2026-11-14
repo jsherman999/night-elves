@@ -178,9 +178,9 @@ def home(rows, msg: str | None = None, usage=None, q: str = "", found=None, arch
     if found is not None:
         extra += section(f"Matches for “{e(q)}”", [t for t, _ in found],
                          "No task's prompt or result has those words.",
-                         snippets={t["id"]: s for t, s in found})
-        extra += ('<p class=hint>To build on one, put its number in “Use results of tasks”. '
-                  '<a href=/>Clear search</a></p>')
+                         "use", {t["id"]: s for t, s in found})
+        extra += ('<p class=hint>Use adds a task\'s number to “Use results of tasks” for the '
+                  'task you are writing. <a href=/>Clear search</a></p>')
     if archived is not None:
         extra += section("Archived", archived, "Nothing archived.", "unarchive")
         extra += "<p class=hint><a href=/>Hide archived</a></p>"
@@ -191,7 +191,7 @@ def home(rows, msg: str | None = None, usage=None, q: str = "", found=None, arch
 {tier_help()}
 <input name=at placeholder="run at (optional): 01:30, 2pm, 2026-11-20 07:05">
 <textarea name=criteria rows=2 placeholder="Done when (optional): e.g. the tests pass and there is a screenshot of each form"></textarea>
-<input name=from placeholder="Use results of tasks (optional): 9, 12">
+<input name=from id=from placeholder="Use results of tasks (optional): 9, 12">
 <label for=files>Files or images (optional, up to {attachments.MAX_FILES})</label>
 <input id=files name=files type=file multiple>
 <p class=hint>Text files up to 200 KB work with any tier. Images and PDFs need Claude or the
@@ -207,8 +207,13 @@ local vision model. Bigger or other kinds of files need agent.</p>
 {"" if archived is not None else "<p class=hint><a href=/?archived=1>Show archived tasks</a></p>"}
 <form method=post action=/logout><button class=quiet>Sign out</button></form></div></div>""", msg)
 
+_USE_JS = ("var f=document.getElementById('from'),v=f.value.split(/[^0-9]+/).filter(Boolean);"
+           "if(v.indexOf('%d')<0)v.push('%d');f.value=v.join(', ');"
+           "f.scrollIntoView({block:'center'});this.textContent='Added'")
+
 def row(t, u=None, act: str | None = None, snippet: str | None = None) -> str:
-    """act: "archive" or "unarchive" puts that button on the row, where the task allows it."""
+    """act: "archive", "unarchive" or "use" puts that button on the row, where the task allows
+    it. Use adds the task's number to the form's "Use results of tasks" box."""
     pri = f" · p{t['priority']}" if t["priority"] != 5 else ""
     n = len(attachments.files(t))
     pri += f" · {n} file{'s' if n > 1 else ''}" if n else ""
@@ -220,6 +225,10 @@ def row(t, u=None, act: str | None = None, snippet: str | None = None) -> str:
              f"<span class='pill {e(t['status'])}'>{e(t['status'])}</span>{arch}"
              f"<span>{e(t['tier'])}{pri} · {e(when_text(t))}</span></div>"
              f"<div class=txt>{e(' '.join(t['prompt'].split())[:140])}</div>{snip}")
+    if act == "use" and t["result_path"]:
+        return (f"<div class='row act'><a href=/t/{t['id']}>{inner}</a>"
+                f"<button type=button class='quiet mini' aria-label='Use the result of #{t['id']}' "
+                f"onclick=\"{e(_USE_JS % (t['id'], t['id']))}\">Use</button></div>")
     if act not in ("archive", "unarchive") or (act == "archive" and t["status"]
                                                not in ("done", "failed", "cancelled")):
         return f"<a class=row href=/t/{t['id']}>{inner}</a>"

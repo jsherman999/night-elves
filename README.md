@@ -211,7 +211,9 @@ To find the number of a task to build on, search by keyword: `elf search 3b2
 emulator`, the search box above the queue on the web page, or `GET
 /tasks?q=...`. A task matches when its prompt or its result file contains
 every word (case is ignored; the first 2 MB of each result is read). Matches
-are listed newest first with the text around the first hit.
+are listed newest first with the text around the first hit. On the web page,
+each match that has a result gets a Use button, which adds its number to the
+form's "Use results of tasks" box.
 
 A finished, failed or cancelled task can be archived: the Archive button on
 its row under Recent or on its page, or `elf archive <id>`. That only takes it

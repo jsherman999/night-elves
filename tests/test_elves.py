@@ -1314,6 +1314,11 @@ class SearchAndArchiveTests(Base):
         self.assertIn("Matches for “system v”", hit)
         self.assertIn("ran System V on a WE 32100 &lt;b&gt;CPU&lt;/b&gt;", hit)
         self.assertIn("<span class='pill cancelled'>archived</span>", hit)
+        self.assertIn("<input name=from id=from ", hit)
+        self.assertIn(f"aria-label='Use the result of #{n}'", hit)
+        self.assertIn(f"v.push(&#x27;{n}&#x27;)", hit)
+        both = call("/?q=system", headers=me)[1]  # a task with no result can't be used
+        self.assertNotIn(f"Use the result of #{self.waiting}", both)
         self.assertIn('value="&lt;i&gt;"', call("/?q=%3Ci%3E", headers=me)[1])
         self.assertIn("No task", call("/?q=zzz", headers=me)[1])
         page = call(f"/t/{n}", headers=me)[1]
