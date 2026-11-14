@@ -10,9 +10,10 @@ from elves.dispatcher import Night, passed, plan_criteria
 class Fake:
     def __init__(self, reply="ok", usd=0.0, fail=0):
         self.reply, self.usd, self.fail, self.calls = reply, usd, fail, []
-    def run(self, prompt, system=None, cwd=None, files=(), args=(), web=False):
+    def run(self, prompt, system=None, cwd=None, files=(), args=(), web=False, budget_usd=None):
         self.calls.append((prompt, system))
         self.cwd, self.files, self.args, self.web = cwd, list(files), list(args), web
+        self.budget_usd = budget_usd
         if self.fail:
             self.fail -= 1
             raise BackendError("boom")
@@ -1502,6 +1503,94 @@ class LocalSearchTests(Base):
         night.run()
         self.assertEqual([db.get(self.conn, t)["backend"] for t in (later, plain)], ["local", "local"])
         self.assertTrue(self.fakes["local"].web)  # the executor was told it may search
+
+class CeilingTests(Base):
+    def api(self, replies, **cfg):
+        b = backends.AnthropicAPI("claude_api", {"model": "m", "price_in": 4.0, "price_out": 20.0,
+                                                 "server_tools": ["web_search"], **cfg})
+        bodies = []
+        def post(url, headers, body, timeout):
+            bodies.append(json.loads(json.dumps(body)))
+            r = replies.pop(0)
+            if isinstance(r, Exception):
+                raise r
+            return r
+        return b, bodies, mock.patch.object(backends, "_post", side_effect=post), \
+            mock.patch.dict(os.environ, {"ANTHROPIC_API_KEY": "k"})
+
+    @staticmethod
+    def turn(stop, text=None, tin=100_000, tout=1000):
+        content = [{"type": "server_tool_use", "id": "s1", "name": "web_search", "input": {}}]
+        if text:
+            content.append({"type": "text", "text": text})
+        return {"stop_reason": stop, "content": content,
+                "usage": {"input_tokens": tin, "output_tokens": tout}}
+
+    def test_a_paused_turn_at_the_limit_is_finished_without_tools(self):
+        # Each turn costs $0.42. Limit $0.80: the second pause is past it.
+        b, bodies, post, env = self.api([self.turn("pause_turn"), self.turn("pause_turn"),
+                                         self.turn("end_turn", "what I found")])
+        with post, env:
+            res = b.run("research this", budget_usd=0.80)
+        self.assertEqual(len(bodies), 3)
+        self.assertIn("tools", bodies[1])  # under the limit: carried on with its tools
+        self.assertNotIn("tools", bodies[2])
+        self.assertEqual([m["role"] for m in bodies[2]["messages"]],
+                         ["user", "assistant", "assistant", "user"])
+        self.assertEqual(bodies[2]["messages"][-1]["content"], backends.WRAP_UP)
+        self.assertAlmostEqual(res.usd, 1.26)
+        self.assertTrue(res.text.startswith("what I found\n\n---\n*night-elves: stopped at this "
+                                            "task's spending limit ($1.26 used in this call)"))
+
+    def test_under_the_limit_or_without_one_nothing_changes(self):
+        for budget in (5.0, None):
+            b, bodies, post, env = self.api([self.turn("pause_turn"), self.turn("end_turn", "done")])
+            with post, env:
+                res = b.run("q", budget_usd=budget)
+            self.assertEqual(res.text, "done")
+            self.assertIn("tools", bodies[1])
+            self.assertEqual(len(bodies[1]["messages"]), 2)
+
+    def test_a_failure_after_billed_turns_still_records_them(self):
+        b, bodies, post, env = self.api([self.turn("pause_turn"), BackendError("network")])
+        with post, env, self.assertRaises(backends.SpentError) as cm:
+            b.run("q", budget_usd=5.0)
+        self.assertAlmostEqual(cm.exception.result.usd, 0.42)
+        b, bodies, post, env = self.api([self.turn("pause_turn"), self.turn("end_turn")])
+        with post, env, self.assertRaises(backends.SpentError) as cm:  # wrapped up, but no text
+            b.run("q", budget_usd=0.10)
+        self.assertAlmostEqual(cm.exception.result.usd, 0.84)
+
+    def test_each_call_gets_what_is_left_and_a_spent_task_fails_once(self):
+        self.cfg["budget"]["max_usd_per_task"] = 1.2
+        tid = db.add_task(self.conn, "hard one", tier="frontier")
+        night = self.night(20, claude_api=Fake("answer", usd=0.5))
+        self.assertEqual(night.call("claude_api", tid, "execute", "p", None), "answer")
+        self.assertAlmostEqual(self.fakes["claude_api"].budget_usd, 1.2)
+        night.call("claude_api", tid, "execute", "p", None)
+        self.assertAlmostEqual(self.fakes["claude_api"].budget_usd, 0.7)
+        night.call("claude_api", tid, "execute", "p", None)  # $1.50 used: over, as a call can be
+        with self.assertRaises(backends.CeilingError) as cm:
+            night.call("claude_api", tid, "execute", "p", None)
+        self.assertIn("$1.50 of API credit used, limit $1.20", str(cm.exception))
+        self.assertEqual(len(self.fakes["claude_api"].calls), 3)  # the fourth was never sent
+        night.call("local", tid, "execute", "p", None)  # other backends aren't limited
+        self.assertIsNone(self.fakes["local"].budget_usd)
+        stats = night.run()  # no retries: the task fails outright, and says why
+        t = db.get(self.conn, tid)
+        self.assertEqual((stats["failed"], stats["retried"], t["status"], t["attempts"]), (1, 0, "failed", 0))
+        self.assertIn("per-task spending limit", t["last_error"])
+        db.requeue(self.conn, tid)  # running it again starts a fresh limit
+        self.assertEqual(db.get(self.conn, tid)["budget_from"][:2], "20")
+        db.update(self.conn, tid, budget_from="2026-11-20T02:00:01Z")  # on this test's clock
+        self.assertEqual(db.task_usd(self.conn, tid), 0.0)
+        self.assertEqual(self.night(20, claude_api=Fake("again", usd=0.5)).run()["done"], 1)
+        self.cfg["budget"]["max_usd_per_task"] = 0  # 0 turns the limit off
+        other = db.add_task(self.conn, "x", tier="frontier")
+        night = self.night(20, claude_api=Fake("a", usd=50.0))
+        night.call("claude_api", other, "execute", "p", None)
+        night.call("claude_api", other, "execute", "p", None)
+        self.assertIsNone(self.fakes["claude_api"].budget_usd)
 
 class PushTests(Base):
     def git(self, *args, cwd=None):

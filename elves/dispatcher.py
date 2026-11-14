@@ -4,7 +4,7 @@ import re, subprocess, time, uuid
 from datetime import datetime, timedelta
 from pathlib import Path
 from . import attachments, backends, db, policy, push, verify
-from .backends import BackendError, SpentError
+from .backends import BackendError, CeilingError, SpentError
 
 PLAN_SYS = ("You are planning work that a smaller model will carry out. Do not do the task. "
             "Write a short numbered plan and the pitfalls to avoid. End with a section that starts "
@@ -126,6 +126,13 @@ class Night:
 
     def call(self, name, task_id, role, prompt, system, cwd=None, files=(), args=(), web=False):
         kw = {k: v for k, v in (("cwd", cwd), ("files", files), ("args", args), ("web", web)) if v}
+        cap = self.cfg["budget"].get("max_usd_per_task") or 0
+        if cap and self.cfg["backends"].get(name, {}).get("type") == "anthropic_api":
+            used = db.task_usd(self.conn, task_id)
+            if cap - used < policy.MIN_USD:
+                raise CeilingError(f"stopped at the per-task spending limit: ${used:.2f} of API "
+                                   f"credit used, limit ${cap:.2f} ([budget] max_usd_per_task)")
+            kw["budget_usd"] = cap - used
         t0 = time.monotonic()
         def spent(res):
             db.record_spend(self.conn, name, task_id, role, res.tokens_in, res.tokens_out,
@@ -234,6 +241,10 @@ class Night:
                 if not passed(review):
                     return self._retry(task, feedback=review,
                                        error=NOT_ACCEPTED + "rejected by the reviewer")
+        except CeilingError as e:  # trying again would only be refused again
+            db.update(self.conn, tid, status="failed", last_error=str(e)[:1000])
+            self.log(f"  #{tid} -> failed: {e}")
+            return "failed"
         except BackendError as e:
             # One error attempt per run, so an outage can't use up every attempt in seconds.
             # Rejections (reviewer, agent check) retry straight away, carrying the feedback.

@@ -15,6 +15,7 @@ DEFAULTS = {
         "burst": 1.5,                  # tonight's allowance = remaining/days_left * burst
         "per_night_cap_usd": 15.0,
         "conserve_night_cap_usd": 2.0, # early-cycle cap, for escalations only
+        "max_usd_per_task": 3.0,       # API credit one task may use, all its calls; 0 = no limit
     },
     "limits": {"max_attempts": 3, "escalate_after": 2, "max_minutes": 360, "hard_priority": 3,
                "check_timeout": 600},  # seconds an agent's CHECK command may run

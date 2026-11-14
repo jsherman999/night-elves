@@ -6,6 +6,10 @@ from dataclasses import dataclass
 class BackendError(RuntimeError):
     pass
 
+class CeilingError(BackendError):
+    """The task has used its share of API credit (budget.max_usd_per_task); trying again
+    wouldn't help."""
+
 class SpentError(BackendError):
     """A call that failed after it was billed; result holds the tokens and cost to record."""
     def __init__(self, msg, result):
@@ -23,6 +27,9 @@ class Result:
 SERVER_TOOLS = {"web_search": "web_search_20260209", "web_fetch": "web_fetch_20260209"}
 SEARCH_USD = 0.01  # per web search request
 MAX_CONTINUES = 8  # pause_turn continuations of one request (long server-tool loops)
+WRAP_UP = ("Stop here: this task has reached its spending limit, so there is no more searching "
+           "or reading. Write the finished result now from what you have gathered. Say plainly "
+           "what you could not check or finish.")
 
 def _post(url: str, headers: dict, body: dict, timeout: int) -> dict:
     req = urllib.request.Request(url, data=json.dumps(body).encode(),
@@ -107,8 +114,12 @@ class AnthropicAPI:
     """Claude API with a Console key; this is what spends the monthly API credit."""
     def __init__(self, name, c):
         self.name, self.c = name, c
-    def run(self, prompt, system=None, files=()) -> Result:
-        """files: images and PDFs (by suffix), sent ahead of the prompt."""
+    def run(self, prompt, system=None, files=(), budget_usd=None) -> Result:
+        """files: images and PDFs (by suffix), sent ahead of the prompt. budget_usd: what this
+        call may still cost. Anthropic's tool loop hands the turn back every ten steps
+        (pause_turn); once the cost so far has reached the budget it isn't sent back to carry
+        on, but once more without tools, to write the answer from what was gathered. So the
+        budget can be passed by up to ten steps plus that last call."""
         key = os.environ.get(self.c.get("api_key_env", "ANTHROPIC_API_KEY"))
         if not key:
             raise BackendError(f"{self.name}: API key env var is not set")
@@ -147,21 +158,39 @@ class AnthropicAPI:
             headers["anthropic-beta"] = "server-side-fallback-2026-07-01"
             body["fallbacks"] = "default"
         tin = tout = searches = 0
+        def cost():
+            return ((tin * self.c.get("price_in", 0.0) + tout * self.c.get("price_out", 0.0)) / 1e6
+                    + searches * SEARCH_USD)
+        capped = False
         for _ in range(MAX_CONTINUES + 1):
-            d = _post("https://api.anthropic.com/v1/messages", headers, body,
-                      self.c.get("timeout", 1800))
+            try:
+                d = _post("https://api.anthropic.com/v1/messages", headers, body,
+                          self.c.get("timeout", 1800))
+            except BackendError as e:
+                if tin or tout:  # an earlier part of this turn was billed
+                    raise SpentError(str(e), Result("", tin, tout, cost())) from e
+                raise
             u = d.get("usage") or {}
             tin += (u.get("input_tokens", 0) + u.get("cache_read_input_tokens", 0)
                     + u.get("cache_creation_input_tokens", 0))
             tout += u.get("output_tokens", 0)
             searches += (u.get("server_tool_use") or {}).get("web_search_requests", 0)
-            if d.get("stop_reason") != "pause_turn":  # a long server-tool turn: send it back
+            if d.get("stop_reason") != "pause_turn" or capped:
                 break
+            # A long server-tool turn, handed back part-way: send it back to carry on, or, at
+            # the spending limit, to finish without its tools.
             messages.append({"role": "assistant", "content": d.get("content", [])})
-        usd = ((tin * self.c.get("price_in", 0.0) + tout * self.c.get("price_out", 0.0)) / 1e6
-               + searches * SEARCH_USD)
+            if budget_usd is not None and cost() >= budget_usd:
+                capped = True
+                messages.append({"role": "user", "content": WRAP_UP})
+                body.pop("tools", None)
+        usd = cost()
         blocks = d.get("content", [])
         text = "".join(b.get("text", "") for b in blocks if b.get("type") == "text")
+        if capped and text.strip():
+            text = (text.rstrip() + f"\n\n---\n*night-elves: stopped at this task's spending "
+                    f"limit (${usd:.2f} used in this call), so the answer above was written "
+                    "from what had been gathered by then.*")
         if not text.strip():
             stop = d.get("stop_reason")
             if stop == "max_tokens":

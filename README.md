@@ -52,6 +52,16 @@ In every mode:
   it falls back to `claude -p`, which only runs inside its time window and up
   to its nightly run cap, so the subscription is fresh in the morning.
 - Tonight's allowance is `remaining / days_left * burst`, capped per night.
+  The allowance is checked before each call, not during one.
+- One task may use at most `budget.max_usd_per_task` of API credit (default $3,
+  `0` for no limit), counted across all its calls since it was last queued. A
+  task at the limit fails at once with that reason, instead of retrying. Inside
+  a long search-and-read call, Anthropic hands the turn back every ten steps;
+  when the cost has reached what the task has left, night-elves has Claude
+  write its answer from what it has gathered, without the tools, and the result
+  says it was cut short. A call can still pass the limit by up to ten steps
+  plus that last answer, so treat it as a brake, not an exact cap. It covers
+  billed API calls only, not `claude -p` or agents on the subscription.
 - Three failed attempts mark a task `failed`. A reviewer rejection is retried
   the same night with the feedback attached. A backend error costs the task one
   attempt and holds it until the next run, so an outage can't fail a task

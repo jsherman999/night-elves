@@ -27,8 +27,9 @@ CREATE TABLE IF NOT EXISTS tasks (
   session TEXT,                              -- "<backend> <id>" of the agent session to resume
   needs TEXT,                                -- auto tier: agent | web | answer, decided once
   secs REAL,                                 -- wall-clock seconds spent on it, all attempts
-  archived INTEGER NOT NULL DEFAULT 0        -- 1 = off the recent list; the result is kept
-);
+  archived INTEGER NOT NULL DEFAULT 0,       -- 1 = off the recent list; the result is kept
+  budget_from TEXT                           -- UTC; spend before this (earlier runs of the task)
+);                                           -- doesn't count towards its per-task ceiling
 CREATE INDEX IF NOT EXISTS tasks_status ON tasks(status, priority, id);
 CREATE TABLE IF NOT EXISTS spend (
   ts TEXT NOT NULL,
@@ -61,7 +62,7 @@ def connect(path: str) -> sqlite3.Connection:
     for col, kind in (("run_after", "TEXT"), ("images", "TEXT"), ("files", "TEXT"),
                       ("criteria", "TEXT"), ("session", "TEXT"),  # before 0.2/0.4/0.5/0.7
                       ("needs", "TEXT"), ("secs", "REAL"),  # before 0.9
-                      ("archived", "INTEGER NOT NULL DEFAULT 0")):
+                      ("archived", "INTEGER NOT NULL DEFAULT 0"), ("budget_from", "TEXT")):
         if col not in cols:
             conn.execute(f"ALTER TABLE tasks ADD COLUMN {col} {kind}")
     scols = {r[1] for r in conn.execute("PRAGMA table_info(spend)")}
@@ -150,7 +151,7 @@ def cancel(conn, task_id: int) -> None:
 def requeue(conn, task_id: int) -> None:
     """Back into the queue with fresh attempts: for failed, cancelled or finished tasks."""
     change(conn, task_id, ("failed", "cancelled", "done"), status="queued", attempts=0,
-           last_error=None, archived=0)
+           last_error=None, archived=0, budget_from=iso())  # a fresh run, a fresh ceiling
 
 def archive(conn, task_id: int, on: bool = True) -> None:
     """Take a finished, failed or cancelled task off the recent list (or put it back). Its row,
@@ -266,6 +267,13 @@ def usage(conn, task_ids) -> dict:
         u["calls"] += r[6]
         u["by"][r[1]] = {"in": r[2] or 0, "out": r[3] or 0, "est": r[5] or 0.0}
     return out
+
+def task_usd(conn, task_id: int) -> float:
+    """API credit billed to this task since it was last put (back) in the queue."""
+    return conn.execute(
+        "SELECT COALESCE(SUM(s.usd),0) FROM spend s JOIN tasks t ON t.id=s.task_id "
+        "WHERE s.task_id=? AND (t.budget_from IS NULL OR s.ts>=t.budget_from)",
+        (task_id,)).fetchone()[0]
 
 def usd_since(conn, backend: str, since: str) -> float:
     return conn.execute("SELECT COALESCE(SUM(usd),0) FROM spend WHERE backend=? AND ts>=?",

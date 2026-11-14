@@ -14,6 +14,7 @@ endgame_days = 7             # in the last N days the frontier model also execut
 burst = 1.5                  # tonight's allowance = remaining / days_left * burst
 per_night_cap_usd = 15.0     # hard ceiling per run
 conserve_night_cap_usd = 2.0 # early-cycle ceiling (frontier-tier tasks and escalations only)
+max_usd_per_task = 3.0       # API credit one task may use across all its calls; 0 = no limit
 
 [limits]
 max_attempts = 3             # then the task is marked failed
