@@ -36,7 +36,9 @@ In every mode:
 - An `auto` task is sized up once, before its first run, by a short call to the
   local model (`roles.classifier`; `"off"` turns it off). One that needs tools
   (clone, build, test, change or push code, make files or media) becomes an agent
-  task. One that needs current information from the web goes to `claude_api`,
+  task, and so does one that asks for a repository's code to be reviewed or
+  searched for bugs, which takes a clone: reading it page by page over the web
+  costs far more and sees less. One that needs current information from the web goes to `claude_api`,
   which searches and fetches pages itself (`server_tools`). When Claude has no
   allowance left tonight, the task goes to the local model if that can search
   (see [Local web search](#local-web-search)); if it can't, the task waits rather
@@ -66,7 +68,14 @@ In every mode:
   the same night with the feedback attached. A backend error costs the task one
   attempt and holds it until the next run, so an outage can't fail a task
   outright. A backend that errors three times in a row is skipped for the rest
-  of the run.
+  of the run. An agent that worked and then failed doesn't count towards that:
+  the backend was up, and the tasks behind it still get their turn.
+- An agent that runs out of time hasn't failed. Its files and its session are
+  kept, the other tasks get their turn, and then it carries on where it
+  stopped, up to twice per agent in one run. Each time counts towards moving
+  the task to Claude's agent (`escalate_after`), not towards `max_attempts`.
+  A task that runs out of time `limits.max_timeouts` times (default 4) is
+  marked `failed`.
 
 ## Install
 
@@ -448,7 +457,7 @@ the network. It is opt-in per task. Two agents can take it:
   the Studio), inside Anthropic's sandbox runtime. It runs any time, so an agent
   task set to run now during the day starts within a minute. It goes first.
 - **Claude Code** (`claude_agent`): takes a task after the local agent has
-  failed it twice (`escalate_after`), and takes priority 1-3 tasks
+  failed it or run out of time on it twice (`escalate_after`), and takes priority 1-3 tasks
   (`hard_priority`) from the start. Without a local agent it takes them all.
 
 The `claude_agent` backend:
@@ -490,7 +499,9 @@ stopped it. Add hosts a task needs to `allowedDomains`.
 
 The sandbox has no GitHub credentials, and won't get any. When a task asks for a
 push, the agent is told to commit in its clone and end with
-`PUSH: <clone folder> <branch>`. Once its check passes, night-elves pushes that
+`PUSH: <clone folder> <branch>`. (It clones with `--separate-git-dir`, because
+the sandbox blocks writes under a `.git` folder; the git directory has to be
+inside the workspace.) Once its check passes, night-elves pushes that
 branch from the host with your own git credentials, if:
 
 - the task's text asks for a push,
@@ -550,6 +561,18 @@ told what went wrong. If the session has gone (Claude prints "No conversation
 found"), it starts a new one in the same workspace, told that the earlier files
 are there. A task that moves from the local agent to Claude starts a Claude
 session, with the same workspace and the same feedback.
+
+Some failures leave a session that can't continue. opencode stops with
+"compaction.failed" when the model can't summarise a full context, and resuming
+that session would stop the same way. A backend's `new_session_on` lists text
+to look for in the last error (`["compaction"]` for the local agent); when it
+is there, the next run starts a new session in the same workspace.
+
+Give the local model as much context as the Mac has memory for, so that
+compaction is rare: load it in LM Studio with at least the `limit.context` in
+`opencode.json` (131072 in the example; `lms load <model> --context-length
+131072`). opencode trusts that number, and a model loaded with less fails
+part-way through long tasks.
 
 ### Setting up the local agent
 

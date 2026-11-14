@@ -4,7 +4,7 @@ from unittest import mock
 from datetime import date, datetime, timezone
 from http.server import ThreadingHTTPServer
 from elves import attachments, backends, cli, config, db, notify, pages, policy, research, web, webtools, when
-from elves.backends import BackendError, Command, Result
+from elves.backends import BackendError, Command, Result, SpentError, TimedOut
 from elves.dispatcher import Night, passed, plan_criteria
 
 class Fake:
@@ -281,6 +281,89 @@ class DispatchTests(Base):
         self.night(18, hour=12, local_agent=Fake("STATUS: DONE\nCHECK: true")).run()
         self.assertEqual(db.get(self.conn, day)["backend"], "local_agent")
 
+    def local_agent_cfg(self, **more):
+        self.agent_cfg()
+        self.cfg["backends"]["local_agent"] = {"type": "command", "argv": ["x"],
+                                               "session_args": ["--session", "ses_{session_hex}"],
+                                               **more}
+        self.cfg["roles"]["local_agent"] = "local_agent"
+
+    def test_agent_out_of_time_continues_without_losing_an_attempt_or_the_backend(self):
+        self.local_agent_cfg()
+        ids = [db.add_task(self.conn, t, tier="agent") for t in ("slow", "b", "c", "d")]
+        order = []
+        def work(prompt, system):
+            order.append("slow" if "Task:\nslow" in prompt else "other")
+            if order[-1] == "slow":
+                raise TimedOut("local_agent: timed out after 5400 s", Result("", 900, 30))
+            return "STATUS: DONE\nCHECK: true"
+        la, claude = Fake(work), Fake("finished it\nSTATUS: DONE\nCHECK: true")
+        n = self.night(18, hour=2, local_agent=la, claude_agent=claude)
+        stats = n.run()
+        # The others ran before the slow task's second turn; then Claude's agent took it over.
+        self.assertEqual(order, ["slow", "other", "other", "other", "slow"])
+        self.assertIn("This continues your earlier work", la.calls[-1][0])
+        self.assertIn("stopped before it finished: local_agent: timed out", la.calls[-1][0])
+        t = db.get(self.conn, ids[0])
+        self.assertEqual((t["status"], t["backend"], t["attempts"], t["timeouts"]),
+                         ("done", "claude_agent", 0, 2))
+        self.assertIn("Earlier attempts left their files", claude.calls[0][0])
+        self.assertEqual((n.down, stats["done"], stats["failed"]), (set(), 4, 0))
+        # Each timed-out run is in the ledger, so it counts towards max_runs_per_night.
+        self.assertEqual(db.runs_since(self.conn, "local_agent", n.run_start), 5)
+        pages.task(t, None)
+        db.requeue(self.conn, ids[0])
+        self.assertEqual(db.get(self.conn, ids[0])["timeouts"], 0)
+
+    def test_agent_out_of_time_waits_for_the_next_run_and_fails_at_the_limit(self):
+        self.local_agent_cfg()
+        del self.cfg["backends"]["claude_agent"]  # nothing to escalate to
+        tid = db.add_task(self.conn, "endless", tier="agent")
+        def work(prompt, system):
+            raise TimedOut("local_agent: timed out after 5400 s", Result(""))
+        la = Fake(work)
+        stats = self.night(18, hour=2, local_agent=la).run()
+        t = db.get(self.conn, tid)
+        self.assertEqual((len(la.calls), t["status"], t["timeouts"], stats["retried"]),
+                         (2, "queued", 2, 2))  # two turns a run, then it is held
+        stats = self.night(19, hour=2, local_agent=la).run()
+        t = db.get(self.conn, tid)
+        self.assertEqual((len(la.calls), t["status"], t["timeouts"], t["attempts"]),
+                         (4, "failed", 4, 0))
+        self.assertIn("4 times, the limit", t["last_error"])
+        self.assertEqual(stats["failed"], 1)
+
+    def test_agent_that_worked_then_failed_does_not_mark_its_backend_down(self):
+        self.local_agent_cfg()
+        del self.cfg["backends"]["claude_agent"]
+        ids = [db.add_task(self.conn, t, tier="agent") for t in "abcd"]
+        def work(prompt, system):
+            raise SpentError("local_agent: exit 1: compaction.failed", Result("", 5000, 100))
+        n = self.night(18, hour=2, local_agent=Fake(work))
+        n.run()
+        self.assertEqual([db.get(self.conn, i)["attempts"] for i in ids], [1, 1, 1, 1])
+        self.assertEqual(n.down, set())
+        # One that never got going (no tokens) is an outage, as before.
+        def dead(prompt, system):
+            raise SpentError("local_agent: exit 127: opencode: not found", Result(""))
+        n = self.night(19, hour=2, local_agent=Fake(dead))
+        n.run()
+        self.assertEqual(n.down, {"local_agent"})
+
+    def test_agent_session_that_cannot_go_on_is_replaced(self):
+        self.local_agent_cfg(new_session_on=["Compaction"])
+        del self.cfg["backends"]["claude_agent"]
+        tid = db.add_task(self.conn, "x", tier="agent")
+        db.update(self.conn, tid, session="local_agent 11111111-2222-3333-4444-555555555555",
+                  attempts=1, last_error='local_agent: exit 1: Error: {"type": "compaction.failed"}')
+        la = Fake("STATUS: DONE\nCHECK: true")
+        self.night(18, hour=2, local_agent=la).run()
+        t = db.get(self.conn, tid)
+        self.assertEqual(t["status"], "done")
+        self.assertNotIn("1111", la.args[1])
+        self.assertIsNotNone(la.calls[0][1])  # a new session gets the instructions again
+        self.assertIn("Earlier attempts left their files", la.calls[0][0])
+
     def test_passed(self):
         self.assertTrue(passed("PASS\nok") and passed("\n pass") and passed("`PASS`"))
         self.assertTrue(passed("Looks fine to me."))  # no verdict at all: don't fail the work
@@ -494,10 +577,15 @@ class MiscTests(Base):
         mark = os.path.join(self.tmp, "mark")
         slow = Command("s", {"argv": ["sh", "-c", f"(sleep 1; touch {mark}) & sleep 10"],
                              "timeout": 0.3})
-        with self.assertRaises(BackendError):
+        with self.assertRaises(TimedOut) as e:
             slow.run("x")
+        self.assertEqual(str(e.exception), "s: timed out after 0.3 s")
         time.sleep(1.5)
         self.assertFalse(os.path.exists(mark))  # the background child was killed too
+        said = Command("s", {"argv": ["sh", "-c", "echo partial; exec sleep 10"], "timeout": 0.3})
+        with self.assertRaises(TimedOut) as e:
+            said.run("x")
+        self.assertEqual(e.exception.result.text, "partial")  # what it printed is kept
 
     def test_contract_parsing(self):
         from elves import verify
@@ -1820,6 +1908,24 @@ class PushTests(Base):
         self.git("config", "core.fsmonitor", f"touch {flag}", cwd=self.clone)
         self.assertIn("Pushed", self.run_push())
         self.assertFalse(os.path.exists(flag))
+
+    def test_a_clone_with_its_git_dir_beside_it_is_pushed(self):
+        # What agents do in the sandbox, where nothing may be written under a .git folder.
+        apart = os.path.join(self.work, "app.gitdir")
+        os.rename(os.path.join(self.clone, ".git"), apart)
+        open(os.path.join(self.clone, ".git"), "w").write("gitdir: ../app.gitdir\n")
+        self.assertEqual(self.git("log", "-1", "--format=%s", cwd=self.clone), "two")
+        self.assertIn("Pushed `main` to jsherman999/app", self.run_push())
+        self.assertEqual(self.git("--git-dir", self.remote, "log", "-1", "--format=%s", "main"), "two")
+
+    def test_a_git_dir_outside_the_workspace_is_not_used(self):
+        outside = os.path.join(self.tmp, "elsewhere.git")
+        os.rename(os.path.join(self.clone, ".git"), outside)
+        open(os.path.join(self.clone, ".git"), "w").write(f"gitdir: {outside}\n")
+        self.assertIn("not a git clone", self.run_push())
+        open(os.path.join(self.clone, ".git"), "w").write("not a pointer\n")
+        self.assertIn("not a git clone", self.run_push())
+        self.assertEqual(self.git("--git-dir", self.remote, "log", "-1", "--format=%s", "main"), "one")
 
     def test_pushes_that_are_not_allowed(self):
         self.assertIn("didn't, so nothing", self.run_push(prompt="change it"))

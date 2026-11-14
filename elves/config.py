@@ -18,7 +18,8 @@ DEFAULTS = {
         "max_usd_per_task": 3.0,       # API credit one task may use, all its calls; 0 = no limit
     },
     "limits": {"max_attempts": 3, "escalate_after": 2, "max_minutes": 360, "hard_priority": 3,
-               "check_timeout": 600},  # seconds an agent's CHECK command may run
+               "check_timeout": 600,  # seconds an agent's CHECK command may run
+               "max_timeouts": 4},  # agent runs a task may lose to the time limit before it fails
     "roles": {"local": "local", "frontier_api": "claude_api",
               "frontier_sub": "claude_cli", "second_opinion": "codex", "agent": "claude_agent",
               "local_vision": "",  # a local model that sees images, e.g. "local_vision"

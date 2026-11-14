@@ -251,6 +251,8 @@ def task(t, result: str | None, msg: str | None = None, raw: bool = False, shots
         facts.append(f"sized up as {t['needs']}")
     if t["attempts"]:
         facts.append(f"{t['attempts']} attempt(s)")
+    if "timeouts" in t.keys() and t["timeouts"]:
+        facts.append(f"ran out of time {t['timeouts']}x")
     if t["archived"]:
         facts.append("archived")
     head = (f"<h1>#{tid} <span class='pill {e(status)}'>{e(status)}</span></h1>"

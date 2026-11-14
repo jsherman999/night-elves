@@ -16,6 +16,10 @@ class SpentError(BackendError):
         super().__init__(msg)
         self.result = result
 
+class TimedOut(SpentError):
+    """A command that was stopped at its time limit. It was working, not broken: result holds
+    what it had printed by then."""
+
 @dataclass
 class Result:
     text: str
@@ -198,19 +202,24 @@ class Command:
                                  env=env, cwd=cwd, start_new_session=True)
         except OSError as e:
             raise BackendError(f"{self.name}: {e}") from e
+        limit = self.c.get("timeout", 1800)
         try:
-            out, err = p.communicate(None if as_arg else full, timeout=self.c.get("timeout", 1800))
+            out, err = p.communicate(None if as_arg else full, timeout=limit)
         except subprocess.TimeoutExpired as e:
+            out = e.stdout or ""
             for sig in (signal.SIGTERM, signal.SIGKILL):  # TERM first lets claude stop its tools
                 try:
                     os.killpg(p.pid, sig)
-                    p.communicate(timeout=10)
+                    out = p.communicate(timeout=10)[0] or out
                     break
                 except ProcessLookupError:
                     break
                 except subprocess.TimeoutExpired:
                     continue
-            raise BackendError(f"{self.name}: {e}") from e
+            if isinstance(out, bytes):
+                out = out.decode(errors="replace")
+            raise TimedOut(f"{self.name}: timed out after {limit:g} s",
+                           parse_output(self.c.get("output", "text"), out)) from e
         try:  # a server an agent forgot to stop would hold its port when the check runs
             os.killpg(p.pid, signal.SIGKILL)
         except (ProcessLookupError, PermissionError):

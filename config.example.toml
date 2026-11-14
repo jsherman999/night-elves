@@ -18,10 +18,12 @@ max_usd_per_task = 3.0       # API credit one task may use across all its calls;
 
 [limits]
 max_attempts = 3             # then the task is marked failed
-escalate_after = 2           # failed local attempts before the frontier model takes over
+escalate_after = 2           # failed (or, for agents, timed-out) local runs before Claude takes over
 max_minutes = 360            # stop starting new tasks after this long
 hard_priority = 3            # priority <= this counts as "hard": endgame tasks, Claude's agent
 check_timeout = 600          # seconds an agent's CHECK command may run when night-elves re-runs it
+max_timeouts = 4             # agent runs a task may lose to the backend's timeout (each continues
+                             # the last) before it is marked failed
 
 [backends.local]
 type = "openai_compat"
@@ -94,8 +96,9 @@ argv = ["srt", "--settings", "~/.night-elves/srt-settings.json", "--",  # Anthro
         "-m", "lmstudio/qwen3.8-27b"]
 output = "opencode-json"                  # records its token counts
 session_args = ["--session", "ses_{session_hex}"]  # the same id creates, then continues, a session
+new_session_on = ["compaction"]           # an error with this text: don't continue that session
 max_runs_per_night = 10                   # no window: it runs any time, like the local model
-timeout = 5400
+timeout = 5400                            # a run stopped here is continued, not failed
 notes = """Playwright 1.65.0 and its Chromium are installed on this Mac. Use exactly that \
 version (npm i -D playwright@1.65.0): another would try to download a browser and fail. In this \
 sandbox Chromium only starts as chromium.launch({ args: ['--single-process'] })."""

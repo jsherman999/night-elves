@@ -28,8 +28,10 @@ CREATE TABLE IF NOT EXISTS tasks (
   needs TEXT,                                -- auto tier: agent | web | answer, decided once
   secs REAL,                                 -- wall-clock seconds spent on it, all attempts
   archived INTEGER NOT NULL DEFAULT 0,       -- 1 = off the recent list; the result is kept
-  budget_from TEXT                           -- UTC; spend before this (earlier runs of the task)
-);                                           -- doesn't count towards its per-task ceiling
+  budget_from TEXT,                          -- UTC; spend before this (earlier runs of the task)
+                                             -- doesn't count towards its per-task ceiling
+  timeouts INTEGER NOT NULL DEFAULT 0        -- agent runs stopped at the time limit, then continued
+);
 CREATE INDEX IF NOT EXISTS tasks_status ON tasks(status, priority, id);
 CREATE TABLE IF NOT EXISTS spend (
   ts TEXT NOT NULL,
@@ -62,7 +64,8 @@ def connect(path: str) -> sqlite3.Connection:
     for col, kind in (("run_after", "TEXT"), ("images", "TEXT"), ("files", "TEXT"),
                       ("criteria", "TEXT"), ("session", "TEXT"),  # before 0.2/0.4/0.5/0.7
                       ("needs", "TEXT"), ("secs", "REAL"),  # before 0.9
-                      ("archived", "INTEGER NOT NULL DEFAULT 0"), ("budget_from", "TEXT")):
+                      ("archived", "INTEGER NOT NULL DEFAULT 0"), ("budget_from", "TEXT"),
+                      ("timeouts", "INTEGER NOT NULL DEFAULT 0")):  # agent time limits
         if col not in cols:
             conn.execute(f"ALTER TABLE tasks ADD COLUMN {col} {kind}")
     scols = {r[1] for r in conn.execute("PRAGMA table_info(spend)")}
@@ -150,7 +153,7 @@ def cancel(conn, task_id: int) -> None:
 
 def requeue(conn, task_id: int) -> None:
     """Back into the queue with fresh attempts: for failed, cancelled or finished tasks."""
-    change(conn, task_id, ("failed", "cancelled", "done"), status="queued", attempts=0,
+    change(conn, task_id, ("failed", "cancelled", "done"), status="queued", attempts=0, timeouts=0,
            last_error=None, archived=0, budget_from=iso())  # a fresh run, a fresh ceiling
 
 def archive(conn, task_id: int, on: bool = True) -> None:

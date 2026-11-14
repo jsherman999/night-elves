@@ -4,7 +4,7 @@ import re, subprocess, time, uuid
 from datetime import datetime, timedelta
 from pathlib import Path
 from . import attachments, backends, db, policy, push, research, verify, webtools
-from .backends import BackendError, CeilingError, SpentError
+from .backends import BackendError, CeilingError, SpentError, TimedOut
 
 PLAN_SYS = ("You are planning work that a smaller model will carry out. Do not do the task. "
             "Write a short numbered plan and the pitfalls to avoid. End with a section that starts "
@@ -50,13 +50,17 @@ CLASSIFY_SYS = (
     "AGENT: doing it takes tools. It asks to clone, download, run, build, test, install, fix, "
     "change, add to, port or deploy code, an app or a repository; to create or edit files, "
     "sites, images, audio or video; to commit or push; or to work through big data files. "
+    "Reading a repository's code closely is AGENT too, because that takes a clone: reviewing "
+    "or auditing it, finding bugs or vulnerabilities in it, or suggesting improvements to it. "
     "Answer AGENT whenever the task asks for something to be made or changed, even if it also "
     "needs the web.\n"
     "WEB: only a written answer is wanted, but it needs current or specific information from "
-    "the internet: searching, reviews, news, prices, or reading web pages or a repository.\n"
+    "the internet: searching, reviews, news, prices, reading web pages, or a quick look at "
+    "what a repository is.\n"
     "ANSWER: a written answer from general knowledge and the task's own text or attachments.\n"
     "Examples: 'clone this repo and find bugs' AGENT; 'add a GitHub Pages version of this app' "
-    "AGENT; 'make a video about this app' AGENT; 'find reviews of this product' WEB; 'what "
+    "AGENT; 'make a video about this app' AGENT; 'read this repo, look for bugs and suggest "
+    "improvements' AGENT; 'find reviews of this product' WEB; 'what "
     "does this GitHub repo do' WEB; 'explain how TCP works' ANSWER.")
 NEEDS = re.compile(r"\b(AGENT|TOOLS?|WEB|SEARCH|ANSWER)\b")
 NEEDS_MAP = {"TOOL": "agent", "TOOLS": "agent", "SEARCH": "web"}
@@ -86,6 +90,16 @@ def commit_workspace(work: Path, message: str) -> str:
         return f"Could not commit the workspace to git: {e}"
 RETRY_DELAY = timedelta(minutes=30)  # before a scheduled task is tried again after an error
 DOWN_AFTER = 3  # consecutive errors before a backend is skipped for the rest of the run
+SLOW_TURNS = 2  # times one agent may run out of time on one task in a run
+
+def outage(kind: str, e: BackendError) -> bool:
+    """Whether an error says the backend itself may be in trouble. A command that ran out of
+    time, or that worked for a while (it used tokens) and then failed, was up: that is the
+    task's trouble, and must not take the backend away from the tasks behind it."""
+    if isinstance(e, TimedOut):
+        return False
+    return not (kind == "command" and isinstance(e, SpentError)
+                and (e.result.tokens_in or e.result.tokens_out))
 
 VERDICT_LINE = re.compile(r"^[\W_]*(?:verdict|result|review)?[\W_]*(PASS|FAIL)", re.I)
 VERDICT_WORD = re.compile(r"\b(PASS|FAIL)(?:ED|ES|S)?\b", re.I)
@@ -115,6 +129,8 @@ class Night:
         self.errors: dict[str, int] = {}
         self.down: set[str] = set()
         self.held: set[int] = set()  # hit a backend error; wait for the next run
+        self.again: set[int] = set()  # ran out of time; continue once the others have had a turn
+        self.slow: dict[tuple[int, str], int] = {}  # (task, backend): times out of time, this run
         self.stats = {"done": 0, "failed": 0, "retried": 0, "skipped": 0}
 
     def state(self):
@@ -143,10 +159,11 @@ class Night:
         except BackendError as e:
             if isinstance(e, SpentError):  # failed, but the tokens were used (and billed)
                 spent(e.result)
-            self.errors[name] = self.errors.get(name, 0) + 1
-            if self.errors[name] >= DOWN_AFTER:
-                self.down.add(name)
-                self.log(f"  {name} marked down for this run")
+            if outage(self.cfg["backends"].get(name, {}).get("type"), e):
+                self.errors[name] = self.errors.get(name, 0) + 1
+                if self.errors[name] >= DOWN_AFTER:
+                    self.down.add(name)
+                    self.log(f"  {name} marked down for this run")
             raise
         self.errors[name] = 0
         spent(res)
@@ -182,7 +199,7 @@ class Night:
         task = self.size_up(task)
         tid = task["id"]
         r = policy.route(task, self.cfg, self.state(), self.ok)
-        if r is None:
+        if r is None or self.slow.get((tid, r.executor), 0) >= SLOW_TURNS:
             return "skipped"
         self.log(f"#{tid} plan={r.planner} exec={r.executor} review={r.reviewer}")
         if not db.claim(self.conn, tid, "planning" if r.planner else "running"):
@@ -195,8 +212,8 @@ class Night:
 
     def _process(self, task, r) -> str:
         tid = task["id"]
+        work, cwd, send = None, None, []
         try:
-            work, cwd, send = None, None, []
             if task["tier"] == "agent":
                 work = Path(self.cfg["paths"]["work"]) / str(tid)
                 work.mkdir(parents=True, exist_ok=True)
@@ -248,6 +265,8 @@ class Night:
             self.log(f"  #{tid} -> failed: {e}")
             return "failed"
         except BackendError as e:
+            if work and isinstance(e, TimedOut):
+                return self._timed_out(task, r.executor, str(e))
             # One error attempt per run, so an outage can't use up every attempt in seconds.
             # Rejections (reviewer, agent check) retry straight away, carrying the feedback.
             # Scheduled tasks are also picked up by the every-minute job, so push them back.
@@ -307,7 +326,11 @@ class Night:
             return [a.replace("{session}", sid).replace("{session_hex}", sid.replace("-", ""))
                     for a in args]
         held, _, sid = (task["session"] or "").partition(" ")
-        if resume and sid and held == executor:
+        # Some failures leave a session that can't go on (opencode can't compact a full one):
+        # the backend's new_session_on lists text that marks them. The files are still there.
+        err = (task["last_error"] or "").lower()
+        spoiled = any(s.lower() in err for s in c.get("new_session_on", []))
+        if resume and sid and held == executor and not spoiled:
             why = self._why(task) or ("The task was queued again, and may have been edited. "
                                       "Check your earlier work against it and finish what's left.")
             try:
@@ -431,6 +454,25 @@ class Night:
         self.log(f"  #{task['id']} -> {status}: {error[:120]}")
         return "failed" if status == "failed" else "retried"
 
+    def _timed_out(self, task, executor, error) -> str:
+        """An agent stopped at its time limit keeps its files and its session, so the next run
+        continues the work. That isn't a failed attempt, but it is counted (limits.max_timeouts),
+        and it counts towards escalating to Claude's agent. The task gets another turn in this
+        run, after the others; once the same agent has run out of time on it twice (SLOW_TURNS),
+        that agent leaves it for the next run."""
+        tid, n = task["id"], (task["timeouts"] or 0) + 1
+        limit = self.cfg["limits"]["max_timeouts"]
+        if n >= limit:
+            db.update(self.conn, tid, status="failed", timeouts=n,
+                      last_error=f"{error} ({n} times, the limit)"[:1000])
+            self.log(f"  #{tid} -> failed: {error} ({n} times, the limit)")
+            return "failed"
+        db.update(self.conn, tid, status="queued", timeouts=n, last_error=error[:1000])
+        self.again.add(tid)
+        self.slow[tid, executor] = self.slow.get((tid, executor), 0) + 1
+        self.log(f"  #{tid} -> queued: {error} ({n} of {limit}); it continues from there")
+        return "retried"
+
     def run(self, max_tasks=None, due_only=False) -> dict:
         """due_only: just the scheduled tasks whose time has come (the every-minute job)."""
         stale = db.requeue_stale(self.conn)
@@ -440,9 +482,13 @@ class Night:
         skipped: list[int] = []
         handled = 0
         while time.monotonic() < deadline and (max_tasks is None or handled < max_tasks):
-            task = db.next_task(self.conn, [*skipped, *self.held], db.iso(self.now()), due_only)
+            task = db.next_task(self.conn, [*skipped, *self.held, *self.again],
+                                db.iso(self.now()), due_only)
             if task is None:
-                break
+                if not self.again:
+                    break
+                self.again = set()  # the rest have had their turn
+                continue
             outcome = self.process(task)
             if outcome == "skipped":
                 skipped.append(task["id"])

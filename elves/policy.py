@@ -137,13 +137,15 @@ def route(task, cfg: dict, state: State, ok) -> Route | None:
 
 def agent_route(task, cfg: dict, ok) -> Route | None:
     """The local agent (when roles.local_agent names one) goes first, like the local model for
-    text; Claude's agent takes over after escalate_after failed attempts, and takes hard tasks
-    (priority <= hard_priority) from the start. Without a Claude agent, the local one keeps them."""
+    text; Claude's agent takes over after escalate_after runs that failed or ran out of time, and
+    takes hard tasks (priority <= hard_priority) from the start. Without a Claude agent, the
+    local one keeps them."""
     r, lim = cfg["roles"], cfg["limits"]
+    tried = task["attempts"] + ((task["timeouts"] or 0) if "timeouts" in task.keys() else 0)
     claude, la = r.get("agent"), r.get("local_agent")
     has_claude = bool(claude) and cfg["backends"].get(claude, {}).get("enabled", True) \
         and claude in cfg["backends"]
-    if la and ok(la) and (not has_claude or (task["attempts"] < lim["escalate_after"]
+    if la and ok(la) and (not has_claude or (tried < lim["escalate_after"]
                                              and task["priority"] > lim["hard_priority"])):
         return Route(None, la, None)
     return Route(None, claude, None) if claude and ok(claude) else None

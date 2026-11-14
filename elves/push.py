@@ -20,7 +20,9 @@ ASKS = re.compile(r"\bpush(?:es|ed|ing)?\b", re.I)
 GITHUB = re.compile(r"^(?:https://(?:[^@/]+@)?github\.com/|git@github\.com:|ssh://git@github\.com/)"
                     r"([A-Za-z0-9-]+)/([A-Za-z0-9._-]+?)(?:\.git)?/?$")
 NOTE = ("This task asks for a push. The sandbox has no GitHub credentials, so don't try to push "
-        "or look for tokens. Clone the repository into the workspace, commit your changes in that "
+        "or look for tokens. Clone the repository into the workspace with `git clone "
+        "--separate-git-dir=<folder>.gitdir <url> <folder>` (the sandbox blocks writes under a "
+        "`.git` folder, so a plain clone fails), commit your changes in that "
         "clone on the branch the task wants (the repository's default branch if it doesn't say), "
         "and put a line `PUSH: <clone folder> <branch>` just before the STATUS line. Once your "
         "check passes, night-elves pushes that branch to the clone's GitHub origin from outside "
@@ -42,17 +44,37 @@ def _git(*args, cwd=None) -> subprocess.CompletedProcess:
                           capture_output=True, text=True, timeout=GIT_TIMEOUT,
                           stdin=subprocess.DEVNULL)
 
+def _config(repo: Path, root: Path) -> Path | None:
+    """The clone's config file, or None if `repo` isn't a clone. Its .git is a folder, or a
+    file pointing at one (`git clone --separate-git-dir`, which agents use because the sandbox
+    blocks writes under .git). Either way it has to be inside the workspace."""
+    dot = repo / ".git"
+    try:
+        if dot.is_file():
+            with open(dot, errors="replace") as f:
+                first = f.read(4096).split("\n")[0]
+            if not first.startswith("gitdir:"):
+                return None
+            dot = repo / first[len("gitdir:"):].strip()
+        dot = dot.resolve()
+    except OSError:
+        return None
+    if root not in dot.parents or not dot.is_dir():
+        return None
+    return dot / "config"
+
 def _one(cfg, work: Path, folder: str, branch: str, env: dict) -> str:
     owners = {o.lower() for o in cfg["push"]["owners"]}
     root = work.resolve()
     repo = (work / folder).resolve()
     if repo != root and root not in repo.parents:
         return f"`{folder}` is outside the workspace; not pushed."
-    if not (repo / ".git").is_dir():
-        return f"`{folder}` is not a git clone (no .git folder); not pushed."
+    config = _config(repo, root)
+    if config is None:
+        return f"`{folder}` is not a git clone (no .git in the workspace); not pushed."
     if _git("check-ref-format", "--branch", branch).returncode or branch.startswith("-"):
         return f"`{branch}` is not a valid branch name; not pushed."
-    url = subprocess.run(["git", "config", "--file", str(repo / ".git" / "config"), "--get",
+    url = subprocess.run(["git", "config", "--file", str(config), "--get",
                           "remote.origin.url"], capture_output=True, text=True).stdout.strip()
     m = GITHUB.match(url)
     if not m:
