@@ -221,34 +221,71 @@ results count towards the 200 KB of text a task can carry inline.
 
 A local model answers from memory unless it is given a way to look things up.
 Point its backend at a [SearXNG](https://docs.searxng.org/) instance with JSON
-output enabled, and night-elves offers the model two tools whenever it carries
-out a task (not when it plans, reviews or sizes one up):
+output enabled:
 
 ```toml
 [backends.local]
 search_url = "http://127.0.0.1:8888"
-max_tool_uses = 12      # searches plus pages per task; then it must answer
-page_chars = 12000      # of a page per call; the model can ask for the next part
 ```
 
-- `web_search` returns titles, URLs and snippets from SearXNG.
-- `fetch_page` downloads a page and returns its text with links kept, at most
-  3 MB of it. It only fetches http(s) URLs whose host, and every redirect's
-  host, resolves to public addresses, so a page can't steer the model into this
-  Mac's own services or the LAN. Files that aren't text (archives, PDFs) are
-  reported by type and size, not read.
+Handed search tools and left to itself, a local model searches once, opens a
+page or two, fills in the rest from memory and says it checked everything. So
+night-elves runs the research in stages (`elves/research.py`), and checks in
+code whatever code can check:
 
-The model needs to support OpenAI-style tool calls through its server (LM Studio
-and Ollama both pass them through). Under each answer night-elves lists the
-pages that were actually opened, or says that the model didn't search, so you
-can tell a checked answer from a remembered one. This is in `elves/webtools.py`
-and uses only the standard library.
+1. **Plan.** The model lists the searches to run, or says the task needs none
+   (then it is answered directly, and the result says so). A task sized up as
+   needing the web is always researched.
+2. **Search and pick.** night-elves runs the searches; the model chooses which
+   results to open. Pages the task itself names are read first.
+3. **Read.** One page at a time, the model writes notes, each with a quote from
+   the page. A note whose quote isn't on the page is dropped. Links the model
+   wants to follow are followed only if they are on that page, and go ahead of
+   the other results, so it can go a level deeper.
+4. **Write.** The model writes the result from the notes alone.
+5. **Trace the links.** Every URL in the result is either a page that was read,
+   a link seen on a page or in the results (these are tested: does anything
+   answer?), or from nowhere. Dead and from-nowhere links go back to the model
+   to be removed.
+6. **Check the claims.** In a call of its own, the model (or the backend named
+   by `check_with`) compares the result with the notes; unsupported claims go
+   back to be corrected.
 
-Two limits to keep in mind. A small model reads and cross-checks less carefully
-than Claude, so treat its research as a draft. And the model reads untrusted
-pages while holding the task's text and attachments: it can't run anything, but
-a hostile page could in principle talk it into fetching a URL that carries some
-of that text. Don't give this tier secrets alongside open-ended browsing.
+If fewer than `min_pages` pages gave useful notes, the attempt fails ("research
+came up too thin") instead of producing a thin answer; on the `auto` tier two
+such failures escalate the task to Claude. Under each result is a research
+record written by night-elves, not the model: the searches, the pages notes
+came from, what couldn't be opened, where the cited links came from (any that
+survived as dead or made up are named), and what the claim check found.
+
+Settings, on the backend, with their defaults:
+
+```toml
+max_queries = 6      # searches planned
+max_pages = 10       # pages opened; a third of them are kept for followed links
+min_pages = 2        # fewer with useful notes is a failure
+page_chars = 12000   # of a page per reading call
+page_parts = 2       # reading calls per page (so 24,000 characters are read)
+max_probes = 12      # cited links tested for being there
+check_with = ""      # another backend to check the claims, e.g. "local_vision"
+
+[backends.local.extra]         # added to every request to this backend as it is
+reasoning_effort = "high"      # e.g. gpt-oss in LM Studio: low | medium | high
+```
+
+A research task makes a dozen or more model calls and takes minutes, not
+seconds. Pages are fetched by `elves/webtools.py` (standard library only):
+http(s) only, at most 3 MB, and only from hosts that resolve to public
+addresses, redirects included, so a page can't steer a fetch into this Mac's own
+services or the LAN. Files that aren't text (archives, PDFs) count as existing
+but aren't read.
+
+Two limits remain. The checks catch invented links, misquoted pages and claims
+the notes don't support; they can't tell whether the right pages were found or
+whether a page is itself wrong, so a local model's research is still a draft.
+And the model reads untrusted pages while holding the task's text: it can't run
+anything, but a hostile page could in principle steer which links get fetched.
+Don't give this tier secrets alongside open-ended browsing.
 
 ### Finding and archiving past tasks
 

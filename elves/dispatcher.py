@@ -3,7 +3,7 @@ from __future__ import annotations
 import re, subprocess, time, uuid
 from datetime import datetime, timedelta
 from pathlib import Path
-from . import attachments, backends, db, policy, push, verify
+from . import attachments, backends, db, policy, push, research, verify, webtools
 from .backends import BackendError, CeilingError, SpentError
 
 PLAN_SYS = ("You are planning work that a smaller model will carry out. Do not do the task. "
@@ -124,8 +124,8 @@ class Night:
         return name in self.backends and policy.available(
             name, self.cfg, self.conn, self.state(), self.period_start, self.now(), self.down)
 
-    def call(self, name, task_id, role, prompt, system, cwd=None, files=(), args=(), web=False):
-        kw = {k: v for k, v in (("cwd", cwd), ("files", files), ("args", args), ("web", web)) if v}
+    def call(self, name, task_id, role, prompt, system, cwd=None, files=(), args=()):
+        kw = {k: v for k, v in (("cwd", cwd), ("files", files), ("args", args)) if v}
         cap = self.cfg["budget"].get("max_usd_per_task") or 0
         if cap and self.cfg["backends"].get(name, {}).get("type") == "anthropic_api":
             used = db.task_usd(self.conn, task_id)
@@ -228,9 +228,11 @@ class Night:
                 return self._done(task)
             if task["feedback"]:
                 prompt += f"\n\nA previous attempt was rejected. Reviewer feedback:\n{task['feedback']}"
-            answer = self.call(r.executor, tid, "execute", prompt, EXEC_SYS,
-                               cwd=str(cwd) if cwd else None, files=send,
-                               web=policy.local_search(self.cfg, r.executor))
+            if policy.local_search(self.cfg, r.executor):
+                answer = self._research(task, r.executor, prompt, send)
+            else:
+                answer = self.call(r.executor, tid, "execute", prompt, EXEC_SYS,
+                                   cwd=str(cwd) if cwd else None, files=send)
             review = ""
             if r.reviewer and self.ok(r.reviewer):
                 db.update(self.conn, tid, status="review")
@@ -256,6 +258,26 @@ class Night:
             return outcome
         self._write_result(task, r.executor, answer, None, review=review, reviewer=r.reviewer)
         return self._done(task)
+
+    def _research(self, task, executor, prompt, files) -> str:
+        """A local model that can search does the task as staged research (see research.py),
+        unless it judges that the task needs none; a task sized up as needing the web always
+        gets it. The claims are checked by the same model in a call of its own, or by the
+        backend its check_with names."""
+        tid, c = task["id"], self.cfg["backends"][executor]
+        other = c.get("check_with")  # another backend, if a second pair of eyes is wanted
+        checker = other if other and self.ok(other) else executor
+        out = research.run(
+            prompt, task["prompt"],
+            lambda p, system: self.call(executor, tid, "execute", p, system, files=files),
+            lambda p, system: self.call(checker, tid, "review", p, system),
+            webtools.Session(c["search_url"]), research.Opts.of(c),
+            must=task["needs"] == "web", checker=checker)
+        if out is not None:
+            return out
+        return (self.call(executor, tid, "execute", prompt, EXEC_SYS, files=files)
+                + "\n\n---\n*night-elves: the model judged that this task needed no web "
+                  "research, so this answer is from its own knowledge and the task's text.*")
 
     def _done(self, task) -> str:
         db.update(self.conn, task["id"], status="done", last_error=None, feedback=None)

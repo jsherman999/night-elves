@@ -3,16 +3,16 @@ import urllib.error, urllib.request
 from unittest import mock
 from datetime import date, datetime, timezone
 from http.server import ThreadingHTTPServer
-from elves import attachments, backends, cli, config, db, notify, pages, policy, web, webtools, when
+from elves import attachments, backends, cli, config, db, notify, pages, policy, research, web, webtools, when
 from elves.backends import BackendError, Command, Result
 from elves.dispatcher import Night, passed, plan_criteria
 
 class Fake:
     def __init__(self, reply="ok", usd=0.0, fail=0):
         self.reply, self.usd, self.fail, self.calls = reply, usd, fail, []
-    def run(self, prompt, system=None, cwd=None, files=(), args=(), web=False, budget_usd=None):
+    def run(self, prompt, system=None, cwd=None, files=(), args=(), budget_usd=None):
         self.calls.append((prompt, system))
-        self.cwd, self.files, self.args, self.web = cwd, list(files), list(args), web
+        self.cwd, self.files, self.args = cwd, list(files), list(args)
         self.budget_usd = budget_usd
         if self.fail:
             self.fail -= 1
@@ -1342,6 +1342,44 @@ class SearchAndArchiveTests(Base):
         code, out, _ = call("/tasks", json.dumps({"prompt": "use it", "from": n}).encode(), js)
         self.assertEqual(code, 201)  # an archived result can still be attached
 
+class Web(webtools.Session):
+    """A Session over canned search results and pages: no network."""
+    def __init__(self, results, pages, files=(), dead=()):
+        super().__init__("http://searx")
+        self.results, self.canned, self.canned_files, self.canned_dead = results, pages, set(files), set(dead)
+    def search(self, query):
+        self.searches.append(query)
+        hits = [{"title": t, "url": u, "snippet": ""} for t, u in self.results.get(query, [])]
+        self.seen.update(webtools.norm(h["url"]) for h in hits)
+        return hits
+    def open(self, url):
+        if url in self.pages:
+            return self.pages[url]
+        if url in self.canned_files:
+            self.files[url] = "a application/gzip file"
+        elif url in self.canned and url not in self.canned_dead:
+            self.pages[url] = self.canned[url]
+            self.seen.update(webtools.norm(u) for u in webtools.urls_in(self.canned[url]))
+            return self.canned[url]
+        else:
+            self.errors.setdefault(url, "HTTP 404")
+        return None
+
+class Model:
+    """A scripted model: replies by which stage's system prompt it is given."""
+    def __init__(self, **replies):
+        self.replies, self.calls = replies, []
+    def __call__(self, prompt, system):
+        stage = next(k for k, v in (("plan", "planning web research"), ("pick", "choosing which search"),
+                                    ("read", "reading one web page"), ("write", "using only the research notes"),
+                                    ("fix", "correcting a research result"), ("check", "checking a research result"))
+                     if v in system)
+        self.calls.append((stage, prompt))
+        r = self.replies[stage]
+        if callable(r):
+            return r(prompt)
+        return r.pop(0) if isinstance(r, list) else r
+
 class LocalSearchTests(Base):
     def serve(self, routes):
         from http.server import BaseHTTPRequestHandler
@@ -1378,8 +1416,8 @@ class LocalSearchTests(Base):
             with self.assertRaises(webtools.Refused):
                 webtools.check_url("https://rebind.example/")
         s = webtools.Session("http://127.0.0.1:1")
-        self.assertIn("not on the public internet", s.call("fetch_page", '{"url": "http://127.0.0.1:8377/"}'))
-        self.assertEqual(s.opened, [])
+        self.assertIsNone(s.open("http://127.0.0.1:8377/"))
+        self.assertIn("not on the public internet", s.errors["http://127.0.0.1:8377/"])
         with mock.patch.object(webtools, "check_url", side_effect=webtools.Refused("no")) as chk:
             with self.assertRaises(webtools.Refused):  # each redirect is checked too
                 webtools._Redirects().redirect_request(None, None, 302, "", {}, "http://10.0.0.5/")
@@ -1397,112 +1435,258 @@ class LocalSearchTests(Base):
         self.assertNotIn("evil", text)
         self.assertNotIn("p{}", text)
         self.assertNotIn("javascript:", text)
+        self.assertEqual(webtools.urls_in("see https://a.org/x/y. and [t](https://b.org/p?q=1), "
+                                          "<https://c.org/>; *https://d.org/z*"),
+                         ["https://a.org/x/y", "https://b.org/p?q=1", "https://c.org/", "https://d.org/z"])
+        self.assertEqual(webtools.norm("HTTP://WWW.A.org/x/#top"), webtools.norm("https://a.org/x"))
+        self.assertNotEqual(webtools.norm("https://a.org/x?p=1"), webtools.norm("https://a.org/x"))
 
-    def test_search_fetch_paging_and_errors(self):
+    def test_session_searches_and_opens_real_pages(self):
         hits = {"results": [{"title": "3B2  notes", "url": "https://ex.org/3b2", "content": "WE 32100"},
-                            {"title": "Other", "url": "https://ex.org/o", "content": ""}]}
+                            {"title": "no url", "content": "x"}]}
         base, seen = self.serve({
             "/search": (200, "application/json", json.dumps(hits).encode()),
-            "/long": (200, "text/html; charset=utf-8", b"<p>" + b"abcdefghij" * 300 + b"</p>"),
+            "/page": (200, "text/html; charset=utf-8", b"<p>See <a href='https://ex.org/deep'>deep</a></p>"),
             "/bin": (200, "application/zip", b"PK"),
-            "/hop": (302, "text/plain", b"", ("Location", "/long")),
+            "/hop": (302, "text/plain", b"", ("Location", "/page")),
+            "/empty": (200, "text/html", b"<script>app()</script>"),
         })
-        s = webtools.Session(base, page_chars=1000)
-        out = s.call("web_search", '{"query": "3b2 cpu"}')
-        self.assertEqual(out, "1. 3B2 notes\n   https://ex.org/3b2\n   WE 32100\n2. Other\n   https://ex.org/o")
+        s = webtools.Session(base)
+        self.assertEqual(s.search("3b2 cpu"), [{"title": "3B2 notes", "url": "https://ex.org/3b2", "snippet": "WE 32100"}])
         self.assertIn("q=3b2+cpu&format=json", seen[0])
-        self.assertIn("not on the public internet", s.call("fetch_page", {"url": base + "/long"}))
         with mock.patch.object(webtools, "ALLOW_PRIVATE", True):
-            first = s.call("fetch_page", json.dumps({"url": base + "/long"}))
-            self.assertTrue(first.startswith("abcdefghij"))
-            self.assertIn("[Characters 0-1000 of 3000. To read on: fetch_page with start=1000.]", first)
-            last = s.call("fetch_page", {"url": base + "/long", "start": 2000})
-            self.assertEqual(last, "abcdefghij" * 100)  # the end: no note
-            self.assertEqual(seen.count("/long"), 1)  # reading on doesn't fetch again
-            self.assertIn("HTTP 404", s.call("fetch_page", {"url": base + "/gone"}))
-            self.assertIn("application/zip file of 2 bytes", s.call("fetch_page", {"url": base + "/bin"}))
-            self.assertTrue(s.call("fetch_page", {"url": base + "/hop"}).startswith("abcdefghij"))
-        self.assertIn("no tool named", s.call("rm", "{}"))
-        self.assertTrue(s.call("web_search", "not json").startswith("Error:"))
-        self.assertEqual(s.searches, ["3b2 cpu"])
-        self.assertEqual(s.opened, [base + "/long", base + "/hop"])
-        self.assertIn(f"ran 1 web search and opened 2 pages:*\n- <{base}/long>", s.note())
-        self.assertIn("didn't, so this answer is from its memory", webtools.Session(base).note())
+            self.assertEqual(s.open(base + "/page"), "See [deep](https://ex.org/deep)")
+            s.open(base + "/page")
+            self.assertEqual(seen.count("/page"), 1)  # kept, not fetched again
+            self.assertIsNone(s.open(base + "/gone"))
+            self.assertIsNone(s.open(base + "/bin"))
+            self.assertIsNone(s.open(base + "/empty"))
+            self.assertTrue(s.open(base + "/hop").startswith("See"))
+            self.assertEqual((s.exists(base + "/bin"), s.exists(base + "/gone")), (True, False))
+        self.assertEqual(s.errors, {base + "/gone": "HTTP 404",
+                                    base + "/empty": "no readable text (it may need JavaScript)"})
+        self.assertEqual(s.files, {base + "/bin": "a application/zip file of 2 bytes"})
+        self.assertTrue(s.opened(base + "/page/#x") and not s.opened(base + "/bin"))
+        self.assertEqual(s.seen, {"ex.org/3b2", "ex.org/deep"})
+        down = webtools.Session("http://127.0.0.1:1")
+        self.assertEqual(down.search("q"), [])  # a search engine that is down isn't fatal here
+        self.assertIn("search: q", down.errors)
 
-    def test_backend_runs_the_tool_loop(self):
-        def reply(content=None, calls=()):
-            m = {"content": content}
-            if calls:
-                m["tool_calls"] = [{"id": f"c{i}", "type": "function",
-                                    "function": {"name": n, "arguments": json.dumps(a)}}
-                                   for i, (n, a) in enumerate(calls)]
-            return {"choices": [{"message": m}], "usage": {"prompt_tokens": 5, "completion_tokens": 7}}
-        cfgb = {"model": "m", "base_url": "http://x/v1", "search_url": "http://s", "max_tool_uses": 3}
-        b = backends.OpenAICompat("local", cfgb)
-        ran = []
-        def tool(self, name, arguments):
-            ran.append((name, json.loads(arguments)))
-            self.opened.append("https://ex.org/3b2")
-            return f"result of {name}"
-        bodies = []
-        def post(url, headers, body, timeout):
-            bodies.append(json.loads(json.dumps(body)))  # a copy: the list grows afterwards
-            return replies.pop(0)
-        replies = [reply(calls=[("web_search", {"query": "3b2"})]),
-                   reply(calls=[("fetch_page", {"url": "https://ex.org/3b2"})]),
-                   reply("The 3B2 used the WE 32100.")]
-        with mock.patch.object(backends, "_post", side_effect=post), \
-                mock.patch.object(webtools.Session, "call", tool):
-            res = b.run("which cpu?", "Be brief.", web=True)
-        self.assertTrue(res.text.startswith("The 3B2 used the WE 32100.\n\n---\n*night-elves:"))
-        self.assertIn("- <https://ex.org/3b2>", res.text)
-        self.assertEqual((res.tokens_in, res.tokens_out), (15, 21))  # every turn counts
-        self.assertEqual(ran, [("web_search", {"query": "3b2"}), ("fetch_page", {"url": "https://ex.org/3b2"})])
-        self.assertEqual([t["function"]["name"] for t in bodies[0]["tools"]], ["web_search", "fetch_page"])
-        self.assertTrue(bodies[0]["messages"][0]["content"].startswith("Be brief.\n\nYou can search"))
-        self.assertEqual([m["role"] for m in bodies[2]["messages"]],
-                         ["system", "user", "assistant", "tool", "assistant", "tool"])
-        self.assertEqual(bodies[2]["messages"][3], {"role": "tool", "tool_call_id": "c0",
-                                                    "content": "result of web_search"})
-        # The budget: calls past it aren't run, and the model is made to answer.
-        ran.clear(); bodies.clear()
-        replies = [reply(calls=[("web_search", {"query": str(i)}) for i in range(4)]),
-                   reply("best I can do")]
-        with mock.patch.object(backends, "_post", side_effect=post), \
-                mock.patch.object(webtools.Session, "call", tool):
-            res = b.run("q", web=True)
-        self.assertEqual(len(ran), 3)
-        self.assertEqual(bodies[1]["messages"][-2]["content"], "Not run: the tool budget for this task is used up.")
-        self.assertEqual(bodies[1]["tool_choice"], "none")
-        self.assertTrue(res.text.startswith("best I can do"))
-        # Without web=True, or without a search_url, it is the plain single call.
-        for backend, kw in ((b, {}), (backends.OpenAICompat("l", {"model": "m", "base_url": "http://x/v1"}),
-                                      {"web": True})):
-            bodies.clear()
-            replies = [reply("plain")]
-            with mock.patch.object(backends, "_post", side_effect=post):
-                self.assertEqual(backend.run("q", **kw).text, "plain")
-            self.assertNotIn("tools", bodies[0])
+    PAGES = {
+        "https://loom.example/3b2/": "The 3B2/400 used the WE 32100 CPU at 10 MHz. "
+                                     "Software is in https://loom.example/3b2/software/ and "
+                                     "old notes at https://loom.example/gone.html",
+        "https://loom.example/3b2/software/": "Folders: DMD_Utilities (12 disk images), TCP-IP. "
+                                              "Get https://loom.example/3b2/base.img.gz",
+        "https://simh.example/": "Open SIMH has a 3B2/400 simulator. Build with make 3b2-400.",
+        "https://blog.example/list": "Top ten emulators of all time!",
+    }
+    RESULTS = {"3b2 emulator": [("Loom 3B2", "https://loom.example/3b2/"), ("Blog", "https://blog.example/list")],
+               "simh 3b2": [("Open SIMH", "https://simh.example/"), ("Loom 3B2", "https://loom.example/3b2/")]}
 
-    def test_tasks_reach_a_local_model_that_can_search(self):
-        self.cfg["backends"]["local"]["search_url"] = "http://127.0.0.1:8888"
+    def read(self, prompt):
+        if "Page: https://loom.example/3b2/\n" in prompt:
+            return ('- The 3B2/400 has a WE 32100 CPU "used the WE 32100 CPU at 10 MHz"\n'
+                    '- It shipped in 1984 "first shipped in 1984"\n'  # not on the page: dropped
+                    "FOLLOW:\nhttps://loom.example/3b2/software/\nhttps://evil.example/not-on-page\n")
+        if "Page: https://loom.example/3b2/software/" in prompt:
+            return '* DMD_Utilities holds 12 disk images “DMD_Utilities (12 disk images)”\n- There is a TCP-IP folder'
+        if "Page: https://simh.example/" in prompt:
+            return '- Build it with make 3b2-400 "Build with  make 3b2-400"'
+        return "NOTHING"
+
+    def test_research_runs_in_stages_and_keeps_only_what_the_pages_say(self):
+        web_ = Web(self.RESULTS, self.PAGES, files=["https://loom.example/3b2/base.img.gz"])
+        draft = ("The emulator is at https://simh.example/ and images at "
+                 "https://loom.example/3b2/base.img.gz. See also https://made-up.example/3b2.zip "
+                 "and https://loom.example/gone.html. It runs at 25 MHz.")
+        fixed = ("The emulator is at https://simh.example/ and images at "
+                 "https://loom.example/3b2/base.img.gz. It runs at 25 MHz.")
+        final = fixed.replace("25 MHz", "10 MHz (https://loom.example/3b2/)")
+        m = Model(plan="1. 3b2 emulator\n- \"simh 3b2\"\n", pick="1, 3, 2", read=self.read,
+                  write=draft, fix=[fixed, final],
+                  check="- \"It runs at 25 MHz\": the notes say 10 MHz")
+        out = research.run("Task:\nwhere is the 3b2 emulator?", "where is the 3b2 emulator?",
+                           m, m, web_, research.Opts(max_pages=5), checker="qwen")
+        stages = [s for s, _ in m.calls]
+        self.assertEqual(stages, ["plan", "pick", "read", "read", "read", "read", "write", "fix", "check", "fix"])
+        self.assertEqual(web_.searches, ["3b2 emulator", "simh 3b2"])
+        self.assertIn("1. Loom 3B2\n   https://loom.example/3b2/", m.calls[1][1])
+        self.assertIn("3. Open SIMH", m.calls[1][1])  # results are merged without repeats
+        # The link the first page pointed to was read next, ahead of the other results; the
+        # one that wasn't on the page was not followed.
+        self.assertEqual(list(web_.pages), ["https://loom.example/3b2/", "https://loom.example/3b2/software/",
+                                            "https://simh.example/", "https://blog.example/list"])
+        notes = m.calls[6][1]
+        self.assertIn("Source: https://loom.example/3b2/\n- The 3B2/400 has a WE 32100 CPU", notes)
+        self.assertNotIn("1984", notes)  # its quote isn't on the page
+        self.assertIn("- DMD_Utilities holds 12 disk images", notes)
+        self.assertIn("- There is a TCP-IP folder (no quote given)", notes)
+        self.assertNotIn("blog.example", notes.split("Research notes:")[1])
+        # Links: the made-up one and the dead one go back; the file is there, so it stays.
+        problems = m.calls[7][1]
+        self.assertIn("not sources. Remove them and whatever rests only on them:\n- https://made-up.example/3b2.zip", problems)
+        self.assertIn("- https://loom.example/gone.html (HTTP 404)", problems)
+        self.assertNotIn("- https://loom.example/3b2/base.img.gz", problems)
+        self.assertIn("It runs at 25 MHz", m.calls[9][1])  # the checker's finding goes back too
+        body, rec = out.split("\n\n---\n")
+        self.assertEqual(body, final)
+        self.assertIn("2 searches; notes taken from 3 pages (4 notes; 1 more dropped because "
+                      "their quote wasn't on the page)", rec)
+        self.assertIn("Read, but nothing useful for the task: <https://blog.example/list>", rec)
+        self.assertIn("Couldn't open: <https://loom.example/gone.html> (HTTP 404)", rec)
+        self.assertIn("Links in the result: 3. 2 are pages notes were taken from; 1 more were seen "
+                      "on a page or in the results and something answers there.", rec)
+        self.assertIn("Claim check by qwen: 1 unsupported claim(s) were sent back", rec)
+        self.assertNotIn("made up", rec)
+
+    def test_research_record_names_what_the_model_would_not_fix(self):
+        web_ = Web(self.RESULTS, self.PAGES)
+        bad = "See https://simh.example/ and https://made-up.example/x and https://loom.example/gone.html"
+        m = Model(plan="3b2 emulator\nsimh 3b2", pick="none of them", read=self.read, write=bad,
+                  fix=bad, check="OK")
+        out = research.run("p", "where is it?", m, m, web_, research.Opts())
+        self.assertIn("**Dead links still in the result:** <https://loom.example/gone.html>", out)
+        self.assertIn("came from no source (treat as made up):** <https://made-up.example/x>", out)
+        self.assertIn("Claim check: every claim was found in the notes.", out)
+        m = Model(plan="3b2 emulator", pick="1", read=self.read, write="It is at https://loom.example/3b2/.")
+        out = research.run("p", "where?", m, None, Web(self.RESULTS, self.PAGES), research.Opts(min_pages=1))
+        self.assertEqual([s for s, _ in m.calls], ["plan", "pick", "read", "read", "write"])  # nothing to fix
+        self.assertIn("**Claims were not checked against the notes** (no checker available).", out)
+        for reply, why in ((BackendError("local: empty response"), "the checker failed: local: empty response"),
+                           ("Looks fine to me!", "the checker's reply couldn't be read")):
+            def check(p, s, reply=reply):
+                if isinstance(reply, Exception):
+                    raise reply
+                return reply
+            m = Model(plan="3b2 emulator", pick="1", read=self.read, write="It is at https://loom.example/3b2/.")
+            out = research.run("p", "where?", m, check, Web(self.RESULTS, self.PAGES), research.Opts(min_pages=1))
+            self.assertIn(f"**Claims were not checked against the notes** ({why}).", out)
+        # Typographic hyphens and quotes in a model's quote still match the page.
+        kept, _, lost = research._notes("- Dated \u201c2026\u201111\u201103\u201d", "", "status (2026-11-03): done")
+        self.assertEqual((len(kept), lost), (1, 0))
+        page = "Free plan: **120 minutes** per month | see [the pricing page](https://u.example/p) for more. Max 3 files."
+        kept, _, lost = research._notes(
+            '- a "120 minutes per month"\n- b "see the pricing page for more"\n'
+            '- c "Free plan: 120 minutes ... Max 3 files"\n- d "120 hours per month"\n- e "20 minutes"\n- f "..."',
+            page, page)
+        self.assertEqual(([k[2] for k in kept], lost), (["a", "b", "c"], 3))  # whole words, in order
+
+    def test_thin_research_is_refused_and_no_research_is_allowed_only_if_optional(self):
+        # One useful page, minimum two: further results are tried, and then it is an error.
+        m = Model(plan="3b2 emulator", pick="1", read=lambda p: self.read(p) if "3b2/\n" in p else "NOTHING")
+        web_ = Web({"3b2 emulator": self.RESULTS["3b2 emulator"]}, {k: v for k, v in self.PAGES.items()
+                                                                     if "software" not in k})
+        with self.assertRaises(BackendError) as cm:
+            research.run("p", "where?", m, None, web_, research.Opts())
+        self.assertIn("useful notes from 1 page(s), minimum 2 (1 searches, 3 pages tried, 1 failed)", str(cm.exception))
+        self.assertIn("https://blog.example/list", web_.pages)  # the result it hadn't picked
+        self.assertNotIn("write", [s for s, _ in m.calls])
+        m = Model(plan="NONE")
+        self.assertIsNone(research.run("p", "explain TCP", m, None, Web({}, {}), research.Opts()))
+        # A task that must use the web searches for the task's own words when no plan comes back,
+        m = Model(plan="None.", pick="1", read="NOTHING")
+        web_ = Web({}, {})
+        with self.assertRaises(BackendError):
+            research.run("p", "latest  sqlite release", m, None, web_, research.Opts(), must=True)
+        self.assertEqual(web_.searches, ["latest sqlite release"])
+        # and a task that names its own pages has them read first, and may cite them.
+        pages = {"https://github.example/me/app": "An app. Uses floppies from https://loom.example/3b2/software/"}
+        m = Model(plan="NONE", read='- It uses floppies "Uses floppies from"',
+                  write="Per https://github.example/me/app it uses floppies.")
+        out = research.run("p", "read https://github.example/me/app and report", m, None,
+                           Web({}, pages), research.Opts(min_pages=1), must=True)
+        self.assertIn("Links in the result: 1. 1 are pages notes were taken from.", out)
+
+    def test_followed_links_leave_room_for_the_results(self):
+        pages = {f"https://a.example/{i}": "page " + " ".join(f"https://a.example/{i}{j}" for j in "abc")
+                 for i in range(1, 4)}
+        pages |= {f"https://a.example/{i}{j}": "deep" for i in range(1, 4) for j in "abc"}
+        m = Model(plan="q", pick="1,2,3", write="done",
+                  read=lambda p: ('- a fact "page"\nFOLLOW:\n' + "\n".join(webtools.urls_in(p.split("\n\n", 2)[2]))
+                                  if "\n\npage " in p else '- deep "deep"'))
+        web_ = Web({"q": [(f"R{i}", f"https://a.example/{i}") for i in range(1, 4)]}, pages)
+        research.run("p", "t", m, None, web_, research.Opts(max_pages=6))
+        got = list(web_.pages)
+        self.assertEqual(len(got), 5)  # two followed links at most (6 // 3), and every result
+        self.assertEqual(sorted(u for u in got if u[-1].isdigit()), [f"https://a.example/{i}" for i in range(1, 4)])
+        self.assertEqual(got[1][:-1], "https://a.example/1")  # a followed link is read right away
+
+    def test_long_pages_are_read_in_parts(self):
+        page = "alpha fact here. " + "x" * 100 + " omega fact there. " + "y" * 300
+        m = Model(plan="q", pick="1", read=["- a \"alpha fact here\"", "- o \"omega fact there\"\n- wrong part \"alpha fact here\""],
+                  write="done")
+        research.run("p", "t", m, None, Web({"q": [("T", "https://l.example/")]}, {"https://l.example/": page}),
+                     research.Opts(min_pages=1, page_chars=110, page_parts=2))
+        reads = [p for s, p in m.calls if s == "read"]
+        self.assertEqual(len(reads), 2)  # two parts read, the rest of the page left
+        self.assertIn("(part 2 of 4)", reads[1])
+        notes = m.calls[-1][1]
+        self.assertIn("- o \"omega fact there\"", notes)
+        self.assertNotIn("wrong part", notes)  # a quote must be in the part being read
+
+    def test_the_dispatcher_researches_with_a_local_model_that_can_search(self):
+        self.cfg["backends"]["local"].update(search_url="http://127.0.0.1:8888", min_pages=1, max_pages=3)
+        self.cfg["backends"]["local_vision"] = {"type": "openai_compat"}
+        self.cfg["backends"]["local"]["check_with"] = "local_vision"
+        self.cfg["roles"]["local_review"] = "local_vision"  # the ordinary review of auto tasks
         self.assertTrue(policy.local_search(self.cfg, "local"))
         self.assertFalse(policy.local_search(self.cfg, "claude_api"))
         self.assertFalse(policy.local_search(self.cfg, None))
-        web_task = db.add_task(self.conn, "latest news")
-        db.update(self.conn, web_task, needs="web")
-        night = self.night(3)  # conserve mode, API allowance left: Claude still goes first
-        night.run()
-        self.assertEqual(db.get(self.conn, web_task)["backend"], "claude_api")
-        self.cfg["budget"]["conserve_night_cap_usd"] = 0.0  # none left, and outside the CLI's hours
-        self.cfg["backends"]["claude_cli"]["window"] = [1, 2]
-        later = db.add_task(self.conn, "more news")
-        db.update(self.conn, later, needs="web")
+        self.assertEqual(research.Opts.of(self.cfg["backends"]["local"]).max_pages, 3)
+        m = Model(plan=["3b2 emulator", "NONE", "NONE"], pick="1", read=self.read,
+                  write="It is at https://loom.example/3b2/.")
+        local = Fake(lambda p, s: m(p, s) if s != "Complete the task fully and return only the finished result."
+                     else "TCP is a protocol.")
+        checker = Fake(lambda p, s: "OK" if "checking a research result" in s else "PASS")
+        made = []
+        def session(url):
+            made.append(url)
+            return Web(self.RESULTS, self.PAGES)
+        researched = db.add_task(self.conn, "where is the 3b2 emulator?", tier="local")
         plain = db.add_task(self.conn, "explain TCP", tier="local")
-        night = self.night(3, hour=9)
-        night.run()
-        self.assertEqual([db.get(self.conn, t)["backend"] for t in (later, plain)], ["local", "local"])
-        self.assertTrue(self.fakes["local"].web)  # the executor was told it may search
+        with mock.patch.object(webtools, "Session", session):
+            night = self.night(3, local=local, local_vision=checker)
+            night.run()
+        self.assertEqual(made, ["http://127.0.0.1:8888"] * 2)
+        out = open(db.get(self.conn, researched)["result_path"]).read()
+        self.assertIn("It is at https://loom.example/3b2/.\n\n---\n*night-elves research record", out)
+        self.assertIn("Claim check by local_vision: every claim was found in the notes.", out)
+        self.assertEqual(len(checker.calls), 1)
+        out = open(db.get(self.conn, plain)["result_path"]).read()
+        self.assertIn("TCP is a protocol.\n\n---\n*night-elves: the model judged that this task needed no web research", out)
+        # Web tasks: Claude first while it has allowance; without it, the local model, and
+        # there "no research needed" isn't an option.
+        first = db.add_task(self.conn, "latest news")
+        db.update(self.conn, first, needs="web")
+        self.night(3).run()
+        self.assertEqual(db.get(self.conn, first)["backend"], "claude_api")
+        self.cfg["budget"]["conserve_night_cap_usd"] = 0.0
+        self.cfg["backends"]["claude_cli"]["window"] = [1, 2]
+        later = db.add_task(self.conn, "more news about the 3b2")
+        db.update(self.conn, later, needs="web")
+        with mock.patch.object(webtools, "Session", lambda url: Web({"more news about the 3b2": self.RESULTS["3b2 emulator"]}, self.PAGES)):
+            self.night(3, hour=9, local=local, local_vision=checker).run()
+        t = db.get(self.conn, later)
+        self.assertEqual((t["status"], t["backend"]), ("done", "local"))
+        self.assertIn("night-elves research record", open(t["result_path"]).read())
+        # Research that comes up thin fails the attempt, like any backend error.
+        self.cfg["backends"]["local"]["min_pages"] = 3
+        thin = db.add_task(self.conn, "where is the 3b2 emulator, again?", tier="local")
+        m.replies["plan"] = ["3b2 emulator"]
+        with mock.patch.object(webtools, "Session", lambda url: Web(self.RESULTS, {})):
+            self.night(3, hour=9, local=local, local_vision=checker).run()
+        t = db.get(self.conn, thin)
+        self.assertEqual((t["status"], t["attempts"]), ("queued", 1))
+        self.assertIn("research came up too thin", t["last_error"])
+
+    def test_extra_request_fields_reach_the_local_server(self):
+        b = backends.OpenAICompat("l", {"model": "m", "base_url": "http://x/v1",
+                                        "extra": {"reasoning_effort": "high"}})
+        reply = {"choices": [{"message": {"content": "hi"}}]}
+        with mock.patch.object(backends, "_post", return_value=reply) as post:
+            self.assertEqual(b.run("q").text, "hi")
+        self.assertEqual(post.call_args[0][2]["reasoning_effort"], "high")
 
 class CeilingTests(Base):
     def api(self, replies, **cfg):
