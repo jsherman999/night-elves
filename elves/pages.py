@@ -22,6 +22,10 @@ a{color:var(--accent);text-decoration:none}
 .card{background:var(--card);border:1px solid var(--line);border-radius:12px;padding:12px 14px}
 .row{display:block;color:inherit;padding:10px 14px;border-top:1px solid var(--line)}
 .row:first-child{border-top:0}.list{padding:0;overflow:hidden}
+.row.act{display:flex;gap:10px;align-items:center}.row.act>a{flex:1;min-width:0;color:inherit}
+.row.act form{margin:0}button.mini{width:auto;margin:0;padding:4px 10px;font-size:.8em}
+.snip{font-size:.85em;color:var(--mute);margin-top:2px;overflow-wrap:anywhere}
+.search{display:flex;gap:8px}.search input{flex:1}.search button{width:auto}
 .top{display:flex;gap:8px;align-items:center;font-size:.85em;color:var(--mute)}
 .top b{color:var(--ink)}.txt{margin-top:2px;overflow-wrap:anywhere}
 .pill{font-size:.75em;font-weight:600;padding:1px 8px;border-radius:99px}
@@ -158,15 +162,28 @@ def usage_line(t, u, short=False) -> str:
         return (f"<p class=use>{' · '.join(bits)}</p><p class=use>By model: {by}</p>")
     return f"<p class=use>{' · '.join(bits)}</p>"
 
-def home(rows, msg: str | None = None, usage=None) -> str:
+def home(rows, msg: str | None = None, usage=None, q: str = "", found=None, archived=None) -> str:
+    """found: [(task, snippet)] for the search q. archived: the archived tasks, when asked for."""
     waiting = sorted((t for t in rows if t["status"] == "queued"),
                      key=lambda t: (t["run_after"] is None, t["run_after"] or "", t["priority"], t["id"]))
     running = [t for t in rows if t["status"] in db.ACTIVE]
-    recent = [t for t in rows if t["status"] not in ("queued", *db.ACTIVE)][:30]
+    recent = [t for t in rows if t["status"] not in ("queued", *db.ACTIVE)
+              and not t["archived"]][:30]
     usage = usage or {}
-    def section(name, items, empty):
-        inner = "".join(row(t, usage.get(t["id"])) for t in items) or f'<div class="row mute">{empty}</div>'
+    def section(name, items, empty, act=None, snippets=None):
+        inner = "".join(row(t, usage.get(t["id"]), act, (snippets or {}).get(t["id"]))
+                        for t in items) or f'<div class="row mute">{empty}</div>'
         return f"<h2>{name}</h2><div class='card list'>{inner}</div>"
+    extra = ""
+    if found is not None:
+        extra += section(f"Matches for “{e(q)}”", [t for t, _ in found],
+                         "No task's prompt or result has those words.",
+                         snippets={t["id"]: s for t, s in found})
+        extra += ('<p class=hint>To build on one, put its number in “Use results of tasks”. '
+                  '<a href=/>Clear search</a></p>')
+    if archived is not None:
+        extra += section("Archived", archived, "Nothing archived.", "unarchive")
+        extra += "<p class=hint><a href=/>Hide archived</a></p>"
     return page("Night Elves", f"""<h1>night-elves</h1><div class=home>
 <form method=post action=/tasks class=card enctype=multipart/form-data>
 <textarea name=prompt rows=4 placeholder="What should the elves do?" required></textarea>
@@ -180,21 +197,38 @@ def home(rows, msg: str | None = None, usage=None) -> str:
 <p class=hint>Text files up to 200 KB work with any tier. Images and PDFs need Claude or the
 local vision model. Bigger or other kinds of files need agent.</p>
 <button>Queue it</button></form><div>
+<form method=get action=/ class=search role=search>
+<input name=q type=search value="{e(q)}" placeholder="Search past prompts and results" aria-label="Search past results">
+<button class=quiet>Search</button></form>
+{extra}
 {section("Running", running, "Nothing running.") if running else ""}
 {section("Waiting", waiting, "The queue is empty.")}
-{section("Recent", recent, "Nothing yet.")}
+{section("Recent", recent, "Nothing yet.", "archive")}
+{"" if archived is not None else "<p class=hint><a href=/?archived=1>Show archived tasks</a></p>"}
 <form method=post action=/logout><button class=quiet>Sign out</button></form></div></div>""", msg)
 
-def row(t, u=None) -> str:
+def row(t, u=None, act: str | None = None, snippet: str | None = None) -> str:
+    """act: "archive" or "unarchive" puts that button on the row, where the task allows it."""
     pri = f" · p{t['priority']}" if t["priority"] != 5 else ""
     n = len(attachments.files(t))
     pri += f" · {n} file{'s' if n > 1 else ''}" if n else ""
     if t["status"] in ("done", "failed") and (use := usage_line(t, u, short=True)):
         pri += f" · {use}"
-    return (f"<a class=row href=/t/{t['id']}><div class=top><b>#{t['id']}</b>"
-            f"<span class='pill {e(t['status'])}'>{e(t['status'])}</span>"
-            f"<span>{e(t['tier'])}{pri} · {e(when_text(t))}</span></div>"
-            f"<div class=txt>{e(' '.join(t['prompt'].split())[:140])}</div></a>")
+    arch = "<span class='pill cancelled'>archived</span>" if t["archived"] else ""
+    snip = f"<div class=snip>{e(snippet)}</div>" if snippet else ""
+    inner = (f"<div class=top><b>#{t['id']}</b>"
+             f"<span class='pill {e(t['status'])}'>{e(t['status'])}</span>{arch}"
+             f"<span>{e(t['tier'])}{pri} · {e(when_text(t))}</span></div>"
+             f"<div class=txt>{e(' '.join(t['prompt'].split())[:140])}</div>{snip}")
+    if act not in ("archive", "unarchive") or (act == "archive" and t["status"]
+                                               not in ("done", "failed", "cancelled")):
+        return f"<a class=row href=/t/{t['id']}>{inner}</a>"
+    back = "home" if act == "archive" else "archived"
+    return (f"<div class='row act'><a href=/t/{t['id']}>{inner}</a>"
+            f"<form method=post action=/tasks/{t['id']}><input type=hidden name=action value={act}>"
+            f"<input type=hidden name=back value={back}>"
+            f"<button class='quiet mini' aria-label='{act.capitalize()} #{t['id']}'>"
+            f"{act.capitalize()}</button></form></div>")
 
 def task(t, result: str | None, msg: str | None = None, raw: bool = False, shots=(),
          usage=None) -> str:
@@ -207,6 +241,8 @@ def task(t, result: str | None, msg: str | None = None, raw: bool = False, shots
         facts.append(f"sized up as {t['needs']}")
     if t["attempts"]:
         facts.append(f"{t['attempts']} attempt(s)")
+    if t["archived"]:
+        facts.append("archived")
     head = (f"<h1>#{tid} <span class='pill {e(status)}'>{e(status)}</span></h1>"
             f"<p class=mute>{e(' · '.join(facts))}</p>")
     if status not in ("queued", *db.ACTIVE):
@@ -257,6 +293,10 @@ def task(t, result: str | None, msg: str | None = None, raw: bool = False, shots
         acts.append(button("retry", "Run again" if status == "done" else "Put back in the queue"))
     if status in ("queued", "failed"):
         acts.append(button("cancel", "Cancel task", "danger", f"Cancel #{tid}?"))
+    if t["archived"]:
+        acts.append(button("unarchive", "Unarchive", "quiet"))
+    elif status in ("done", "failed", "cancelled"):
+        acts.append(button("archive", "Archive", "quiet"))
     if status in db.ACTIVE:
         acts.append("<p class=mute>A run is working on this task, so it can't be changed.</p>")
     body += f"<div class=acts>{''.join(acts)}</div>"

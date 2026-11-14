@@ -131,7 +131,8 @@ CSP = ("default-src 'none'; img-src 'self'; style-src 'unsafe-inline'; script-sr
        "form-action 'self'; frame-ancestors 'none'; base-uri 'none'")
 
 def act(cfg: dict, conn, tid: int, d: dict) -> str:
-    """One change to a task from the web: save (edit fields), now, cancel or retry."""
+    """One change to a task from the web: save (edit fields), now, cancel, retry, archive or
+    unarchive."""
     action = d.get("action") or "save"
     if action == "cancel":
         db.cancel(conn, tid)
@@ -139,6 +140,10 @@ def act(cfg: dict, conn, tid: int, d: dict) -> str:
     if action == "retry":
         db.requeue(conn, tid)
         return f"#{tid} is back in the queue"
+    if action in ("archive", "unarchive"):
+        db.archive(conn, tid, action == "archive")
+        return (f"Archived #{tid}; its result is kept and can still be searched and used"
+                if action == "archive" else f"#{tid} is back on the recent list")
     if action == "now":
         db.change(conn, tid, ("queued",), run_after=db.iso())
         t, now = db.get(conn, tid), datetime.now()
@@ -315,8 +320,14 @@ def make_handler(cfg: dict, token: str):
                     return self._send(200, pages.login(), HTML)
                 conn = db.connect(cfg["paths"]["db"])
                 try:
+                    qs = parse_qs(u.query)
+                    q = " ".join(qs.get("q", [""])[0].split())[:200]
+                    found = db.search(conn, q, results) if q else None
+                    old = db.list_tasks(conn, limit=300, archived=True) if "archived" in qs else None
                     rows = db.list_tasks(conn, limit=300)
-                    return self._send(200, pages.home(rows, msg, db.usage(conn, [t["id"] for t in rows])), HTML)
+                    use = db.usage(conn, [t["id"] for t in [*rows, *(old or []),
+                                                            *(t for t, _ in found or [])]])
+                    return self._send(200, pages.home(rows, msg, use, q, found, old), HTML)
                 finally:
                     conn.close()
             if u.path == "/tasks" or (m and m.group(1) == "tasks"):
@@ -330,6 +341,9 @@ def make_handler(cfg: dict, token: str):
             conn = db.connect(cfg["paths"]["db"])
             try:
                 if u.path == "/tasks":
+                    if q := parse_qs(u.query).get("q", [""])[0].strip():
+                        return self._send(200, [{**task_json(t), "snippet": s}
+                                                for t, s in db.search(conn, q, results)])
                     return self._send(200, [task_json(r) for r in db.list_tasks(conn, limit=100)])
                 t = db.get(conn, int(m.group(2)))
                 if t is None:
@@ -412,7 +426,8 @@ def make_handler(cfg: dict, token: str):
                     except ValueError as e:
                         msg, code = str(e), 409 if "can't be changed" in str(e) else 400
                     if not self._wants_json():
-                        return self._redirect(f"/t/{tid}?m=" + quote(msg))
+                        back = {"home": "/?m=", "archived": "/?archived=1&m="}.get(d.get("back"))
+                        return self._redirect((back or f"/t/{tid}?m=") + quote(msg))
                     t = db.get(conn, tid)
                     return self._send(code, {"message": msg, **({"task": task_json(t)} if t else {})})
                 if u.path == "/sms":  # Twilio-style webhook: form fields From and Body

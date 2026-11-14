@@ -1202,6 +1202,140 @@ class SizeUpAndUsageTests(Base):
         u = db.usage(self.conn, [tid])[tid]
         self.assertEqual((u["in"], u["out"], u["usd"]), (5, 9, 0.25))
 
+class SearchAndArchiveTests(Base):
+    def setUp(self):
+        super().setUp()
+        self.cfg["paths"]["db"] = os.path.join(self.tmp, "q.db")
+        self.conn = conn = db.connect(self.cfg["paths"]["db"])
+        self.notes = db.add_task(conn, "Research the 3B2")
+        res = os.path.join(self.tmp, f"{self.notes}.md")
+        open(res, "w").write("# Notes\n\nThe 3B2/400 ran System V on a WE 32100 <b>CPU</b>.")
+        db.update(conn, self.notes, status="done", result_path=res)
+        self.other = db.add_task(conn, "Summarise the weather")
+        db.update(conn, self.other, status="done", result_path="/etc/hosts")  # outside results
+        self.waiting = db.add_task(conn, "still waiting, system unknown")
+
+    def test_search_matches_prompts_and_results(self):
+        conn, found = self.conn, lambda q: [(t["id"], s) for t, s in db.search(self.conn, q, self.tmp)]
+        self.assertEqual(found("  "), [])
+        self.assertEqual(found("nothing-like-this"), [])
+        (tid, snippet), = found("we SYSTEM v")  # every word, any case, from the result
+        self.assertEqual(tid, self.notes)
+        self.assertIn("ran System V on a WE 32100", snippet)
+        self.assertEqual(found("weather"), [(self.other, "")])  # the prompt alone
+        self.assertEqual([i for i, _ in found("system")], [self.waiting, self.notes])
+        self.assertEqual(found("localhost"), [])  # a result path outside the folder isn't read
+        db.archive(conn, self.notes)
+        self.assertEqual([i for i, _ in found("32100")], [self.notes])  # archived still found
+
+    def test_archive_rules(self):
+        conn = self.conn
+        with self.assertRaises(ValueError):
+            db.archive(conn, self.waiting)
+        with self.assertRaises(LookupError):
+            db.archive(conn, 99)
+        before = db.get(conn, self.notes)["updated_at"]
+        db.archive(conn, self.notes)
+        t = db.get(conn, self.notes)
+        self.assertEqual((t["archived"], t["updated_at"], t["status"]), (1, before, "done"))
+        self.assertTrue(os.path.isfile(t["result_path"]))
+        self.assertEqual([r["id"] for r in db.list_tasks(conn, archived=True)], [self.notes])
+        self.assertNotIn(self.notes, [r["id"] for r in db.list_tasks(conn, archived=False)])
+        db.archive(conn, self.notes, False)
+        self.assertEqual(db.get(conn, self.notes)["archived"], 0)
+        db.archive(conn, self.notes)
+        db.requeue(conn, self.notes)  # running it again brings it back
+        self.assertEqual(db.get(conn, self.notes)["archived"], 0)
+
+    def test_old_database_gains_the_column(self):
+        path = os.path.join(self.tmp, "old.db")
+        import sqlite3
+        old = sqlite3.connect(path)
+        lines = [l for l in db.SCHEMA.splitlines() if "archived" not in l]
+        self.assertEqual(len(lines), len(db.SCHEMA.splitlines()) - 1)
+        old.executescript("\n".join(lines)
+                          .replace("secs REAL,   ", "secs REAL    ", 1))
+        old.execute("INSERT INTO tasks (created_at, updated_at, prompt) VALUES ('a', 'a', 'x')")
+        old.commit()
+        old.close()
+        self.assertEqual(db.get(db.connect(path), 1)["archived"], 0)
+
+    def test_cli(self):
+        def run(*argv):
+            out, err = io.StringIO(), io.StringIO()
+            with mock.patch.object(config, "load", return_value=self.cfg), \
+                    contextlib.redirect_stdout(out), contextlib.redirect_stderr(err):
+                return cli.main(list(argv)), out.getvalue(), err.getvalue()
+        code, out, _ = run("search", "system", "v")
+        self.assertEqual(code, 0)
+        self.assertIn(f"#{self.notes} ", out)
+        self.assertIn("ran System V", out)
+        self.assertEqual(run("search", "zzz")[0], 1)
+        self.assertEqual(run("archive", str(self.notes))[:2], (0, f"archived #{self.notes}\n"))
+        self.assertIn("(archived) Research", run("list")[1])
+        self.assertIn("(archived)", run("search", "32100")[1])
+        code, out, _ = run("add", "--from", str(self.notes), "build on it")  # still referable
+        self.assertEqual((code, out.strip().endswith("with 1 file(s)")), (0, True))
+        self.assertEqual(run("archive", str(self.waiting))[0], 1)
+        self.assertEqual(run("unarchive", str(self.notes))[0], 0)
+        self.assertEqual(db.get(self.conn, self.notes)["archived"], 0)
+
+    def test_web(self):
+        srv = ThreadingHTTPServer(("127.0.0.1", 0), web.make_handler(self.cfg, "s3cret-token-123456"))
+        threading.Thread(target=srv.serve_forever, daemon=True).start()
+        self.addCleanup(srv.shutdown)
+        base = f"http://127.0.0.1:{srv.server_port}"
+        class NoRedirect(urllib.request.HTTPRedirectHandler):
+            def redirect_request(self, *a, **k):
+                return None
+        opener = urllib.request.build_opener(NoRedirect)
+        def call(path, data=None, headers=None):
+            req = urllib.request.Request(base + path, data=data, headers=headers or {})
+            try:
+                with opener.open(req) as r:
+                    return r.status, r.read().decode(), r.headers
+            except urllib.error.HTTPError as e:
+                return e.code, e.read().decode(), e.headers
+        form = {"Content-Type": "application/x-www-form-urlencoded"}
+        me = {"Cookie": call("/login", b"token=s3cret-token-123456", form)[2]["Set-Cookie"].split(";")[0]}
+        n = self.notes
+        home = call("/", headers=me)[1]
+        self.assertIn(f"aria-label='Archive #{n}'", home)
+        self.assertNotIn(f"aria-label='Archive #{self.waiting}'", home)  # not finished
+        code, _, h = call(f"/tasks/{n}", b"action=archive&back=home", {**form, **me, "Origin": base})
+        self.assertEqual((code, h["Location"][:13]), (303, "/?m=Archived%"))
+        home = call("/", headers=me)[1]
+        self.assertNotIn("Research the 3B2", home)
+        self.assertIn("Summarise the weather", home)
+        old = call("/?archived=1", headers=me)[1]
+        self.assertIn("Research the 3B2", old)
+        self.assertIn(f"aria-label='Unarchive #{n}'", old)
+        hit = call("/?q=system+v", headers=me)[1]  # archived, and still found
+        self.assertIn("Matches for “system v”", hit)
+        self.assertIn("ran System V on a WE 32100 &lt;b&gt;CPU&lt;/b&gt;", hit)
+        self.assertIn("<span class='pill cancelled'>archived</span>", hit)
+        self.assertIn('value="&lt;i&gt;"', call("/?q=%3Ci%3E", headers=me)[1])
+        self.assertIn("No task", call("/?q=zzz", headers=me)[1])
+        page = call(f"/t/{n}", headers=me)[1]
+        self.assertIn("value=unarchive", page)
+        self.assertIn("The 3B2/400 ran", page)  # the result is still there
+        code, _, h = call(f"/tasks/{n}", b"action=unarchive&back=archived", {**form, **me, "Origin": base})
+        self.assertEqual((code, h["Location"][:15]), (303, "/?archived=1&m="))
+        self.assertIn("Research the 3B2", call("/", headers=me)[1])
+        # JSON
+        js = {"Authorization": "Bearer s3cret-token-123456", "Content-Type": "application/json"}
+        code, out, _ = call(f"/tasks/{n}", b'{"action": "archive"}', js)
+        self.assertEqual((code, json.loads(out)["task"]["archived"]), (200, 1))
+        code, out, _ = call(f"/tasks/{self.waiting}", b'{"action": "archive"}', js)
+        self.assertEqual(code, 400)
+        self.assertEqual(call("/tasks?q=32100")[0], 401)
+        code, out, _ = call("/tasks?q=32100", headers=js)
+        got = json.loads(out)
+        self.assertEqual([(t["id"], t["archived"]) for t in got], [(n, 1)])
+        self.assertIn("WE 32100", got[0]["snippet"])
+        code, out, _ = call("/tasks", json.dumps({"prompt": "use it", "from": n}).encode(), js)
+        self.assertEqual(code, 201)  # an archived result can still be attached
+
 class PushTests(Base):
     def git(self, *args, cwd=None):
         return subprocess.run(["git", "-c", "user.name=t", "-c", "user.email=t@t", *args], cwd=cwd,

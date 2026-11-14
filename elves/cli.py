@@ -7,8 +7,9 @@ from .dispatcher import Night
 
 def describe(t) -> str:
     at = f"@{when.label(t['run_after'])} " if t["run_after"] and t["status"] == "queued" else ""
+    arch = "(archived) " if t["archived"] else ""
     return (f"#{t['id']:<4} {t['status']:<9} p{t['priority']} {t['tier']:<8} "
-            f"{t['source']:<4} {at}{' '.join(t['prompt'].split())[:60]}")
+            f"{t['source']:<4} {at}{arch}{' '.join(t['prompt'].split())[:60]}")
 
 def main(argv=None) -> int:
     ap = argparse.ArgumentParser(prog="elf", description="Queue tasks for overnight model work.")
@@ -28,6 +29,12 @@ def main(argv=None) -> int:
                    metavar="FILE", help=f"attach a file (repeatable, up to {attachments.MAX_FILES})")
     l = sub.add_parser("list", help="show recent tasks")
     l.add_argument("-s", "--status")
+    f = sub.add_parser("search", help="find tasks by words in their prompt or result")
+    f.add_argument("words", nargs="+", help="every word must appear; case is ignored")
+    for name, text in (("archive", "take finished tasks off the web page's recent list (results are kept)"),
+                       ("unarchive", "put archived tasks back on the recent list")):
+        x = sub.add_parser(name, help=text)
+        x.add_argument("id", type=int, nargs="+")
     s = sub.add_parser("show", help="show one task and its result")
     s.add_argument("id", type=int)
     r = sub.add_parser("retry", help="put a failed, cancelled or finished task back in the queue")
@@ -82,6 +89,21 @@ def main(argv=None) -> int:
     elif args.cmd == "list":
         for t in db.list_tasks(conn, args.status):
             print(describe(t))
+    elif args.cmd == "search":
+        found = db.search(conn, " ".join(args.words))
+        for t, snippet in found:
+            print(describe(t) + (f"\n      {snippet}" if snippet else ""))
+        if not found:
+            print("no task matches", file=sys.stderr)
+            return 1
+    elif args.cmd in ("archive", "unarchive"):
+        try:
+            for tid in args.id:
+                db.archive(conn, tid, args.cmd == "archive")
+                print(f"{args.cmd}d #{tid}")
+        except (LookupError, ValueError) as e:
+            print(str(e).strip("'\""), file=sys.stderr)
+            return 1
     elif args.cmd == "show":
         t = db.get(conn, args.id)
         if not t:

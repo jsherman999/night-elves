@@ -1,6 +1,6 @@
 """SQLite queue and spend ledger."""
 from __future__ import annotations
-import json, sqlite3
+import json, re, sqlite3
 from datetime import datetime, timezone
 from pathlib import Path
 
@@ -26,7 +26,8 @@ CREATE TABLE IF NOT EXISTS tasks (
   criteria TEXT,                             -- "done when": what the result must satisfy
   session TEXT,                              -- "<backend> <id>" of the agent session to resume
   needs TEXT,                                -- auto tier: agent | web | answer, decided once
-  secs REAL                                  -- wall-clock seconds spent on it, all attempts
+  secs REAL,                                 -- wall-clock seconds spent on it, all attempts
+  archived INTEGER NOT NULL DEFAULT 0        -- 1 = off the recent list; the result is kept
 );
 CREATE INDEX IF NOT EXISTS tasks_status ON tasks(status, priority, id);
 CREATE TABLE IF NOT EXISTS spend (
@@ -59,7 +60,8 @@ def connect(path: str) -> sqlite3.Connection:
     cols = {r[1] for r in conn.execute("PRAGMA table_info(tasks)")}
     for col, kind in (("run_after", "TEXT"), ("images", "TEXT"), ("files", "TEXT"),
                       ("criteria", "TEXT"), ("session", "TEXT"),  # before 0.2/0.4/0.5/0.7
-                      ("needs", "TEXT"), ("secs", "REAL")):  # before 0.9
+                      ("needs", "TEXT"), ("secs", "REAL"),  # before 0.9
+                      ("archived", "INTEGER NOT NULL DEFAULT 0")):
         if col not in cols:
             conn.execute(f"ALTER TABLE tasks ADD COLUMN {col} {kind}")
     scols = {r[1] for r in conn.execute("PRAGMA table_info(spend)")}
@@ -148,7 +150,52 @@ def cancel(conn, task_id: int) -> None:
 def requeue(conn, task_id: int) -> None:
     """Back into the queue with fresh attempts: for failed, cancelled or finished tasks."""
     change(conn, task_id, ("failed", "cancelled", "done"), status="queued", attempts=0,
-           last_error=None)
+           last_error=None, archived=0)
+
+def archive(conn, task_id: int, on: bool = True) -> None:
+    """Take a finished, failed or cancelled task off the recent list (or put it back). Its row,
+    result file and workspace stay, so it can still be searched for and referenced."""
+    t = get(conn, task_id)
+    if t is None:
+        raise LookupError(f"no task #{task_id}")
+    if on and t["status"] not in ("done", "failed", "cancelled"):
+        raise ValueError(f"#{task_id} hasn't finished, so it can't be archived")
+    conn.execute("UPDATE tasks SET archived=? WHERE id=?", (int(on), task_id))  # not updated_at:
+    conn.commit()                                                 # that is when it finished
+
+MAX_SEARCH = 2 * 2**20  # bytes of each result file that a search reads
+
+def search(conn, query: str, results: str | Path | None = None, limit: int = 50) -> list:
+    """Tasks whose prompt or result contains every word of the query, any case, newest first,
+    archived ones included. Returns [(task, snippet)]: the snippet is the result text around
+    the first word found there, or "" when only the prompt matched. With `results`, only
+    result files inside that folder are read."""
+    words = query.lower().split()
+    if not words:
+        return []
+    root = Path(results).expanduser().resolve() if results else None
+    out = []
+    for t in conn.execute("SELECT * FROM tasks ORDER BY id DESC").fetchall():
+        body = ""
+        if t["result_path"]:
+            p = Path(t["result_path"]).resolve()
+            if (root is None or p.is_relative_to(root)) and p.is_file():
+                with open(p, errors="replace") as f:
+                    body = f.read(MAX_SEARCH)
+        hay = (t["prompt"] + "\n" + body).lower()
+        if not all(w in hay for w in words):
+            continue
+        hits = [m for w in words if (m := re.search(re.escape(w), body, re.I))]
+        snippet = ""
+        if hits:
+            m = min(hits, key=lambda m: m.start())
+            a, b = max(0, m.start() - 60), min(len(body), m.end() + 100)
+            snippet = (("…" if a else "") + " ".join(body[a:b].split())
+                       + ("…" if b < len(body) else ""))
+        out.append((t, snippet))
+        if len(out) >= limit:
+            break
+    return out
 
 def claim(conn, task_id: int, status: str) -> bool:
     """Start work on a task, unless it was cancelled or edited away since it was picked."""
@@ -171,7 +218,11 @@ def next_task(conn, skip=(), now: str | None = None, due_only=False):
         " ORDER BY run_after IS NULL, priority, id LIMIT 1",
         (now or iso(), *skip)).fetchone()
 
-def list_tasks(conn, status=None, limit=50):
+def list_tasks(conn, status=None, limit=50, archived=None):
+    """archived: True for only archived tasks, False for only the others, None for both."""
+    if archived is not None:
+        return conn.execute("SELECT * FROM tasks WHERE archived=? ORDER BY id DESC LIMIT ?",
+                            (int(archived), limit)).fetchall()
     if status:
         return conn.execute("SELECT * FROM tasks WHERE status=? ORDER BY id DESC LIMIT ?",
                             (status, limit)).fetchall()

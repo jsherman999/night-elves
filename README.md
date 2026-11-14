@@ -92,6 +92,9 @@ elf add --from 9 "Using these 3B2 notes, build a quick-reference page"
 cat spec.md | elf add -
 elf list
 elf show 3
+elf search 3b2 emulator # tasks whose prompt or result has every word
+elf archive 3 4         # off the web page's recent list; results are kept
+elf unarchive 3
 elf budget              # mode, credit spent, tonight's allowance
 elf run --dry-run       # show how each queued task would be routed
 elf run                 # work the queue now
@@ -177,10 +180,12 @@ the token (HttpOnly, SameSite=Strict, Secure over HTTPS), so changing
 | `POST /tasks` `{"prompt", "priority", "tier", "at", "criteria", "from"}` | queue a task (`criteria`: done when; `from`: `"9, 12"` or `[9, 12]`) |
 | `POST /tasks` as `multipart/form-data`, same fields plus `files` | queue a task with files |
 | `GET /tasks` | the latest 100 tasks |
+| `GET /tasks?q=3b2+emulator` | tasks whose prompt or result has every word, each with a `snippet` |
 | `GET /tasks/<id>` | one task, with its result text and its files |
 | `GET /tasks/<id>/f/<n>` | its nth file (1-based) |
 | `POST /tasks/<id>` `{"action": "save", "prompt", "tier", "priority", "at", "criteria"}` | edit it (`"at": ""` clears the time) |
 | `POST /tasks/<id>` `{"action": "now" \| "cancel" \| "retry"}` | run it within a minute, cancel it, requeue it |
+| `POST /tasks/<id>` `{"action": "archive" \| "unarchive"}` | take a finished task off the recent list, or put it back |
 
 A change to a task a run has already started returns 409.
 
@@ -199,6 +204,22 @@ queue time, so rerunning task 9 later doesn't change it. As a text file it is
 pasted into the prompt for any tier, and an agent also gets it in `input/`. A
 task that has no result yet can't be referenced ("#9 has no result yet"), and
 results count towards the 200 KB of text a task can carry inline.
+
+### Finding and archiving past tasks
+
+To find the number of a task to build on, search by keyword: `elf search 3b2
+emulator`, the search box above the queue on the web page, or `GET
+/tasks?q=...`. A task matches when its prompt or its result file contains
+every word (case is ignored; the first 2 MB of each result is read). Matches
+are listed newest first with the text around the first hit.
+
+A finished, failed or cancelled task can be archived: the Archive button on
+its row under Recent or on its page, or `elf archive <id>`. That only takes it
+off the web page's recent list. The task, its result file and its workspace
+stay on disk, so it still turns up in searches (marked "archived"), still
+opens at `/t/<id>`, and still works with `--from` / `from #9:`. "Show archived
+tasks" under Recent lists them with an Unarchive button; running an archived
+task again also brings it back.
 
 ### Files and images
 
