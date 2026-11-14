@@ -3,16 +3,16 @@ import urllib.error, urllib.request
 from unittest import mock
 from datetime import date, datetime, timezone
 from http.server import ThreadingHTTPServer
-from elves import attachments, backends, cli, config, db, notify, pages, policy, web, when
+from elves import attachments, backends, cli, config, db, notify, pages, policy, web, webtools, when
 from elves.backends import BackendError, Command, Result
 from elves.dispatcher import Night, passed, plan_criteria
 
 class Fake:
     def __init__(self, reply="ok", usd=0.0, fail=0):
         self.reply, self.usd, self.fail, self.calls = reply, usd, fail, []
-    def run(self, prompt, system=None, cwd=None, files=(), args=()):
+    def run(self, prompt, system=None, cwd=None, files=(), args=(), web=False):
         self.calls.append((prompt, system))
-        self.cwd, self.files, self.args = cwd, list(files), list(args)
+        self.cwd, self.files, self.args, self.web = cwd, list(files), list(args), web
         if self.fail:
             self.fail -= 1
             raise BackendError("boom")
@@ -1340,6 +1340,168 @@ class SearchAndArchiveTests(Base):
         self.assertIn("WE 32100", got[0]["snippet"])
         code, out, _ = call("/tasks", json.dumps({"prompt": "use it", "from": n}).encode(), js)
         self.assertEqual(code, 201)  # an archived result can still be attached
+
+class LocalSearchTests(Base):
+    def serve(self, routes):
+        from http.server import BaseHTTPRequestHandler
+        class H(BaseHTTPRequestHandler):
+            def do_GET(self):
+                code, ctype, body, *extra = routes.get(self.path.split("?")[0], (404, "text/plain", b"no"))
+                self.send_response(code)
+                self.send_header("Content-Type", ctype)
+                self.send_header("Content-Length", str(len(body)))
+                for k, v in extra:
+                    self.send_header(k, v)
+                self.end_headers()
+                self.wfile.write(body)
+                H.seen.append(self.path)
+            def log_message(self, *a):
+                pass
+        H.seen = []
+        srv = ThreadingHTTPServer(("127.0.0.1", 0), H)
+        threading.Thread(target=srv.serve_forever, daemon=True).start()
+        self.addCleanup(srv.shutdown)
+        return f"http://127.0.0.1:{srv.server_port}", H.seen
+
+    def test_only_public_http_urls_are_fetched(self):
+        for bad in ("file:///etc/passwd", "ftp://example.com/x", "http://127.0.0.1:8377/",
+                    "http://localhost:1234/v1/models", "http://192.168.4.1/", "http://[::1]/",
+                    "http://169.254.169.254/latest", "http://10.0.0.5/", "notaurl"):
+            with self.assertRaises(webtools.Refused, msg=bad):
+                webtools.check_url(bad)
+        public = [(2, 1, 6, "", ("93.184.216.34", 443))]
+        with mock.patch.object(webtools.socket, "getaddrinfo", return_value=public):
+            self.assertEqual(webtools.check_url("https://example.com/a?b=1"), "https://example.com/a?b=1")
+        mixed = public + [(2, 1, 6, "", ("10.0.0.5", 443))]  # one private address is enough
+        with mock.patch.object(webtools.socket, "getaddrinfo", return_value=mixed):
+            with self.assertRaises(webtools.Refused):
+                webtools.check_url("https://rebind.example/")
+        s = webtools.Session("http://127.0.0.1:1")
+        self.assertIn("not on the public internet", s.call("fetch_page", '{"url": "http://127.0.0.1:8377/"}'))
+        self.assertEqual(s.opened, [])
+        with mock.patch.object(webtools, "check_url", side_effect=webtools.Refused("no")) as chk:
+            with self.assertRaises(webtools.Refused):  # each redirect is checked too
+                webtools._Redirects().redirect_request(None, None, 302, "", {}, "http://10.0.0.5/")
+        chk.assert_called_once_with("http://10.0.0.5/")
+
+    def test_html_becomes_text_with_links(self):
+        text = webtools.html_text(
+            "<html><head><title>T</title><style>p{}</style><script>evil()</script></head>"
+            "<body><h1>Files</h1><p>Get <a href='/pub/a.tar'>the  archive</a> &amp; more"
+            "<a href='javascript:x()'>js</a></p><table><tr><td>a</td><td>b</td></tr></table>",
+            "https://ex.org/dir/")
+        self.assertIn("[the archive](https://ex.org/pub/a.tar)", text)
+        self.assertIn("& more", text)
+        self.assertIn("a | b", text)
+        self.assertNotIn("evil", text)
+        self.assertNotIn("p{}", text)
+        self.assertNotIn("javascript:", text)
+
+    def test_search_fetch_paging_and_errors(self):
+        hits = {"results": [{"title": "3B2  notes", "url": "https://ex.org/3b2", "content": "WE 32100"},
+                            {"title": "Other", "url": "https://ex.org/o", "content": ""}]}
+        base, seen = self.serve({
+            "/search": (200, "application/json", json.dumps(hits).encode()),
+            "/long": (200, "text/html; charset=utf-8", b"<p>" + b"abcdefghij" * 300 + b"</p>"),
+            "/bin": (200, "application/zip", b"PK"),
+            "/hop": (302, "text/plain", b"", ("Location", "/long")),
+        })
+        s = webtools.Session(base, page_chars=1000)
+        out = s.call("web_search", '{"query": "3b2 cpu"}')
+        self.assertEqual(out, "1. 3B2 notes\n   https://ex.org/3b2\n   WE 32100\n2. Other\n   https://ex.org/o")
+        self.assertIn("q=3b2+cpu&format=json", seen[0])
+        self.assertIn("not on the public internet", s.call("fetch_page", {"url": base + "/long"}))
+        with mock.patch.object(webtools, "ALLOW_PRIVATE", True):
+            first = s.call("fetch_page", json.dumps({"url": base + "/long"}))
+            self.assertTrue(first.startswith("abcdefghij"))
+            self.assertIn("[Characters 0-1000 of 3000. To read on: fetch_page with start=1000.]", first)
+            last = s.call("fetch_page", {"url": base + "/long", "start": 2000})
+            self.assertEqual(last, "abcdefghij" * 100)  # the end: no note
+            self.assertEqual(seen.count("/long"), 1)  # reading on doesn't fetch again
+            self.assertIn("HTTP 404", s.call("fetch_page", {"url": base + "/gone"}))
+            self.assertIn("application/zip file of 2 bytes", s.call("fetch_page", {"url": base + "/bin"}))
+            self.assertTrue(s.call("fetch_page", {"url": base + "/hop"}).startswith("abcdefghij"))
+        self.assertIn("no tool named", s.call("rm", "{}"))
+        self.assertTrue(s.call("web_search", "not json").startswith("Error:"))
+        self.assertEqual(s.searches, ["3b2 cpu"])
+        self.assertEqual(s.opened, [base + "/long", base + "/hop"])
+        self.assertIn(f"ran 1 web search and opened 2 pages:*\n- <{base}/long>", s.note())
+        self.assertIn("didn't, so this answer is from its memory", webtools.Session(base).note())
+
+    def test_backend_runs_the_tool_loop(self):
+        def reply(content=None, calls=()):
+            m = {"content": content}
+            if calls:
+                m["tool_calls"] = [{"id": f"c{i}", "type": "function",
+                                    "function": {"name": n, "arguments": json.dumps(a)}}
+                                   for i, (n, a) in enumerate(calls)]
+            return {"choices": [{"message": m}], "usage": {"prompt_tokens": 5, "completion_tokens": 7}}
+        cfgb = {"model": "m", "base_url": "http://x/v1", "search_url": "http://s", "max_tool_uses": 3}
+        b = backends.OpenAICompat("local", cfgb)
+        ran = []
+        def tool(self, name, arguments):
+            ran.append((name, json.loads(arguments)))
+            self.opened.append("https://ex.org/3b2")
+            return f"result of {name}"
+        bodies = []
+        def post(url, headers, body, timeout):
+            bodies.append(json.loads(json.dumps(body)))  # a copy: the list grows afterwards
+            return replies.pop(0)
+        replies = [reply(calls=[("web_search", {"query": "3b2"})]),
+                   reply(calls=[("fetch_page", {"url": "https://ex.org/3b2"})]),
+                   reply("The 3B2 used the WE 32100.")]
+        with mock.patch.object(backends, "_post", side_effect=post), \
+                mock.patch.object(webtools.Session, "call", tool):
+            res = b.run("which cpu?", "Be brief.", web=True)
+        self.assertTrue(res.text.startswith("The 3B2 used the WE 32100.\n\n---\n*night-elves:"))
+        self.assertIn("- <https://ex.org/3b2>", res.text)
+        self.assertEqual((res.tokens_in, res.tokens_out), (15, 21))  # every turn counts
+        self.assertEqual(ran, [("web_search", {"query": "3b2"}), ("fetch_page", {"url": "https://ex.org/3b2"})])
+        self.assertEqual([t["function"]["name"] for t in bodies[0]["tools"]], ["web_search", "fetch_page"])
+        self.assertTrue(bodies[0]["messages"][0]["content"].startswith("Be brief.\n\nYou can search"))
+        self.assertEqual([m["role"] for m in bodies[2]["messages"]],
+                         ["system", "user", "assistant", "tool", "assistant", "tool"])
+        self.assertEqual(bodies[2]["messages"][3], {"role": "tool", "tool_call_id": "c0",
+                                                    "content": "result of web_search"})
+        # The budget: calls past it aren't run, and the model is made to answer.
+        ran.clear(); bodies.clear()
+        replies = [reply(calls=[("web_search", {"query": str(i)}) for i in range(4)]),
+                   reply("best I can do")]
+        with mock.patch.object(backends, "_post", side_effect=post), \
+                mock.patch.object(webtools.Session, "call", tool):
+            res = b.run("q", web=True)
+        self.assertEqual(len(ran), 3)
+        self.assertEqual(bodies[1]["messages"][-2]["content"], "Not run: the tool budget for this task is used up.")
+        self.assertEqual(bodies[1]["tool_choice"], "none")
+        self.assertTrue(res.text.startswith("best I can do"))
+        # Without web=True, or without a search_url, it is the plain single call.
+        for backend, kw in ((b, {}), (backends.OpenAICompat("l", {"model": "m", "base_url": "http://x/v1"}),
+                                      {"web": True})):
+            bodies.clear()
+            replies = [reply("plain")]
+            with mock.patch.object(backends, "_post", side_effect=post):
+                self.assertEqual(backend.run("q", **kw).text, "plain")
+            self.assertNotIn("tools", bodies[0])
+
+    def test_tasks_reach_a_local_model_that_can_search(self):
+        self.cfg["backends"]["local"]["search_url"] = "http://127.0.0.1:8888"
+        self.assertTrue(policy.local_search(self.cfg, "local"))
+        self.assertFalse(policy.local_search(self.cfg, "claude_api"))
+        self.assertFalse(policy.local_search(self.cfg, None))
+        web_task = db.add_task(self.conn, "latest news")
+        db.update(self.conn, web_task, needs="web")
+        night = self.night(3)  # conserve mode, API allowance left: Claude still goes first
+        night.run()
+        self.assertEqual(db.get(self.conn, web_task)["backend"], "claude_api")
+        self.cfg["budget"]["conserve_night_cap_usd"] = 0.0  # none left, and outside the CLI's hours
+        self.cfg["backends"]["claude_cli"]["window"] = [1, 2]
+        later = db.add_task(self.conn, "more news")
+        db.update(self.conn, later, needs="web")
+        plain = db.add_task(self.conn, "explain TCP", tier="local")
+        night = self.night(3, hour=9)
+        night.run()
+        self.assertEqual([db.get(self.conn, t)["backend"] for t in (later, plain)], ["local", "local"])
+        self.assertTrue(self.fakes["local"].web)  # the executor was told it may search
 
 class PushTests(Base):
     def git(self, *args, cwd=None):

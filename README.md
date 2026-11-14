@@ -37,9 +37,11 @@ In every mode:
   local model (`roles.classifier`; `"off"` turns it off). One that needs tools
   (clone, build, test, change or push code, make files or media) becomes an agent
   task. One that needs current information from the web goes to `claude_api`,
-  which searches and fetches pages itself (`server_tools`), and waits for tonight's
-  allowance rather than let a local model answer from memory. The rest are routed
-  as below. The task page says what it was sized up as.
+  which searches and fetches pages itself (`server_tools`). When Claude has no
+  allowance left tonight, the task goes to the local model if that can search
+  (see [Local web search](#local-web-search)); if it can't, the task waits rather
+  than be answered from memory. The rest are routed as below. The task page says
+  what it was sized up as.
 - A task can say when it's done (`--done-when`). The executor, the reviewer and
   the agent are all held to it; without one, the planner writes some.
 - A task that fails locally twice is escalated to the frontier model. Failing
@@ -204,6 +206,39 @@ queue time, so rerunning task 9 later doesn't change it. As a text file it is
 pasted into the prompt for any tier, and an agent also gets it in `input/`. A
 task that has no result yet can't be referenced ("#9 has no result yet"), and
 results count towards the 200 KB of text a task can carry inline.
+
+### Local web search
+
+A local model answers from memory unless it is given a way to look things up.
+Point its backend at a [SearXNG](https://docs.searxng.org/) instance with JSON
+output enabled, and night-elves offers the model two tools whenever it carries
+out a task (not when it plans, reviews or sizes one up):
+
+```toml
+[backends.local]
+search_url = "http://127.0.0.1:8888"
+max_tool_uses = 12      # searches plus pages per task; then it must answer
+page_chars = 12000      # of a page per call; the model can ask for the next part
+```
+
+- `web_search` returns titles, URLs and snippets from SearXNG.
+- `fetch_page` downloads a page and returns its text with links kept, at most
+  3 MB of it. It only fetches http(s) URLs whose host, and every redirect's
+  host, resolves to public addresses, so a page can't steer the model into this
+  Mac's own services or the LAN. Files that aren't text (archives, PDFs) are
+  reported by type and size, not read.
+
+The model needs to support OpenAI-style tool calls through its server (LM Studio
+and Ollama both pass them through). Under each answer night-elves lists the
+pages that were actually opened, or says that the model didn't search, so you
+can tell a checked answer from a remembered one. This is in `elves/webtools.py`
+and uses only the standard library.
+
+Two limits to keep in mind. A small model reads and cross-checks less carefully
+than Claude, so treat its research as a draft. And the model reads untrusted
+pages while holding the task's text and attachments: it can't run anything, but
+a hostile page could in principle talk it into fetching a URL that carries some
+of that text. Don't give this tier secrets alongside open-ended browsing.
 
 ### Finding and archiving past tasks
 

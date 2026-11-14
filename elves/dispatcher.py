@@ -124,8 +124,8 @@ class Night:
         return name in self.backends and policy.available(
             name, self.cfg, self.conn, self.state(), self.period_start, self.now(), self.down)
 
-    def call(self, name, task_id, role, prompt, system, cwd=None, files=(), args=()):
-        kw = {k: v for k, v in (("cwd", cwd), ("files", files), ("args", args)) if v}
+    def call(self, name, task_id, role, prompt, system, cwd=None, files=(), args=(), web=False):
+        kw = {k: v for k, v in (("cwd", cwd), ("files", files), ("args", args), ("web", web)) if v}
         t0 = time.monotonic()
         def spent(res):
             db.record_spend(self.conn, name, task_id, role, res.tokens_in, res.tokens_out,
@@ -222,7 +222,8 @@ class Night:
             if task["feedback"]:
                 prompt += f"\n\nA previous attempt was rejected. Reviewer feedback:\n{task['feedback']}"
             answer = self.call(r.executor, tid, "execute", prompt, EXEC_SYS,
-                               cwd=str(cwd) if cwd else None, files=send)
+                               cwd=str(cwd) if cwd else None, files=send,
+                               web=policy.local_search(self.cfg, r.executor))
             review = ""
             if r.reviewer and self.ok(r.reviewer):
                 db.update(self.conn, tid, status="review")

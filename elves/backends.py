@@ -40,8 +40,9 @@ class OpenAICompat:
     """Any OpenAI-compatible server: Ollama, LM Studio, mlx_lm.server, llama.cpp."""
     def __init__(self, name, c):
         self.name, self.c = name, c
-    def run(self, prompt, system=None, files=()) -> Result:
-        """files: images, sent as data URLs, if the backend has vision = true."""
+    def run(self, prompt, system=None, files=(), web=False) -> Result:
+        """files: images, sent as data URLs, if the backend has vision = true. web: let the
+        model search and read pages (see webtools), when the backend has a search_url."""
         content = prompt
         if files:
             if not self.c.get("vision"):
@@ -58,20 +59,49 @@ class OpenAICompat:
                     raise BackendError(f"{self.name}: can't attach {p.name}: {e}") from e
                 content.append({"type": "image_url",
                                 "image_url": {"url": f"data:{media};base64,{data}"}})
+        session = None
+        if web and self.c.get("search_url"):
+            from . import webtools
+            session = webtools.Session(self.c["search_url"], self.c.get("page_chars", 12000))
+            system = f"{system}\n\n{webtools.SYSTEM}" if system else webtools.SYSTEM
         msgs = ([{"role": "system", "content": system}] if system else []) + \
                [{"role": "user", "content": content}]
         key = os.environ.get(self.c.get("api_key_env", ""), "none")
-        d = _post(self.c["base_url"].rstrip("/") + "/chat/completions",
-                  {"Authorization": f"Bearer {key}"},
-                  {"model": self.c["model"], "messages": msgs,
-                   "max_tokens": self.c.get("max_tokens", 4096)},
-                  self.c.get("timeout", 1800))
-        try:
-            text = (d["choices"][0]["message"]["content"] or "").strip()
-        except (KeyError, IndexError) as e:
-            raise BackendError(f"{self.name}: unexpected response {str(d)[:300]}") from e
-        u = d.get("usage") or {}
-        return Result(text, u.get("prompt_tokens", 0), u.get("completion_tokens", 0), 0.0)
+        body = {"model": self.c["model"], "messages": msgs,
+                "max_tokens": self.c.get("max_tokens", 4096)}
+        if session:
+            body["tools"] = webtools.TOOLS
+        budget = int(self.c.get("max_tool_uses", 12))
+        used = tin = tout = 0
+        while True:
+            d = _post(self.c["base_url"].rstrip("/") + "/chat/completions",
+                      {"Authorization": f"Bearer {key}"}, body, self.c.get("timeout", 1800))
+            try:
+                msg = d["choices"][0]["message"]
+                text = (msg.get("content") or "").strip()
+            except (KeyError, IndexError, TypeError, AttributeError) as e:
+                raise BackendError(f"{self.name}: unexpected response {str(d)[:300]}") from e
+            u = d.get("usage") or {}
+            tin += u.get("prompt_tokens", 0)
+            tout += u.get("completion_tokens", 0)
+            calls = msg.get("tool_calls") if session else None
+            if not calls or body.get("tool_choice") == "none":
+                break
+            msgs.append({"role": "assistant", "content": msg.get("content") or "",
+                         "tool_calls": calls})
+            for call in calls:
+                fn = call.get("function") or {}
+                used += 1
+                out = (session.call(fn.get("name", ""), fn.get("arguments"))
+                       if used <= budget else "Not run: the tool budget for this task is used up.")
+                msgs.append({"role": "tool", "tool_call_id": call.get("id", ""), "content": out})
+            if used >= budget:  # one more turn, to write the answer from what it has
+                body["tool_choice"] = "none"
+                msgs.append({"role": "user", "content": "That was the last tool call allowed. "
+                             "Write the finished result now from what you have found."})
+        if session and text:
+            text += session.note()
+        return Result(text, tin, tout, 0.0)
 
 class AnthropicAPI:
     """Claude API with a Console key; this is what spends the monthly API credit."""

@@ -78,6 +78,11 @@ def available(name, cfg, conn, state: State, run_start: str, now: datetime, down
                 and db.runs_since(conn, name, run_start) < c.get("max_runs_per_night", 5))
     return True
 
+def local_search(cfg: dict, name: str | None) -> bool:
+    """Whether this backend is a local model set up to search the web (see webtools)."""
+    c = cfg["backends"].get(name or "", {})
+    return c.get("type") == "openai_compat" and bool(c.get("search_url"))
+
 def route(task, cfg: dict, state: State, ok) -> Route | None:
     """ok(name) says whether a backend can be used right now. None = leave queued."""
     r, lim = cfg["roles"], cfg["limits"]
@@ -91,12 +96,14 @@ def route(task, cfg: dict, state: State, ok) -> Route | None:
     kinds = {f["kind"] for f in fs}
     needs = task["needs"] if "needs" in task.keys() else None
     if task["tier"] == "auto" and needs == "web" and "data" not in kinds:
-        # Only Claude can search the web (claude_api with server_tools); wait for it rather
-        # than let a local model answer from memory, unless no Claude backend is set up.
+        # Claude searches best (claude_api with server_tools). When it isn't available now, a
+        # local model that can search takes the task, below; one that can't would answer from
+        # memory, so the task waits for Claude instead, unless no Claude backend is set up.
         if frontier:
             return Route(None, frontier, None)
-        if any(cfg["backends"].get(n, {}).get("enabled", True) and n in cfg["backends"]
-               for n in (r["frontier_api"], r["frontier_sub"])):
+        if not (local and local_search(cfg, local)) and any(
+                cfg["backends"].get(n, {}).get("enabled", True) and n in cfg["backends"]
+                for n in (r["frontier_api"], r["frontier_sub"])):
             return None
     if "data" in kinds:  # only the agent can work on these; intake already insists on it
         return None

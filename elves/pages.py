@@ -96,8 +96,9 @@ TIER_HELP = {
     "auto": "Elves pick: usually the local model, with Claude planning and checking in the second "
             "half of the billing cycle. Images and PDFs go to the local vision model if there is "
             "one, else Claude. Tasks that fail locally twice go to Claude.",
-    "local": "Only the Studio's local models. Free, runs any time. Images and PDFs of up to 20 "
-             "pages go to the local vision model, if one is set up.",
+    "local": "Only the Studio's local models. Free, runs any time. Searches the web itself "
+             "when that is set up. Images and PDFs of up to 20 pages go to the local vision "
+             "model, if one is set up.",
     "frontier": "Claude does the whole task, in the overnight window while tonight's allowance lasts.",
     "agent": "An agent with tools in a sandbox: runs commands, writes files, builds small apps, "
              "works through big data files, and must pass its own check. The local agent goes "

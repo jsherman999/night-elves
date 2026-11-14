@@ -28,6 +28,9 @@ base_url = "http://localhost:11434/v1"   # Ollama; LM Studio is usually :1234/v1
 model = "your-local-model"
 max_tokens = 8192
 timeout = 3600
+# search_url = "http://127.0.0.1:8888"   # a SearXNG instance (JSON output on): the model can
+# max_tool_uses = 12                     # then search the web and read pages, this many
+# page_chars = 12000                     # calls per task, this much of a page at a time
 
 [backends.local_vision]                  # optional: a local model that can see images, used
 type = "openai_compat"                    # for images and PDFs of up to 20 pages (as page
