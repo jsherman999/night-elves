@@ -4,7 +4,7 @@ One read-only page built from the queue, the spend ledger and the log files besi
 web intake serves it at /dashboard to a signed-in browser; `[web] view_port` also serves it,
 and nothing else, to the local network behind its own token (see web.serve)."""
 from __future__ import annotations
-import fcntl, json, urllib.request
+import fcntl, json, re, urllib.request
 from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime, timedelta
 from html import escape as e
@@ -17,6 +17,54 @@ TASKS = 30
 LOG_LINES = 300    # of each log, from its end
 LOGS = ("nightly", "due", "web")  # <name>.log beside the queue; launchd writes them
 SLOTS = 8          # series colours; the backends past these share the last
+ITEMS = 40         # lines in a cost breakdown
+
+ROLE_TEXT = {
+    "local": "does ordinary tasks",
+    "frontier_api": "Claude for planning, checking and escalated tasks, paid from the API credit",
+    "frontier_sub": "Claude on the subscription, used when the API can't be (no allowance left tonight)",
+    "second_opinion": "reviews the local model's answers",
+    "agent": "the agent for hard agent tasks and ones the local agent failed",
+    "local_vision": "reads images and PDFs on this Mac",
+    "local_review": "reviews local answers when no other reviewer is free",
+    "local_agent": "tries agent tasks first",
+    "agent_review": "reads the local agent's work before it is accepted",
+    "agent_handoff": "leaves the next run a note when the local agent stops unfinished",
+    "agent_plan": "plans the local agent's work",
+    "classifier": "sizes up auto tasks as agent, web or answer",
+    "guide": "writes the guide when you press Guide / fix on a task",
+}
+
+def about(cfg: dict, name: str, roles: list[str]) -> str:
+    """What a backend is and how it is paid for, in a sentence or two."""
+    c = cfg["backends"].get(name)
+    if not c:
+        return "No longer in config.toml; its past runs are still in the ledger."
+    argv = c.get("argv", [])
+    if c.get("type") == "openai_compat":
+        what = (f"A model ({c.get('model') or 'unnamed'}) served on this Mac at "
+                f"{c.get('base_url', '?')}. It costs nothing and can run at any hour.")
+    elif c.get("type") == "anthropic_api":
+        what = (f"Claude ({c.get('model') or 'default model'}) through your Anthropic API key. Every "
+                f"call is billed per token against the ${cfg['budget']['monthly_credit_usd']:,.0f} "
+                "monthly API credit, within a nightly allowance. This is the only backend that "
+                "spends money.")
+    elif "opencode" in argv:
+        what = ("opencode driving a local model with tools, inside a sandbox. It costs nothing; a "
+                "run count and a time limit hold it back.")
+    elif "codex" in argv:
+        what = ("The Codex CLI on your ChatGPT plan. Nothing is billed per call: the plan's own "
+                "limits apply, and a run count here.")
+    elif "claude" in argv:
+        tools = "with tools, in a sandbox, " if name == cfg["roles"].get("agent") else ""
+        what = (f"Claude Code run from the command line {tools}on your claude.ai subscription. "
+                "Nothing is billed per call: “unbilled” is what its tokens would have cost at API "
+                "prices. Its hours and a run count hold it back instead.")
+    else:
+        what = "A command-line tool that takes a prompt and prints an answer. Not billed per call."
+    if not c.get("enabled", True):
+        what += " It is switched off in config.toml."
+    return what
 
 CSS = """
 :root{--s1:#2a78d6;--s2:#eb6834;--s3:#1baf7a;--s4:#eda100;--s5:#e87ba4;--s6:#008300;--s7:#6250d6;
@@ -29,12 +77,21 @@ CSS = """
 .tile .v{font-size:1.5em;font-weight:650;line-height:1.25;overflow-wrap:anywhere}
 .tile .s{font-size:.8em;color:var(--mute)}
 .scroll{overflow-x:auto;padding:0}
-table.d{border-collapse:collapse;width:100%;font-size:.86em}
-table.d th,table.d td{padding:6px 10px;border-top:1px solid var(--line);text-align:left;
+table.d{border-collapse:collapse;width:100%;font-size:.8em}
+table.d th,table.d td{padding:5px 8px;border-top:1px solid var(--line);text-align:left;
 vertical-align:top;white-space:nowrap}
+table.d .s2{display:block;font-size:.92em;color:var(--mute);white-space:normal}
+.tile.click{cursor:pointer}.tile.click:hover,.tile.click:focus-visible{border-color:var(--accent);outline:0}
+.tile .more{font-size:.75em;color:var(--accent);margin-top:2px}
+dialog{background:var(--card);color:var(--ink);border:1px solid var(--line);border-radius:12px;padding:0;
+width:min(860px,94vw);max-height:86vh}dialog::backdrop{background:rgba(0,0,0,.5)}
+dialog>div{padding:16px 18px}dialog h3{margin:0 0 .3em;font-size:1.1em}
+dialog h4{margin:1em 0 .3em;font-size:.8em;text-transform:uppercase;letter-spacing:.06em;color:var(--mute)}
+dialog p{font-size:.88em;margin:.3em 0 .6em}dialog ul{font-size:.88em;margin:.3em 0;padding-left:1.3em}
+dialog form{margin:.9em 0 0;text-align:right}dialog form button{width:auto;padding:6px 18px}
 table.d tr:first-child th{border-top:0;color:var(--mute);font-weight:600;font-size:.9em}
 table.d td.n,table.d th.n{text-align:right;font-variant-numeric:tabular-nums}
-table.d td.w{white-space:normal;min-width:16em;overflow-wrap:anywhere}
+table.d td.w{white-space:normal;min-width:12em;overflow-wrap:anywhere}
 .sw{display:inline-block;width:10px;height:10px;border-radius:3px;margin-right:6px;vertical-align:-1px}
 .legend{display:flex;flex-wrap:wrap;gap:4px 14px;font-size:.82em;color:var(--mute);margin:.2em 0 .6em}
 .charts{display:grid;grid-template-columns:repeat(auto-fit,minmax(320px,1fr));gap:10px}
@@ -61,13 +118,19 @@ if(!t){tip.style.display='none';return}tip.textContent=t.getAttribute('data-tip'
 var x=ev.clientX+14,y=ev.clientY+14,w=tip.offsetWidth,h=tip.offsetHeight;
 if(x+w>innerWidth-8)x=ev.clientX-w-14;if(y+h>innerHeight-8)y=ev.clientY-h-14;
 tip.style.left=Math.max(4,x)+'px';tip.style.top=Math.max(4,y)+'px'});
+document.addEventListener('click',function(ev){var t=ev.target.closest&&ev.target.closest('[data-open]');
+if(t){ev.preventDefault();var g=document.getElementById(t.getAttribute('data-open'));
+if(g&&g.showModal){tip.style.display='none';g.showModal()}return}
+if(ev.target.tagName==='DIALOG')ev.target.close()});
+document.addEventListener('keydown',function(ev){var t=ev.target;
+if((ev.key==='Enter'||ev.key===' ')&&t.matches&&t.matches('.tile[data-open]')){ev.preventDefault();t.click()}});
 var f=document.getElementById('logfilter');
 function filt(){var q=f.value.toLowerCase();document.querySelectorAll('.logs pre').forEach(function(p){
 if(!p.dataset.all)p.dataset.all=p.textContent;
 p.textContent=q?p.dataset.all.split('\\n').filter(function(l){return l.toLowerCase().indexOf(q)>=0}).join('\\n'):p.dataset.all})}
 if(f){f.addEventListener('input',filt)}
 document.querySelectorAll('.logs pre').forEach(function(p){p.scrollTop=p.scrollHeight});
-setInterval(function(){if(document.hidden||(f&&f.value)||scrollY>80)return;location.reload()},60000)})();
+setInterval(function(){if(document.hidden||(f&&f.value)||scrollY>80||document.querySelector('dialog[open]'))return;location.reload()},60000)})();
 """
 
 def _ping(url: str) -> bool:
@@ -139,10 +202,36 @@ def gather(cfg: dict, conn, now: datetime | None = None, ping=True) -> dict:
                     "SELECT backend, COUNT(*), SUM(tokens_in), SUM(tokens_out), SUM(secs), SUM(usd),"
                     " SUM(COALESCE(est_usd, usd)) FROM spend WHERE ts>=? GROUP BY backend", (since,))}
     by = {"today": totals(today), "week": totals(week), "cycle": totals(state.cycle_start)}
-    for t in by.values():  # backends since removed from the config still have history
+    first = midnight - timedelta(days=DAYS - 1)
+    # Backends since removed from the config still have history, in the totals or the charts.
+    for t in (*by.values(), totals(db.iso(first))):
         names += [n for n in t if n not in names]
 
-    first = midnight - timedelta(days=DAYS - 1)
+    def itemize(since: str, amount: str) -> list:
+        """What added money to a bucket: one line per task, backend and kind of call."""
+        return conn.execute(
+            f"SELECT s.task_id, s.backend, s.role, COUNT(*) AS calls, SUM({amount}) AS usd, "
+            "MAX(s.ts) AS ts, SUM(s.secs) AS secs, t.prompt FROM spend s "
+            f"LEFT JOIN tasks t ON t.id=s.task_id WHERE s.ts>=? AND {amount}>0 "
+            "GROUP BY s.task_id, s.backend, s.role ORDER BY usd DESC", (since,)).fetchall()
+    items = {"api": itemize(state.cycle_start, "s.usd"),
+             "sub": itemize(today, "(COALESCE(s.est_usd, s.usd) - s.usd)")}
+    roles: dict[str, list[str]] = {}
+    for role, name in cfg["roles"].items():
+        if role == "classifier":  # "" = the local model sizes tasks up; "off" = nobody does
+            name = None if name == "off" else name or cfg["roles"]["local"]
+        if name:
+            roles.setdefault(name, []).append(role)
+    by_role: dict[str, list] = {}
+    for r in conn.execute(
+            "SELECT backend, COALESCE(role, '') AS role, COUNT(*) AS calls, SUM(secs) AS secs, "
+            "SUM(usd) AS usd, SUM(COALESCE(est_usd, usd)) AS est FROM spend WHERE ts>=? "
+            "GROUP BY backend, role ORDER BY calls DESC", (db.iso(first),)):
+        by_role.setdefault(r["backend"], []).append(r)
+    recent = {n: conn.execute(
+        "SELECT s.ts, s.task_id, s.role, s.secs, s.usd, s.est_usd, t.prompt FROM spend s "
+        "LEFT JOIN tasks t ON t.id=s.task_id WHERE s.backend=? ORDER BY s.rowid DESC LIMIT 8",
+        (n,)).fetchall() for n in names}
     days = [(first + timedelta(days=i)).date() for i in range(DAYS)]
     daily = {d: {} for d in days}
     for ts, backend, secs, usd, est in conn.execute(
@@ -197,7 +286,32 @@ def gather(cfg: dict, conn, now: datetime | None = None, ping=True) -> dict:
         "tasks": tasks, "usage": db.usage(conn, [t["id"] for t in tasks]), "runs": runs,
         "running": run_in_progress(cfg), "services": services(cfg) if ping else [],
         "logs": {n: tail(home / f"{n}.log") for n in LOGS},
+        "items": items,
+        "detail": {n: {"about": about(cfg, n, roles.get(n, [])), "roles": roles.get(n, []),
+                       "by_role": by_role.get(n, []), "recent": recent.get(n, [])} for n in names},
     }
+
+def task_log(cfg: dict, tid: int, lines: int = 80) -> list[str]:
+    """The lines of the launchd logs that name this task, oldest first, each marked with its
+    log. A line that follows one of the task's lines and belongs to no task (the rest of a
+    long error) is kept with it."""
+    home, mine, out = Path(cfg["paths"]["db"]).parent, re.compile(rf"#{tid}(?!\d)"), []
+    other = re.compile(r"\s*#\d|night-elves |API credit|intake #|\S+ \"(GET|POST) ")
+    for name in LOGS:
+        on = False
+        for line in tail(home / f"{name}.log", 100000, 2 * 2**20).splitlines():
+            if mine.search(line):
+                on = True
+            elif on and (other.match(line) or not line.strip()):
+                on = False
+            if on:
+                out.append(f"{name}: {line}")
+    return out[-lines:]
+
+def task_calls(conn, tid: int) -> list:
+    """The ledger's lines for one task, oldest first."""
+    return conn.execute("SELECT ts, backend, role, tokens_in, tokens_out, usd, est_usd, secs "
+                        "FROM spend WHERE task_id=? ORDER BY rowid", (tid,)).fetchall()
 
 def _slot(names: list[str], name: str) -> int:
     return min(names.index(name), SLOTS - 1) + 1 if name in names else SLOTS
@@ -254,24 +368,56 @@ def chart(d: dict, key: str, title: str, sub: str, fmt, div: float = 1) -> str:
 def _money(v: float) -> str:
     return f"${v:,.2f}" if v >= 0.005 or v == 0 else "<$0.01"
 
+def _task_cost(u: dict | None) -> str:
+    if not u:
+        return "-"
+    sub = u["est"] - u["usd"]
+    parts = ([_money(u["usd"])] if u["usd"] >= 0.005 else []) + ([f"≈{_money(sub)}"] if sub >= 0.005 else [])
+    return " + ".join(parts) or "-"
+
 def _mins(secs: float) -> str:
     return pages.duration(secs) or "0s"
 
-def _cost_cells(t: dict | None) -> str:
+def _pair(t: dict | None) -> str:
+    """A cost cell: what was billed, and under it what was not."""
     if not t:
-        return "<td class=n>0</td><td class=n>-</td><td class=n>-</td><td class=n>-</td><td class=n>-</td>"
+        return "<td class=n>-</td>"
     sub = t["est"] - t["usd"]
-    return (f"<td class=n>{t['calls']:,}</td><td class=n>{pages.tokens(t['in'])} / {pages.tokens(t['out'])}</td>"
-            f"<td class=n>{e(_mins(t['secs']))}</td><td class=n>{e(_money(t['usd']))}</td>"
-            f"<td class=n>{e(_money(sub)) if sub >= 0.005 else '-'}</td>")
+    return (f"<td class=n>{e(_money(t['usd']))}"
+            + (f"<span class=s2>+{e(_money(sub))} unbilled</span>" if sub >= 0.005 else "") + "</td>")
 
-def render(d: dict, links: bool = True, msg: str | None = None) -> str:
-    """links: whether task numbers link to their pages (the view-only server has none)."""
+def _dialog(ident: str, title: str, inner: str) -> str:
+    return (f"<dialog id={ident} aria-label='{e(title)}'><div><h3>{e(title)}</h3>{inner}"
+            "<form method=dialog><button class=quiet autofocus>Close</button></form></div></dialog>")
+
+def _items(rows, task_ref, empty: str, note: str) -> str:
+    """A cost breakdown: the biggest lines first, the small ones summed at the end."""
+    if not rows:
+        return f"<p>{e(empty)}</p>"
+    total = sum(r["usd"] for r in rows)
+    out = []
+    for r in rows[:ITEMS]:
+        n = f" ×{r['calls']}" if r["calls"] > 1 else ""
+        out.append(f"<tr><td class=n>{e(_money(r['usd']))}</td><td>{task_ref(r['task_id'])}</td>"
+                   f"<td>{e(r['backend'])} {e(r['role'] or '')}{n}</td>"
+                   f"<td>{pages.local(r['ts']):%a %b} {pages.local(r['ts']).day} {pages.local(r['ts']):%H:%M}</td>"
+                   f"<td class=w>{e(' '.join((r['prompt'] or 'no task').split())[:80])}</td></tr>")
+    if len(rows) > ITEMS:
+        rest = rows[ITEMS:]
+        out.append(f"<tr><td class=n>{e(_money(sum(r['usd'] for r in rest)))}</td>"
+                   f"<td colspan=4>{len(rest)} smaller items</td></tr>")
+    return (f"<p>{e(note)}</p><div class=scroll><table class=d><tr><th class=n>Cost<th>Task<th>What ran"
+            f"<th>Last call<th>Task prompt</tr>{''.join(out)}"
+            f"<tr><td class=n><b>{e(_money(total))}</b></td><td colspan=4><b>total</b></td></tr></table></div>")
+
+def render(d: dict, links: bool = True, msg: str | None = None, tasks: bool = True) -> str:
+    """links: this is the full site, with the queue to go back to (the view-only server has
+    none). tasks: whether task numbers link to task pages."""
     st, now, names = d["state"], d["now"], d["names"]
     def task_ref(tid) -> str:
         if tid is None:
             return "-"
-        return f"<a href=/t/{tid}>#{tid}</a>" if links else f"#{tid}"
+        return f"<a href=/t/{tid}>#{tid}</a>" if tasks else f"#{tid}"
 
     active = d["active"]
     if active:
@@ -287,22 +433,36 @@ def render(d: dict, links: bool = True, msg: str | None = None) -> str:
     calls = sum(t["calls"] for t in today.values())
     secs = sum(t["secs"] for t in today.values())
     sub_today = sum(t["est"] - t["usd"] for t in today.values())
+    more = "<div class=more>What added to this ›</div>"
     tiles = [
-        ("Now", doing),
+        ("Now", doing, ""),
         ("Queue", f"<div class=v>{c.get('queued', 0)} waiting</div><div class=s>today: "
-                  f"{fin.get('done', 0)} done, {fin.get('failed', 0)} failed</div>"),
-        ("Model calls today", f"<div class=v>{calls:,}</div><div class=s>{e(_mins(secs))} of model time</div>"),
+                  f"{fin.get('done', 0)} done, {fin.get('failed', 0)} failed</div>", ""),
+        ("Model calls today", f"<div class=v>{calls:,}</div><div class=s>{e(_mins(secs))} of model time</div>", ""),
         ("API credit", f"<div class=v>{e(_money(st.spent))}</div><div class=s>of ${st.credit:,.0f} this "
                        f"cycle · {st.days_left} days left<br>today {e(_money(st.tonight_spent))} of "
-                       f"{e(_money(st.tonight_allowance))} · {e(st.mode)}</div>"),
+                       f"{e(_money(st.tonight_allowance))} · {e(st.mode)}</div>{more}", "dlg-api"),
         ("Subscription work today", f"<div class=v>{e(_money(sub_today))}</div>"
-                                    "<div class=s>at API prices; not billed</div>"),
+                                    f"<div class=s>at API prices; not billed</div>{more}", "dlg-sub"),
     ]
+    def tile(k, v, dlg):
+        click = f" click' data-open={dlg} role=button tabindex=0 aria-haspopup=dialog" if dlg else "'"
+        return f"<div class='tile{click}><div class=k>{e(k)}</div>{v}</div>"
     body = ["<div class=bar><h1 style='margin:0;flex:1'>night-elves dashboard</h1>",
             f"<span>as of {now:%a %b} {now.day}, {now:%H:%M:%S}</span>",
             "<a href=/>Queue</a>" if links else "", "</div>",
-            "<div class=tiles style='margin-top:12px'>"
-            + "".join(f"<div class=tile><div class=k>{e(k)}</div>{v}</div>" for k, v in tiles) + "</div>"]
+            "<div class=tiles style='margin-top:12px'>" + "".join(tile(*t) for t in tiles) + "</div>"]
+    dialogs = [
+        _dialog("dlg-api", f"API credit used this cycle: {_money(st.spent)}", _items(
+            d["items"]["api"], task_ref, "Nothing has been billed to the API credit this cycle.",
+            f"Money actually charged to the Anthropic API key since {pages.local(st.cycle_start):%b} "
+            f"{pages.local(st.cycle_start).day}. Only the API backend spends it; each line is one "
+            "task's calls of one kind.")),
+        _dialog("dlg-sub", f"Subscription work today: {_money(sub_today)}", _items(
+            d["items"]["sub"], task_ref, "No subscription runs today.",
+            "Not charged. This is what today's runs on flat-rate plans (Claude Code on the "
+            "claude.ai subscription) would have cost at API prices, from their token counts.")),
+    ]
 
     if d["services"]:
         body.append("<p class=bar style='margin:.8em 0 0'>" + "".join(
@@ -321,23 +481,60 @@ def render(d: dict, links: bool = True, msg: str | None = None) -> str:
                 + "</div>")
 
     rows = []
-    for b in d["backends"]:
+    for i, b in enumerate(d["backends"]):
         n = b["name"]
         cls = {"ready": "ok", "waiting": "idle", "off": "idle", "removed": "idle"}[b["state"]]
         mark = {"ready": "✓ ready", "waiting": "… waiting", "off": "– off", "removed": "– removed"}[b["state"]]
-        rows.append(f"<tr><td><i class=sw style='background:var(--s{_slot(names, n)})'></i><b>{e(n)}</b></td>"
-                    f"<td class={cls}>{mark}</td><td>{e(b['model'] or b['type'])}</td><td>{e(b['limit'])}</td>"
-                    + _cost_cells(d["by"]["today"].get(n))
-                    + "".join(f"<td class=n>{e(_money(d['by'][k][n]['usd'])) if n in d['by'][k] else '-'}</td>"
-                              f"<td class=n>{e(_money(d['by'][k][n]['est'] - d['by'][k][n]['usd'])) if n in d['by'][k] else '-'}</td>"
-                              for k in ("week", "cycle")) + "</tr>")
-    body.append("<h2>Backends</h2><div class='card scroll'><table class=d><tr><th>Backend<th>Status<th>Model"
-                "<th>Limits<th class=n>Calls today<th class=n>Tokens in / out<th class=n>Time"
-                "<th class=n>Billed<th class=n>Not billed<th class=n>7 days billed<th class=n>not billed"
-                "<th class=n>Cycle billed<th class=n>not billed</tr>" + "".join(rows) + "</table></div>"
-                "<p class=hint>Billed is API credit. Not billed is what subscription runs would have "
-                "cost at API prices. Waiting means outside its hours, out of runs, or out of tonight's "
-                "allowance.</p>")
+        t = d["by"]["today"].get(n)
+        rows.append(
+            f"<tr><td><i class=sw style='background:var(--s{_slot(names, n)})'></i>"
+            f"<a href=#dlg-b{i} data-open=dlg-b{i} aria-haspopup=dialog><b>{e(n)}</b></a>"
+            f"<span class='s2 {cls}'>{mark}</span></td>"
+            f"<td class=w>{e(b['model'] or b['type'])}<span class=s2>{e(b['limit'])}</span></td>"
+            + (f"<td class=n>{t['calls']:,}</td><td class=n>{pages.tokens(t['in'])} / {pages.tokens(t['out'])}</td>"
+               f"<td class=n>{e(_mins(t['secs']))}</td>" if t else "<td class=n>0</td><td class=n>-</td><td class=n>-</td>")
+            + "".join(_pair(d["by"][k].get(n)) for k in ("today", "week", "cycle")) + "</tr>")
+        det = d["detail"][n]
+        inner = f"<p>{e(det['about'])}</p>"
+        if det["roles"]:
+            inner += "<h4>What it is used for</h4><ul>" + "".join(
+                f"<li><b>{e(r)}</b>: {e(ROLE_TEXT.get(r, 'a role in config.toml'))}</li>"
+                for r in det["roles"]) + "</ul>"
+        if b["limit"]:
+            inner += f"<h4>Limits</h4><p>{e(b['limit'])}</p>"
+        inner += ("<h4>Totals</h4><div class=scroll><table class=d><tr><th>Period<th class=n>Calls"
+                  "<th class=n>Tokens in / out<th class=n>Time<th class=n>Cost</tr>")
+        for k, label in (("today", "Today"), ("week", "7 days"), ("cycle", "This billing cycle")):
+            v = d["by"][k].get(n)
+            inner += (f"<tr><td>{label}</td>" + (
+                f"<td class=n>{v['calls']:,}</td><td class=n>{pages.tokens(v['in'])} / {pages.tokens(v['out'])}</td>"
+                f"<td class=n>{e(_mins(v['secs']))}</td>{_pair(v)}" if v else
+                "<td class=n>0</td><td class=n>-</td><td class=n>-</td><td class=n>-</td>") + "</tr>")
+        inner += "</table></div>"
+        if det["by_role"]:
+            inner += (f"<h4>What it did, last {DAYS} days</h4><div class=scroll><table class=d><tr><th>Kind of call"
+                      "<th class=n>Calls<th class=n>Time<th class=n>Cost</tr>" + "".join(
+                          f"<tr><td>{e(r['role'] or '-')}</td><td class=n>{r['calls']:,}</td>"
+                          f"<td class=n>{e(_mins(r['secs'] or 0))}</td>"
+                          + _pair({"usd": r["usd"] or 0.0, "est": r["est"] or 0.0}) + "</tr>"
+                          for r in det["by_role"]) + "</table></div>")
+        if det["recent"]:
+            inner += ("<h4>Latest calls</h4><div class=scroll><table class=d><tr><th>Ended<th>Task<th>Kind"
+                      "<th class=n>Time<th>Task prompt</tr>" + "".join(
+                          f"<tr><td>{pages.local(r['ts']):%a %H:%M}</td><td>{task_ref(r['task_id'])}</td>"
+                          f"<td>{e(r['role'] or '')}</td><td class=n>{e(pages.duration(r['secs']) or '-')}</td>"
+                          f"<td class=w>{e(' '.join((r['prompt'] or '').split())[:70])}</td></tr>"
+                          for r in det["recent"]) + "</table></div>")
+        else:
+            inner += "<p>It has not run yet.</p>"
+        dialogs.append(_dialog(f"dlg-b{i}", n, inner))
+    body.append("<h2>Backends</h2><div class='card scroll'><table class=d><tr><th>Backend<th>Model and limits"
+                "<th class=n>Calls today<th class=n>Tokens in / out<th class=n>Time"
+                "<th class=n>Cost today<th class=n>7 days<th class=n>Cycle</tr>" + "".join(rows) + "</table></div>"
+                "<p class=hint>A cost is money billed to the API credit. “+$x unbilled” under it is what "
+                "subscription runs would have cost at API prices; nobody was charged that. Waiting means "
+                "outside its hours, out of runs, or out of tonight's allowance. Click a backend's name "
+                "for what it is and what it has done.</p>")
 
     rows = []
     for t in d["tasks"]:
@@ -349,11 +546,14 @@ def render(d: dict, links: bool = True, msg: str | None = None) -> str:
                     f"</span></td><td>{e(t['tier'])}</td><td>{e(t['backend'] or '-')}</td>"
                     f"<td>{pages.local(t['updated_at']):%a %H:%M}</td><td class=n>{e(tries or '-')}</td>"
                     f"<td class=n>{e(pages.duration(t['secs']) or '-')}</td>"
-                    f"<td class=n>{e(_money(u['est'])) if u and u['est'] >= 0.005 else '-'}</td>"
+                    f"<td class=n>{e(_task_cost(u))}</td>"
                     f"<td class=w>{e(' '.join(t['prompt'].split())[:110])}{err}</td></tr>")
     body.append("<h2>Tasks, most recently changed</h2><div class='card scroll'><table class=d><tr><th>Task"
                 "<th>Status<th>Tier<th>Backend<th>Changed<th class=n>Failed tries<th class=n>Time"
-                "<th class=n>Cost<th>Prompt and last error</tr>" + "".join(rows) + "</table></div>")
+                "<th class=n>Cost<th>Prompt and last error</tr>" + "".join(rows) + "</table></div>"
+                "<p class=hint>Cost: a plain figure was billed to the API credit; ≈ marks what "
+                "subscription runs would have cost at API prices, which was not billed."
+                + (" Click a task's number for its details." if tasks else "") + "</p>")
 
     rows = []
     for r in d["runs"]:
@@ -379,6 +579,7 @@ def render(d: dict, links: bool = True, msg: str | None = None) -> str:
     if not links:
         body.append("<form method=post action=/logout><button class=quiet style='max-width:12em'>"
                     "Sign out</button></form>")
+    body.append("".join(dialogs))
     body.append(f"<div id=tip role=tooltip></div><style>{CSS}</style><script>{JS}</script>")
     return pages.page("Elves dashboard", "".join(body), msg)
 

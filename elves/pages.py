@@ -61,6 +61,12 @@ max-width:18em;overflow-wrap:break-word}
 .imgs img{width:100%;height:160px;object-fit:cover;object-position:top;border-radius:9px;
 border:1px solid var(--line);background:var(--card);display:block}
 .use{font-size:.85em;color:var(--mute);margin:.2em 0}.use b{color:var(--ink);font-weight:600}
+.scroll{overflow-x:auto;padding:0}table.t{border-collapse:collapse;width:100%;font-size:.82em}
+table.t th,table.t td{padding:5px 9px;border-top:1px solid var(--line);text-align:left;white-space:nowrap}
+table.t tr:first-child th{border-top:0;color:var(--mute);font-weight:600}
+table.t .n{text-align:right;font-variant-numeric:tabular-nums}
+pre.log{max-height:24em;overflow:auto;font-size:12px}
+.guide{border-left:3px solid var(--accent);padding-left:12px;margin:.4em 0 .8em}
 @media (min-width:900px){main{max-width:min(1400px,94vw);padding:24px 32px 64px}
 .home{display:grid;grid-template-columns:minmax(300px,24em) minmax(0,1fr);gap:28px;align-items:start}
 .home>form{position:sticky;top:16px}.home h2:first-child{margin-top:.2em}
@@ -241,8 +247,56 @@ def row(t, u=None, act: str | None = None, snippet: str | None = None) -> str:
             f"<button class='quiet mini' aria-label='{act.capitalize()} #{t['id']}'>"
             f"{act.capitalize()}</button></form></div>")
 
+def run_details(t, detail: dict) -> str:
+    """The record of a task's runs: each model call, the reviewer's or check's feedback, and
+    the log lines that name the task."""
+    out = ""
+    if calls := detail.get("calls"):
+        rows = []
+        for c in calls:
+            est = c["est_usd"] if c["est_usd"] is not None else c["usd"]
+            price = (f"${c['usd']:.2f}" if c["usd"] >= 0.005 else f"≈${est:.2f}" if est and est >= 0.005
+                     else "-")
+            rows.append(f"<tr><td>{local(c['ts']):%a %b %d %H:%M}</td><td>{e(c['backend'])}</td>"
+                        f"<td>{e(c['role'] or '')}</td><td class=n>{tokens(c['tokens_in'])} / "
+                        f"{tokens(c['tokens_out'])}</td><td class=n>{e(duration(c['secs']) or '-')}</td>"
+                        f"<td class=n>{e(price)}</td></tr>")
+        out += ("<h2>Model calls</h2><div class='card scroll'><table class=t><tr><th>Ended<th>Backend"
+                "<th>Kind<th class=n>Tokens in / out<th class=n>Time<th class=n>Cost</tr>"
+                + "".join(rows) + "</table></div><p class=hint>A plain cost was billed to the API "
+                "credit; ≈ is what a subscription run would have cost at API prices, not billed.</p>")
+    if t["feedback"]:
+        out += (f"<h2>Feedback on the last attempt</h2><div class=card><pre>{e(t['feedback'])}</pre></div>")
+    if detail.get("plan"):
+        out += f"<h2>The manager's plan</h2><div class=card><pre>{e(detail['plan'])}</pre></div>"
+    log = detail.get("log") or []
+    out += ("<h2>Log lines for this task</h2><div class=card><pre class=log>"
+            + (e("\n".join(log)) or "Nothing in the logs names this task.") + "</pre></div>")
+    return out
+
+def guide_block(tid: int, g: dict | None) -> str:
+    """What a Guide / fix has found so far (see guide.py)."""
+    if not g:
+        return ""
+    who = e(g.get("backend") or "the guide")
+    if g["state"] == "pending":
+        return (f"<p class=msg role=status>{who} is reading this run. The guide appears here when "
+                "it is written; this page checks every few seconds.</p>"
+                "<script>setTimeout(function(){location.replace(location.pathname)},6000)</script>")
+    if g["state"] == "failed":
+        return f"<p class=err>The guide could not be written ({who}): {e(g.get('error') or 'no reason given')}</p>"
+    text = (f"<div class=guide><p><b>Guide from {who}.</b> {e(g.get('diagnosis') or '')}</p>"
+            + ("<p class=mute>Its suggested instructions are in the box below; change them as you "
+               "like before sending.</p>" if g.get("instructions")
+               else "<p class=mute>It suggested no further instructions.</p>") + "</div>")
+    return text
+
 def task(t, result: str | None, msg: str | None = None, raw: bool = False, shots=(),
-         usage=None) -> str:
+         usage=None, detail: dict | None = None, guide: dict | None = None,
+         readonly: bool = False, elsewhere: str = "") -> str:
+    """detail: {"calls", "log", "plan"} for the run-details sections. guide: the task's Guide /
+    fix, if one was asked for. readonly: the page the view-only listener serves, with nothing
+    to press and no files; elsewhere is the full site's address, to point to."""
     tid, status = t["id"], t["status"]
     facts = [f"tier {t['tier']}", f"priority {t['priority']}", f"from {t['source']}",
              f"added {local(t['created_at']):%a %b %d %H:%M}"]
@@ -266,6 +320,19 @@ def task(t, result: str | None, msg: str | None = None, raw: bool = False, shots
         head += f"<p><b>Done when:</b> {e(t['criteria'])}</p>"
     if t["last_error"]:
         head += f"<p class=err>Last error: {e(t['last_error'])}</p>"
+    if readonly:
+        if n := len(attachments.files(t)):
+            head += f"<p class=mute>{n} attached file{'s' if n > 1 else ''} (not shown at this address).</p>"
+        body = head + f"<h2>Prompt</h2><div class=card><pre>{e(t['prompt'])}</pre></div>"
+        where = (f"<a href='{e(elsewhere.rstrip('/'))}/t/{tid}'>{e(elsewhere.rstrip('/'))}/t/{tid}</a>"
+                 if elsewhere else "the Tailscale address")
+        body += (f"<p class=hint>This address only shows. To resubmit this task with more "
+                 f"instructions, ask for a guide, or change it, open {where}.</p>")
+        body += run_details(t, detail or {})
+        if result is not None:
+            body += f"<h2>Result</h2><div class='card md'>{md.render(result)}</div>"
+        body += "<p><a href=/>&larr; Dashboard</a></p>"
+        return page(f"Task {tid}", body, msg)
     if fs := attachments.files(t):
         imgs = [i for i, f in enumerate(fs, 1) if f["kind"] == "image"]
         if imgs:
@@ -313,6 +380,21 @@ def task(t, result: str | None, msg: str | None = None, raw: bool = False, shots
     if status in db.ACTIVE:
         acts.append("<p class=mute>A run is working on this task, so it can't be changed.</p>")
     body += f"<div class=acts>{''.join(acts)}</div>"
+    if status not in db.ACTIVE:
+        ran = bool(result or t["last_error"] or t["feedback"])
+        again = "Add these instructions" if status == "queued" else "Resubmit with these instructions"
+        body += ("<h2>Run it again with more instructions</h2>" + guide_block(tid, guide)
+                 + f"""<form method=post action=/tasks/{tid} class=card>
+<input type=hidden name=action value=resubmit>
+<label for=extra>Added to the end of the prompt. An agent carries on in the same workspace.</label>
+<textarea id=extra name=extra rows=6 required placeholder="What should it do differently this time?">{e((guide or {}).get('instructions') or '')}</textarea>
+<button>{again}</button></form>""")
+        if ran and not (guide and guide["state"] == "pending"):
+            body += (f"<form method=post action=/tasks/{tid}><input type=hidden name=action value=guide>"
+                     "<button class=quiet>Guide / fix: have a frontier model read this run and "
+                     "suggest the instructions</button></form>")
+    if detail is not None:
+        body += run_details(t, detail)
     if result is not None:
         switch = (f"<a href=/t/{tid}>formatted</a>" if raw else f"<a href=/t/{tid}?raw=1>plain text</a>")
         shown = f"<pre>{e(result)}</pre>" if raw else md.render(result)
@@ -322,5 +404,5 @@ def task(t, result: str | None, msg: str | None = None, raw: bool = False, shots
         body += ("<h2>Images in the workspace</h2><div class=imgs>" + "".join(
             f"<a href=/t/{tid}/w/{e(quote(s))}><img src=/t/{tid}/w/{e(quote(s))} alt='{e(s)}' "
             f"title='{e(s)}' loading=lazy></a>" for s in shots) + "</div>")
-    body += "<p><a href=/>&larr; Queue</a></p>"
+    body += "<p><a href=/>&larr; Queue</a> · <a href=/dashboard>Dashboard</a></p>"
     return page(f"Task {tid}", body, msg)

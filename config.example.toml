@@ -145,6 +145,7 @@ agent_review = ""            # "codex": reads the local agent's work before it i
 agent_handoff = ""           # "codex": leaves the next run a note when a local agent run stops
 agent_plan = ""              # "codex": writes the plan the local agent follows
 classifier = ""              # sizes up auto tasks as agent / web / answer; "" = local, "off"
+guide = ""                   # writes a task's Guide / fix; "" = frontier_sub, else frontier_api
 
 [push]
 owners = []                  # GitHub owners an agent may push to, e.g. ["your-user"]; [] = none
@@ -158,6 +159,7 @@ max_upload_mb = 2048         # one task's files through the web intake
 public_url = ""              # e.g. "https://studio.tailnet-name.ts.net": digests then link each result
 # view_port = 8378           # the dashboard alone, read-only, for the local network (plain http);
 # view_host = "0.0.0.0"      # its sign-in is $ELVES_VIEW_TOKEN, never the main token
+# view_tasks = false         # there, a task's number opens its page to read; false leaves the dashboard alone
 
 [notify]
 # Command that receives the morning digest. "{text}" is replaced with the digest;

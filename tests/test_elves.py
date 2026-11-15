@@ -3,7 +3,7 @@ import urllib.error, urllib.request
 from unittest import mock
 from datetime import date, datetime, timedelta, timezone
 from http.server import ThreadingHTTPServer
-from elves import attachments, backends, cli, config, dash, db, notify, pages, policy, research, web, webtools, when
+from elves import attachments, backends, cli, config, dash, db, guide, notify, pages, policy, research, web, webtools, when
 from elves.backends import BackendError, Command, Result, SpentError, TimedOut
 from elves.dispatcher import Night, passed, plan_criteria
 
@@ -957,12 +957,118 @@ class DashboardTests(Base):
                      "✓ ready", "… waiting", "≈$1.50"):
             self.assertIn(part, page, part)
         self.assertNotIn("<b>logs", page)
-        view = dash.render(d, links=False)
+        view = dash.render(d, links=False, tasks=False)
         self.assertNotIn("href=/t/", view)
         self.assertNotIn("href=/>Queue", view)
+        self.assertIn("href=/t/", dash.render(d, links=False))
         self.assertEqual(json.loads(dash.to_json(d))["budget"]["cycle_spent"], 0.25)
         self.assertEqual([dash._nice(v) for v in (0, 0.03, 0.4, 3, 37, 180, 5400)],
                          [1.0, 0.05, 0.5, 5, 50, 200, 10000])
+
+    def test_breakdowns(self):
+        db.record_spend(self.conn, "claude_api", self.busy, "plan", 9000, 900, 1.25, secs=40,
+                        ts=db.iso(self.now.replace(hour=3)))
+        d = dash.gather(self.cfg, self.conn, self.now, ping=False)
+        # What added to each bucket, biggest first: billed API calls, and unbilled subscription work.
+        self.assertEqual([(r["task_id"], r["role"], round(r["usd"], 2)) for r in d["items"]["api"]],
+                         [(self.busy, "plan", 1.25), (self.done, "review", 0.25)])
+        self.assertEqual([(r["backend"], round(r["usd"], 2)) for r in d["items"]["sub"]],
+                         [("claude_agent", 1.5)])
+        det = d["detail"]
+        self.assertIn("costs nothing", det["local"]["about"])
+        self.assertIn("only backend that spends money", det["claude_api"]["about"])
+        self.assertIn("subscription", det["claude_agent"]["about"])
+        self.assertIn("No longer in config", det["gone"]["about"])
+        self.assertEqual(det["local"]["roles"], ["local"])  # the classifier is off in these tests
+        self.cfg["roles"]["classifier"] = ""  # "" = the local model sizes tasks up
+        again = dash.gather(self.cfg, self.conn, self.now, ping=False)
+        self.assertEqual(again["detail"]["local"]["roles"], ["local", "classifier"])
+        self.assertEqual([(r["role"], r["calls"]) for r in det["claude_api"]["by_role"]],
+                         [("plan", 1), ("review", 1)])
+        self.assertEqual(det["claude_agent"]["recent"][0]["task_id"], self.busy)
+        page = dash.render(d)
+        for part in ("data-open=dlg-api", "<dialog id=dlg-api", "API credit used this cycle: $1.50",
+                     "claude_api plan", "<dialog id=dlg-sub", "Subscription work today: $1.50",
+                     "data-open=dlg-b0", "<dialog id=dlg-b0", "does ordinary tasks",
+                     "+$1.50 unbilled", "What it did, last 14 days"):
+            self.assertIn(part, page, part)
+        self.assertNotIn("7 days billed", page)  # the wide table's columns are gone
+        json.loads(dash.to_json(d))
+
+    def test_task_page_details_resubmit_and_guide(self):
+        tid = db.add_task(self.conn, "port the app", tier="agent")
+        db.update(self.conn, tid, status="failed", backend="local_agent", attempts=3,
+                  last_error="not accepted: rejected by the reviewer (codex):",
+                  feedback="FAIL\ninv.py ignores --low", session="local_agent abc")
+        db.record_spend(self.conn, "local_agent", tid, "execute", 50000, 900, 0.0, secs=300)
+        db.record_spend(self.conn, "codex", tid, "review", 70000, 500, 0.0, secs=25)
+        open(os.path.join(self.tmp, "nightly.log"), "a").write(
+            f"#{tid} plan=None exec=local_agent review=None\n"
+            f"  #{tid} -> failed: local_agent: exit 1: first line\nrest of that error\n"
+            f"#{tid}9 plan=None exec=local review=None\n")
+        self.assertEqual(dash.task_log(self.cfg, tid), [
+            f"nightly: #{tid} plan=None exec=local_agent review=None",
+            f"nightly:   #{tid} -> failed: local_agent: exit 1: first line",
+            "nightly: rest of that error"])
+        t = db.get(self.conn, tid)
+        detail = web.task_detail(self.cfg, self.conn, tid)
+        page = pages.task(t, None, detail=detail)
+        for part in ("Model calls", "<td>codex</td><td>review</td>", "inv.py ignores --low",
+                     "rest of that error", "name=action value=resubmit", "name=action value=guide",
+                     "Resubmit with these instructions", "href=/dashboard"):
+            self.assertIn(part, page, part)
+        # The view-only page shows the same record and has nothing to press.
+        view = pages.task(t, None, detail=detail, readonly=True, elsewhere="https://studio.ts.net/")
+        self.assertIn("inv.py ignores --low", view)
+        self.assertIn("href='https://studio.ts.net/t/%d'" % tid, view)
+        self.assertNotIn("<form", view)
+        self.assertNotIn("<button", view)
+
+        # Guide: a frontier model reads the record and proposes the instructions.
+        self.cfg["roles"]["guide"] = "claude_cli"
+        seen = Fake("DIAGNOSIS: It never handled --low.\nINSTRUCTIONS:\nAdd --low to inv.py, then test it.")
+        with self.assertRaises(ValueError):  # nothing to read yet
+            guide.start(self.cfg, self.conn, db.get(self.conn, db.add_task(self.conn, "new")), None,
+                        {"claude_cli": seen}, thread=False)
+        msg = guide.start(self.cfg, self.conn, t, "## Result\nhalf done", {"claude_cli": seen},
+                          thread=False)
+        self.assertIn("claude_cli is reading", msg)
+        for part in ("port the app", "inv.py ignores --low", "half done", "rest of that error",
+                     "codex review"):
+            self.assertIn(part, seen.calls[0][0], part)
+        g = guide.read(self.cfg, tid)
+        self.assertEqual((g["state"], g["diagnosis"], g["instructions"]),
+                         ("done", "It never handled --low.", "Add --low to inv.py, then test it."))
+        self.assertEqual(self.conn.execute(
+            "SELECT role FROM spend WHERE task_id=? ORDER BY rowid DESC", (tid,)).fetchone()[0], "guide")
+        page = pages.task(t, None, detail=detail, guide=g)
+        self.assertIn("It never handled --low.", page)
+        self.assertIn(">Add --low to inv.py, then test it.</textarea>", page)
+        guide.write(self.cfg, tid, state="pending", backend="claude_cli", started=time.time())
+        self.assertIn("setTimeout", pages.task(t, None, detail=detail, guide=guide.read(self.cfg, tid)))
+        self.assertIn("already being written", guide.start(self.cfg, self.conn, t, "x", {}, thread=False))
+        # By default Claude on the subscription writes it, whatever its hours; the API only
+        # while tonight's allowance lasts.
+        self.cfg["roles"]["guide"] = ""
+        self.assertEqual(guide.pick(self.cfg, self.conn, {"claude_cli": 1, "claude_api": 1}), "claude_cli")
+        self.assertEqual(guide.pick(self.cfg, self.conn, {"claude_api": 1}), "claude_api")
+        self.cfg["budget"]["conserve_night_cap_usd"] = self.cfg["budget"]["per_night_cap_usd"] = 0
+        self.assertIsNone(guide.pick(self.cfg, self.conn, {"claude_api": 1}))
+
+        # Resubmit: back in the queue, fresh attempts, the instructions on the end of the
+        # prompt, the session kept, the guide used up.
+        with self.assertRaises(ValueError):
+            web.act(self.cfg, self.conn, tid, {"action": "resubmit", "extra": "  "})
+        msg = web.act(self.cfg, self.conn, tid, {"action": "resubmit", "extra": "Add --low to inv.py."})
+        t = db.get(self.conn, tid)
+        self.assertIn("in the queue with your instructions", msg)
+        self.assertEqual((t["status"], t["attempts"], t["session"]), ("queued", 0, "local_agent abc"))
+        self.assertTrue(t["prompt"].startswith("port the app\n\nMore instructions, added "))
+        self.assertTrue(t["prompt"].endswith(":\nAdd --low to inv.py."))
+        self.assertIsNone(guide.read(self.cfg, tid))
+        self.assertIn("Add these instructions", pages.task(t, None, detail=detail))
+        with self.assertRaises(ValueError):  # not while a run is working on it
+            web.act(self.cfg, self.conn, self.busy, {"action": "resubmit", "extra": "x"})
 
     def test_served_to_the_signed_in_and_read_only_to_the_lan(self):
         class NoRedirect(urllib.request.HTTPRedirectHandler):
@@ -1007,12 +1113,34 @@ class DashboardTests(Base):
             code, page, _ = lan("/dashboard", headers={"Cookie": seen})
             self.assertEqual(code, 200)
             self.assertIn("night-elves dashboard", page)
-            self.assertNotIn("href=/t/", page)
-            # Nothing else is there: no queue, no task pages, no intake, and no way in with
-            # the main site's cookie.
-            for path in ("/tasks", f"/t/{self.done}", "/dashboard.json"):
+            # A task's page is there to read, with nothing to press; not without signing in.
+            self.assertIn(f"href=/t/{self.done}>", page)
+            code, one, _ = lan(f"/t/{self.done}", headers={"Cookie": seen})
+            self.assertEqual(code, 200)
+            self.assertIn("Log lines for this task", one)
+            self.assertNotIn("<form", one)
+            self.assertIn("View token", lan(f"/t/{self.done}")[1])
+            self.assertEqual(lan("/t/999", headers={"Cookie": seen})[0], 404)
+            # Nothing else is there: no queue, no intake, no files, no changes, and no way in
+            # with the main site's cookie.
+            for path in ("/tasks", f"/tasks/{self.done}", f"/t/{self.done}/f/1", "/dashboard.json"):
                 self.assertEqual(lan(path, headers={"Cookie": seen})[0], 404, path)
             self.assertEqual(lan("/tasks", b"prompt=x&token=view-token-1234", form)[0], 404)
+            self.assertEqual(lan(f"/tasks/{self.done}", b"action=resubmit&extra=x",
+                                 {**form, "Cookie": seen})[0], 404)
+            self.assertEqual(db.get(self.conn, self.done)["status"], "done")
+            # The main site's task page has the details and both new buttons, and they work.
+            code, one, _ = main(f"/t/{self.done}", headers={"Cookie": cookie})
+            self.assertIn("name=action value=resubmit", one)
+            self.assertIn("Model calls", one)
+            code, _, h = main(f"/tasks/{self.done}", b"action=resubmit&extra=shorter+please",
+                              {**form, "Cookie": cookie})
+            self.assertEqual((code, db.get(self.conn, self.done)["status"]), (303, "queued"))
+            self.assertIn("shorter please", db.get(self.conn, self.done)["prompt"])
+            self.cfg["web"]["view_tasks"] = False
+            off = start(web.make_view_handler(self.cfg, "view-token-1234"))
+            self.assertEqual(off(f"/t/{self.done}", headers={"Cookie": seen})[0], 404)
+            self.assertNotIn("href=/t/", off("/dashboard", headers={"Cookie": seen})[1])
             self.assertIn("View token", lan("/dashboard", headers={"Cookie": cookie})[1])
             self.assertEqual(main("/dashboard", headers={"Cookie": seen})[0], 303)
             self.assertEqual(lan("/login", b"token=view-token-1234",

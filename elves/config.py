@@ -29,14 +29,16 @@ DEFAULTS = {
               "agent_plan": "",     # writes the plan the local agent follows
               "agent_review": "",   # reads work whose check passed, before it is accepted
               "agent_handoff": "",  # writes a note for the next run when one stops unfinished
-              "classifier": ""},  # sizes up auto tasks (agent, web or answer); "" = local, "off"
+              "classifier": "",  # sizes up auto tasks (agent, web or answer); "" = local, "off"
+              "guide": ""},  # writes a task's Guide / fix; "" = frontier_sub, else frontier_api
     "push": {"owners": []},  # GitHub owners an agent's PUSH may go to; [] = no pushes
     "backends": {},
     "web": {"host": "127.0.0.1", "port": 8377, "token_env": "ELVES_TOKEN", "sms_allow": [],
             "max_upload_mb": 2048,  # one task's files, sent through the web intake
             "public_url": "",  # e.g. the Tailscale address; digests link each result there
             # The dashboard alone, read-only, for the local network: off while view_port is 0.
-            "view_host": "0.0.0.0", "view_port": 0, "view_token_env": "ELVES_VIEW_TOKEN"},
+            "view_host": "0.0.0.0", "view_port": 0, "view_token_env": "ELVES_VIEW_TOKEN",
+            "view_tasks": True},  # whether that listener also shows a task's page, read-only
     "notify": {"argv": []},
 }
 

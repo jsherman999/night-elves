@@ -224,12 +224,30 @@ for what the elves are doing and what it costs:
 - **Model runs:** time, cost and calls per day for the last 14 days, by backend
   (hover or tap a day for its numbers).
 - **Backends:** whether each can run now and why not (its hours, its runs for
-  today, tonight's allowance), with today's calls, tokens and time, and money
-  billed and not billed for today, 7 days and the billing cycle.
+  today, tonight's allowance), with today's calls, tokens and time, and its
+  cost for today, 7 days and the billing cycle.
 - **Tasks** most recently changed, with failed tries, time, cost and last error.
+  A task's number opens its page.
 - **Model calls:** the latest 80 lines of the ledger.
 - **Logs:** the end of `nightly.log`, `due.log` and `web.log` (the files launchd
   writes beside the queue), with a filter box.
+
+Three things open a breakdown when clicked:
+
+- **API credit** lists what was charged this cycle: one line per task and kind
+  of call, biggest first.
+- **Subscription work today** lists the same for today's runs that were not
+  charged.
+- **A backend's name** says what that backend is, how it is paid for and which
+  roles it fills, with its totals, what kinds of calls it made in the last 14
+  days, and its latest calls.
+
+There are two kinds of cost on the page, and only one of them is money you
+paid. A plain figure was billed to the API credit; only the `anthropic_api`
+backend (`claude_api`) does that. A figure marked "unbilled" or "≈" is what a
+run on a flat-rate plan (`claude -p` on the claude.ai subscription) would have
+cost at API prices, worked out from its token counts; nobody was charged it.
+Local models cost nothing.
 
 It reloads each minute while it is in front and scrolled to the top.
 `/dashboard.json` gives the figures to a script with the bearer token.
@@ -251,7 +269,39 @@ That listener speaks plain http, so it has a token of its own
 LAN unencrypted can only read the dashboard, while the token that can queue
 work, and so run agents, stays on loopback and Tailscale. The page shows the
 start of each task's prompt and the logs, so it still asks for the sign-in.
-There are no task pages, results, files or changes at that address.
+A task's number opens its page there too, to read only: the prompt, the model
+calls, the log lines and the result, with no files and nothing to press.
+`view_tasks = false` leaves that out, and the address then shows the dashboard
+alone. Queueing, changing and resubmitting tasks, and asking for a guide, are
+at the Tailscale address only.
+
+### A task's page, resubmitting, and Guide / fix
+
+`/t/<id>` shows a task's run in full: each model call (backend, kind, tokens,
+time, cost), the feedback on its last attempt (a reviewer's, or its failed
+check's), the lines of the logs that name it, the manager's plan if there is
+one, and the result.
+
+**Run it again with more instructions** takes text and adds it to the end of
+the prompt under a dated "More instructions" heading, then puts the task back
+in the queue with fresh attempts (a task still waiting just gets the text). An
+agent task keeps its workspace and its session, so it carries on from its
+earlier work rather than starting over. It runs with the nightly run; **Run
+now** starts it within a minute.
+
+**Guide / fix** asks a frontier model to work out those instructions. It is
+given the task, its outcome, errors, feedback, model calls, log lines and the
+result, and replies with a short diagnosis for you and instructions written to
+the model that will redo the task. The page shows the diagnosis and puts the
+instructions in the box, where you can change them before sending; nothing is
+resubmitted until you press the button. The guide is written in the
+background and the page picks it up when it is ready.
+
+`roles.guide` names the backend that writes guides. Left empty, it is Claude
+on the subscription (`roles.frontier_sub`), and failing that the API while
+tonight's allowance lasts. Because you asked for it, a command backend's hours
+and nightly run count don't hold a guide back, but the call is in the ledger
+(kind `guide`), so it counts towards that backend's runs for the day.
 
 ### Using an earlier task's result
 

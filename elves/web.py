@@ -7,7 +7,7 @@ from pathlib import Path
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from urllib.parse import parse_qs, quote, unquote, urlparse
 import threading
-from . import attachments, dash, db, pages, policy, when
+from . import attachments, dash, db, guide, pages, policy, when
 
 MAX_BODY = 64 * 1024
 MAX_FIELD = 1024 * 1024  # a non-file field of a multipart upload (the prompt)
@@ -131,10 +131,51 @@ ICON_PATHS = {"/icon.png", "/apple-touch-icon.png", "/apple-touch-icon-precompos
 CSP = ("default-src 'none'; img-src 'self'; style-src 'unsafe-inline'; script-src 'unsafe-inline'; "
        "form-action 'self'; frame-ancestors 'none'; base-uri 'none'")
 
+def result_text(cfg: dict, t) -> str | None:
+    """A task's result file, as much of it as a page shows; None when there isn't one."""
+    if not t["result_path"]:
+        return None
+    results = Path(cfg["paths"]["results"]).expanduser().resolve()
+    p = Path(t["result_path"]).resolve()
+    if not p.is_relative_to(results) or not p.is_file():
+        return None
+    with open(p, errors="replace") as f:
+        text = f.read(MAX_RESULT + 1)
+    return text[:MAX_RESULT] + ("\n\n[cut short; the rest is in the file]"
+                                if len(text) > MAX_RESULT else "")
+
+def task_detail(cfg: dict, conn, tid: int) -> dict:
+    """What a task's page shows about its runs: ledger lines, log lines, the manager's plan."""
+    plan = Path(cfg["paths"]["work"]) / f"{tid}.plan.md"
+    try:
+        text = plan.read_text(errors="replace").partition("\n")[2].strip()  # after its mark
+    except OSError:
+        text = ""
+    return {"calls": dash.task_calls(conn, tid), "log": dash.task_log(cfg, tid), "plan": text}
+
 def act(cfg: dict, conn, tid: int, d: dict) -> str:
-    """One change to a task from the web: save (edit fields), now, cancel, retry, archive or
-    unarchive."""
+    """One change to a task from the web: save (edit fields), now, cancel, retry, archive,
+    unarchive, resubmit (put it back with more instructions) or guide (ask a frontier model
+    what those instructions should be)."""
     action = d.get("action") or "save"
+    if action in ("resubmit", "guide"):
+        t = db.get(conn, tid)
+        if t is None:
+            raise LookupError(f"no task #{tid}")
+        if action == "guide":
+            return guide.start(cfg, conn, t, result_text(cfg, t))
+        extra = str(d.get("extra") or "").strip()
+        if not extra:
+            raise ValueError("write the instructions to add first")
+        now = datetime.now()
+        prompt = (f"{t['prompt'].rstrip()}\n\nMore instructions, added {now:%b} {now.day} "
+                  f"{now:%H:%M}:\n{extra}")
+        if t["status"] != "queued":
+            db.requeue(conn, tid)  # refuses a task that a run is working on
+        db.change(conn, tid, ("queued",), vision=attachments.local_vision(cfg), prompt=prompt)
+        guide.clear(cfg, tid)
+        return (f"#{tid} is in the queue with your instructions added; it runs tonight, or "
+                "press Run now")
     if action == "cancel":
         db.cancel(conn, tid)
         return f"Cancelled #{tid}"
@@ -286,15 +327,7 @@ def make_handler(cfg: dict, token: str):
                 shutil.copyfileobj(fh, self.wfile, CHUNK)
 
         def _result(self, t) -> str | None:
-            if not t["result_path"]:
-                return None
-            p = Path(t["result_path"]).resolve()
-            if not p.is_relative_to(results) or not p.is_file():
-                return None
-            with open(p, errors="replace") as f:
-                text = f.read(MAX_RESULT + 1)
-            return text[:MAX_RESULT] + ("\n\n[cut short; the rest is in the file]"
-                                        if len(text) > MAX_RESULT else "")
+            return result_text(cfg, t)
 
         def _work_image(self, tid: int, rel: str):
             p = attachments.work_image(cfg, tid, unquote(rel))
@@ -367,7 +400,9 @@ def make_handler(cfg: dict, token: str):
                     return self._send(200, {**task_json(t), "result": self._result(t), "usage": use})
                 raw = parse_qs(u.query).get("raw", [""])[0] == "1"
                 shots = attachments.work_images(cfg, t["id"]) if t["tier"] == "agent" else []
-                return self._send(200, pages.task(t, self._result(t), msg, raw, shots, use), HTML)
+                return self._send(200, pages.task(
+                    t, self._result(t), msg, raw, shots, use, task_detail(cfg, conn, t["id"]),
+                    guide.read(cfg, t["id"])), HTML)
             finally:
                 conn.close()
 
@@ -473,6 +508,7 @@ def make_view_handler(cfg: dict, token: str):
     listener speaks plain http, and its cookie is one that plain http will carry."""
     session = hmac.new(token.encode(), b"night-elves view session", hashlib.sha256).hexdigest()
     name = COOKIE + "_view"
+    tasks = bool(cfg["web"].get("view_tasks", True))
 
     class View(BaseHTTPRequestHandler):
         def _send(self, code, body, ctype=HTML, headers=()):
@@ -501,16 +537,25 @@ def make_view_handler(cfg: dict, token: str):
             path = urlparse(self.path).path
             if path in ICON_PATHS:
                 return self._send(200, ICON.read_bytes(), "image/png")
-            if path not in ("/", "/dashboard"):
+            m = re.fullmatch(r"/t/(\d+)", path) if tasks else None
+            if path not in ("/", "/dashboard") and not m:
                 return self._send(404, "not found", "text/plain")
             if not self._signed_in():
                 return self._send(200, dash.login())
             conn = db.connect(cfg["paths"]["db"])
             try:
+                if m:  # one task, to read: nothing here can change or queue anything
+                    t = db.get(conn, int(m.group(1)))
+                    if t is None:
+                        return self._send(404, "no such task", "text/plain")
+                    return self._send(200, pages.task(
+                        t, result_text(cfg, t), usage=db.usage(conn, [t["id"]]).get(t["id"]),
+                        detail=task_detail(cfg, conn, t["id"]), readonly=True,
+                        elsewhere=cfg["web"].get("public_url", "")))
                 d = dash.gather(cfg, conn)
             finally:
                 conn.close()
-            self._send(200, dash.render(d, links=False))
+            self._send(200, dash.render(d, links=False, tasks=tasks))
 
         def do_POST(self):
             path = urlparse(self.path).path
