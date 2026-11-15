@@ -133,10 +133,11 @@ class Setup:
             return "local"
         return "api" if c.get("type") == "anthropic_api" else "plan"
 
-    def tag(self, backend: str) -> str:
-        """`name (model)`, short enough for a box."""
-        m = self.model(backend)
-        return f"{backend[:18]} ({m})" if m else backend[:18]
+    def tag(self, backend: str, room: int = 40) -> str:
+        """`name (model)`, cut to the characters a box has room for."""
+        name = backend[:16]
+        m = self.model(backend)[:max(room - len(name) - 3, 0)]
+        return f"{name} ({m})" if m else name
 
     def hours(self, backend: str) -> str:
         c = self.backends.get(backend) or {}
@@ -197,7 +198,7 @@ def answers(s: Setup) -> Fig:
     if second:
         who = f"{second[:16]}; {spare[:16]} if it can't"
     else:
-        who = f"{spare[:18]} (a second model, if one is set)"
+        who = spare[:30]
     f.box(300, 456, 300, 52, ["A reviewer checks the answer", who],
           s.kind(second) if second else "local")
     f.ask(300, 552, 200, 80, ["PASS?"])
@@ -238,7 +239,7 @@ def agents(s: Setup) -> Fig:
     f.box(450, 34, 320, 44, ["An agent task", "work that needs tools, in its own workspace"], "end")
     f.ask(450, 132, 260, 92, [f"Priority 1-{hard}, or", f"{after} failed attempt{'' if after == 1 else 's'}?"])
     if ca:
-        f.box(775, 132, 260, 64, ["Claude's agent works on it", s.tag(ca), s.hours(ca)], s.kind(ca))
+        f.box(775, 132, 260, 64, ["Claude's agent works on it", s.tag(ca, 36), s.hours(ca)], s.kind(ca))
     else:
         f.box(775, 132, 260, 64, ["No Claude agent is set up", "the local agent keeps the task"], "fail")
     if la:
