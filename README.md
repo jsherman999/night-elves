@@ -211,6 +211,48 @@ the token (HttpOnly, SameSite=Strict, Secure over HTTPS), so changing
 
 A change to a task a run has already started returns 409.
 
+### Dashboard
+
+`/dashboard` on the web intake (there is a link under the queue) is one page
+for what the elves are doing and what it costs:
+
+- **Now:** the task being worked on and for how long, the queue, today's model
+  calls and model time, the API credit used this cycle and today, and what
+  today's subscription runs would have cost at API prices.
+- **Services:** whether the local model server, SearXNG and the browser reader
+  answer.
+- **Model runs:** time, cost and calls per day for the last 14 days, by backend
+  (hover or tap a day for its numbers).
+- **Backends:** whether each can run now and why not (its hours, its runs for
+  today, tonight's allowance), with today's calls, tokens and time, and money
+  billed and not billed for today, 7 days and the billing cycle.
+- **Tasks** most recently changed, with failed tries, time, cost and last error.
+- **Model calls:** the latest 80 lines of the ledger.
+- **Logs:** the end of `nightly.log`, `due.log` and `web.log` (the files launchd
+  writes beside the queue), with a filter box.
+
+It reloads each minute while it is in front and scrolled to the top.
+`/dashboard.json` gives the figures to a script with the bearer token.
+
+Over Tailscale it is part of the site, behind the same sign-in. For the local
+network there is a second listener that serves the dashboard and nothing else:
+
+```toml
+[web]
+view_port = 8378        # http://<the Mac's name or address>:8378
+```
+
+```sh
+echo "export ELVES_VIEW_TOKEN=$(openssl rand -base64 12)" >> ~/.night-elves/env
+```
+
+That listener speaks plain http, so it has a token of its own
+(`ELVES_VIEW_TOKEN`, at least 12 characters, not the main one): what crosses the
+LAN unencrypted can only read the dashboard, while the token that can queue
+work, and so run agents, stays on loopback and Tailscale. The page shows the
+start of each task's prompt and the logs, so it still asks for the sign-in.
+There are no task pages, results, files or changes at that address.
+
 ### Using an earlier task's result
 
 Every result is a Markdown file, `~/.night-elves/results/<id>.md` (an agent's

@@ -6,7 +6,8 @@ from http.cookies import SimpleCookie
 from pathlib import Path
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from urllib.parse import parse_qs, quote, unquote, urlparse
-from . import attachments, db, pages, policy, when
+import threading
+from . import attachments, dash, db, pages, policy, when
 
 MAX_BODY = 64 * 1024
 MAX_FIELD = 1024 * 1024  # a non-file field of a multipart upload (the prompt)
@@ -330,6 +331,17 @@ def make_handler(cfg: dict, token: str):
                     return self._send(200, pages.home(rows, msg, use, q, found, old), HTML)
                 finally:
                     conn.close()
+            if u.path in ("/dashboard", "/dashboard.json"):
+                as_json = u.path.endswith(".json")
+                if not (self._token_ok(None) if as_json else self._cookie_ok()):
+                    return self._send(401, {"error": "unauthorized"}) if as_json else self._redirect("/")
+                conn = db.connect(cfg["paths"]["db"])
+                try:
+                    d = dash.gather(cfg, conn)
+                finally:
+                    conn.close()
+                return (self._send(200, dash.to_json(d)) if as_json
+                        else self._send(200, dash.render(d, msg=msg), HTML))
             if u.path == "/tasks" or (m and m.group(1) == "tasks"):
                 if not self._token_ok(None):
                     return self._send(401, {"error": "unauthorized"})
@@ -455,10 +467,86 @@ def make_handler(cfg: dict, token: str):
             print(f"{self.address_string()} {line}", flush=True)
     return Handler
 
+def make_view_handler(cfg: dict, token: str):
+    """The dashboard and nothing else, read-only, for the local network. It has its own token,
+    so the one that can queue work (and so run agents) never crosses the LAN unencrypted: this
+    listener speaks plain http, and its cookie is one that plain http will carry."""
+    session = hmac.new(token.encode(), b"night-elves view session", hashlib.sha256).hexdigest()
+    name = COOKIE + "_view"
+
+    class View(BaseHTTPRequestHandler):
+        def _send(self, code, body, ctype=HTML, headers=()):
+            data = body if isinstance(body, bytes) else body.encode()
+            self.send_response(code)
+            for k, v in (("Content-Type", ctype), ("Content-Length", str(len(data))),
+                         ("Cache-Control", "no-store"), ("X-Content-Type-Options", "nosniff"),
+                         *((("Content-Security-Policy", CSP),) if ctype == HTML else ()), *headers):
+                self.send_header(k, v)
+            self.end_headers()
+            self.wfile.write(data)
+
+        def _signed_in(self) -> bool:
+            jar = SimpleCookie()
+            try:
+                jar.load(self.headers.get("Cookie", ""))
+            except Exception:
+                return False
+            m = jar.get(name)
+            return bool(m) and hmac.compare_digest(m.value.encode(), session.encode())
+
+        def _cookie(self, value: str, max_age: int) -> tuple[str, str]:
+            return ("Set-Cookie", f"{name}={value}; Path=/; Max-Age={max_age}; HttpOnly; SameSite=Strict")
+
+        def do_GET(self):
+            path = urlparse(self.path).path
+            if path in ICON_PATHS:
+                return self._send(200, ICON.read_bytes(), "image/png")
+            if path not in ("/", "/dashboard"):
+                return self._send(404, "not found", "text/plain")
+            if not self._signed_in():
+                return self._send(200, dash.login())
+            conn = db.connect(cfg["paths"]["db"])
+            try:
+                d = dash.gather(cfg, conn)
+            finally:
+                conn.close()
+            self._send(200, dash.render(d, links=False))
+
+        def do_POST(self):
+            path = urlparse(self.path).path
+            origin = self.headers.get("Origin")
+            same = origin is None or urlparse(origin).netloc == self.headers.get("Host")
+            n = min(int(self.headers.get("Content-Length") or 0), 4096)
+            d = {k: v[0] for k, v in parse_qs(self.rfile.read(n).decode(errors="replace")).items()}
+            if path == "/logout" and same:
+                return self._send(303, "", "text/plain", [("Location", "/"), self._cookie("", 0)])
+            if path != "/login":
+                return self._send(404, "not found", "text/plain")
+            supplied = d.get("token", "")
+            if same and hmac.compare_digest(supplied.encode(), token.encode()):
+                return self._send(303, "", "text/plain",
+                                  [("Location", "/"), self._cookie(session, 365 * 86400)])
+            time.sleep(1)
+            self._send(401, dash.login("That token didn't match."))
+
+        def log_message(self, fmt, *args):
+            print(f"view {self.address_string()} {(fmt % args).split('?')[0]}", flush=True)
+    return View
+
 def serve(cfg: dict) -> None:
     token = os.environ.get(cfg["web"]["token_env"], "")
     if len(token) < 16:
         raise SystemExit(f"Set {cfg['web']['token_env']} to a secret of at least 16 characters.")
+    if port := int(cfg["web"].get("view_port") or 0):
+        view = os.environ.get(cfg["web"]["view_token_env"], "")
+        if len(view) < 12 or view == token:
+            print(f"dashboard for the local network is off: set {cfg['web']['view_token_env']} to a "
+                  "secret of at least 12 characters, different from the main token", flush=True)
+        else:
+            lan = ThreadingHTTPServer((cfg["web"]["view_host"], port), make_view_handler(cfg, view))
+            threading.Thread(target=lan.serve_forever, daemon=True).start()
+            print(f"night-elves dashboard (read-only) on http://{cfg['web']['view_host']}:{port}",
+                  flush=True)
     addr = (cfg["web"]["host"], cfg["web"]["port"])
     print(f"night-elves intake on http://{addr[0]}:{addr[1]}")
     ThreadingHTTPServer(addr, make_handler(cfg, token)).serve_forever()

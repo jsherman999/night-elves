@@ -206,6 +206,7 @@ local vision model. Bigger or other kinds of files need agent.</p>
 {section("Waiting", waiting, "The queue is empty.")}
 {section("Recent", recent, "Nothing yet.", "archive")}
 {"" if archived is not None else "<p class=hint><a href=/?archived=1>Show archived tasks</a></p>"}
+<p class=hint><a href=/dashboard>Dashboard: model runs, cost, status and logs</a></p>
 <form method=post action=/logout><button class=quiet>Sign out</button></form></div></div>""", msg)
 
 _USE_JS = ("var f=document.getElementById('from'),v=f.value.split(/[^0-9]+/).filter(Boolean);"

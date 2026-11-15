@@ -156,6 +156,8 @@ token_env = "ELVES_TOKEN"
 sms_allow = []               # e.g. ["+16125550123"]
 max_upload_mb = 2048         # one task's files through the web intake
 public_url = ""              # e.g. "https://studio.tailnet-name.ts.net": digests then link each result
+# view_port = 8378           # the dashboard alone, read-only, for the local network (plain http);
+# view_host = "0.0.0.0"      # its sign-in is $ELVES_VIEW_TOKEN, never the main token
 
 [notify]
 # Command that receives the morning digest. "{text}" is replaced with the digest;

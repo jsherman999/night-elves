@@ -34,7 +34,9 @@ DEFAULTS = {
     "backends": {},
     "web": {"host": "127.0.0.1", "port": 8377, "token_env": "ELVES_TOKEN", "sms_allow": [],
             "max_upload_mb": 2048,  # one task's files, sent through the web intake
-            "public_url": ""},  # e.g. the Tailscale address; digests link each result there
+            "public_url": "",  # e.g. the Tailscale address; digests link each result there
+            # The dashboard alone, read-only, for the local network: off while view_port is 0.
+            "view_host": "0.0.0.0", "view_port": 0, "view_token_env": "ELVES_VIEW_TOKEN"},
     "notify": {"argv": []},
 }
 

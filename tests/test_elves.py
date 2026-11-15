@@ -1,9 +1,9 @@
 import contextlib, html, io, json, os, shutil, subprocess, tempfile, threading, time, unittest
 import urllib.error, urllib.request
 from unittest import mock
-from datetime import date, datetime, timezone
+from datetime import date, datetime, timedelta, timezone
 from http.server import ThreadingHTTPServer
-from elves import attachments, backends, cli, config, db, notify, pages, policy, research, web, webtools, when
+from elves import attachments, backends, cli, config, dash, db, notify, pages, policy, research, web, webtools, when
 from elves.backends import BackendError, Command, Result, SpentError, TimedOut
 from elves.dispatcher import Night, passed, plan_criteria
 
@@ -906,6 +906,119 @@ if __name__ == "__main__":
 PNG = (b"\x89PNG\r\n\x1a\n\x00\x00\x00\rIHDR\x00\x00\x00\x01\x00\x00\x00\x01\x08\x06\x00\x00"
        b"\x00\x1f\x15\xc4\x89\x00\x00\x00\rIDATx\x9cc\xf8\xff\xff?\x00\x05\xfe\x02\xfe\xa75\x81"
        b"\x84\x00\x00\x00\x00IEND\xaeB`\x82")  # 1x1
+
+class DashboardTests(Base):
+    def setUp(self):
+        super().setUp()
+        self.cfg["paths"]["db"] = os.path.join(self.tmp, "q.db")
+        self.cfg["backends"]["claude_agent"] = {"type": "command", "argv": ["claude", "-p"],
+                                                "window": [1, 5], "max_runs_per_night": 3}
+        self.conn = db.connect(self.cfg["paths"]["db"])
+        self.now = datetime.now().astimezone().replace(hour=14, minute=30, second=0, microsecond=0)
+        self.done = db.add_task(self.conn, "summarise <b>logs</b>")
+        db.update(self.conn, self.done, status="done", backend="local")
+        self.busy = db.add_task(self.conn, "build the thing", tier="agent")
+        db.update(self.conn, self.busy, status="running", backend="claude_agent")
+        db.add_task(self.conn, "later")
+        ts = db.iso(self.now.replace(hour=2))
+        db.record_spend(self.conn, "local", self.done, "execute", 1000, 200, 0.0, ts=ts, secs=30)
+        db.record_spend(self.conn, "claude_api", self.done, "review", 5000, 100, 0.25, ts=ts, secs=12)
+        db.record_spend(self.conn, "claude_agent", self.busy, "execute", 90000, 3000, 0.0, ts=ts,
+                        est_usd=1.5, secs=600)
+        db.record_spend(self.conn, "gone", None, "execute", 5, 5, 0.0, secs=1,
+                        ts=db.iso(self.now - timedelta(days=3)))
+        open(os.path.join(self.tmp, "nightly.log"), "w").write(
+            "#1 plan=None exec=local review=None\n\x1b[?25lLoading 5%\n  #1 -> <failed>: boom\n")
+
+    def test_figures_and_page(self):
+        d = dash.gather(self.cfg, self.conn, self.now, ping=False)
+        today = d["by"]["today"]
+        self.assertEqual((today["local"]["calls"], today["claude_api"]["usd"], today["claude_agent"]["est"]),
+                         (1, 0.25, 1.5))
+        self.assertNotIn("gone", today)
+        self.assertIn("gone", d["by"]["week"])  # a backend no longer configured keeps its history
+        self.assertEqual(d["daily"][self.now.date()]["claude_agent"]["secs"], 600)
+        self.assertEqual((d["counts"]["queued"], d["finished"].get("done")), (1, 1))
+        self.assertEqual([t["id"] for t in d["active"]], [self.busy])
+        rows = {b["name"]: b for b in d["backends"]}
+        self.assertEqual((rows["claude_agent"]["state"], rows["local"]["state"], rows["gone"]["state"]),
+                         ("waiting", "ready", "removed"))  # 14:30 is outside the agent's hours
+        self.assertIn("1 of 3 runs today", rows["claude_agent"]["limit"])
+        self.assertEqual(d["logs"]["nightly"].splitlines(),
+                         ["#1 plan=None exec=local review=None", "  #1 -> <failed>: boom"])
+        self.assertFalse(d["running"])
+        import fcntl
+        with open(self.cfg["paths"]["db"] + ".lock", "w") as lock:
+            fcntl.flock(lock, fcntl.LOCK_EX)
+            self.assertTrue(dash.run_in_progress(self.cfg))
+        page = dash.render(d)
+        for part in (f"#{self.busy} running", "1 waiting", "$0.25", "summarise &lt;b&gt;logs&lt;/b&gt;",
+                     "-&gt; &lt;failed&gt;: boom", f"<a href=/t/{self.done}>", "<svg", "claude_agent: 10m",
+                     "✓ ready", "… waiting", "≈$1.50"):
+            self.assertIn(part, page, part)
+        self.assertNotIn("<b>logs", page)
+        view = dash.render(d, links=False)
+        self.assertNotIn("href=/t/", view)
+        self.assertNotIn("href=/>Queue", view)
+        self.assertEqual(json.loads(dash.to_json(d))["budget"]["cycle_spent"], 0.25)
+        self.assertEqual([dash._nice(v) for v in (0, 0.03, 0.4, 3, 37, 180, 5400)],
+                         [1.0, 0.05, 0.5, 5, 50, 200, 10000])
+
+    def test_served_to_the_signed_in_and_read_only_to_the_lan(self):
+        class NoRedirect(urllib.request.HTTPRedirectHandler):
+            def redirect_request(self, *a, **k):
+                return None
+        opener = urllib.request.build_opener(NoRedirect)
+        def start(handler):
+            srv = ThreadingHTTPServer(("127.0.0.1", 0), handler)
+            threading.Thread(target=srv.serve_forever, daemon=True).start()
+            self.addCleanup(srv.shutdown)
+            base = f"http://127.0.0.1:{srv.server_port}"
+            def call(path, data=None, headers=None):
+                req = urllib.request.Request(base + path, data=data, headers=headers or {})
+                try:
+                    with opener.open(req) as r:
+                        return r.status, r.read().decode(errors="replace"), r.headers
+                except urllib.error.HTTPError as e:
+                    return e.code, e.read().decode(), e.headers
+            return call
+        form = {"Content-Type": "application/x-www-form-urlencoded"}
+        with mock.patch.object(dash, "services", return_value=[("search", "SearXNG", False)]):
+            main = start(web.make_handler(self.cfg, "s3cret-token-123456"))
+            self.assertEqual(main("/dashboard")[0], 303)  # sign in first
+            self.assertEqual(main("/dashboard.json")[0], 401)
+            cookie = main("/login", b"token=s3cret-token-123456", form)[2]["Set-Cookie"].split(";")[0]
+            code, page, _ = main("/dashboard", headers={"Cookie": cookie})
+            self.assertEqual(code, 200)
+            self.assertIn("✗ down", page)
+            self.assertIn(f"<a href=/t/{self.done}>", page)
+            self.assertIn("href=/dashboard", main("/", headers={"Cookie": cookie})[1])
+            code, body, _ = main("/dashboard.json", headers={"Authorization": "Bearer s3cret-token-123456"})
+            self.assertEqual((code, json.loads(body)["queue"]["queued"]), (200, 1))
+
+            lan = start(web.make_view_handler(self.cfg, "view-token-1234"))
+            self.assertIn("View token", lan("/")[1])
+            self.assertIn("View token", lan("/dashboard")[1])
+            self.assertEqual(lan("/login", b"token=s3cret-token-123456", form)[0], 401)  # not the main one
+            code, _, h = lan("/login", b"token=view-token-1234", form)
+            self.assertEqual(code, 303)
+            self.assertNotIn("Secure", h["Set-Cookie"])  # this listener is plain http
+            seen = h["Set-Cookie"].split(";")[0]
+            code, page, _ = lan("/dashboard", headers={"Cookie": seen})
+            self.assertEqual(code, 200)
+            self.assertIn("night-elves dashboard", page)
+            self.assertNotIn("href=/t/", page)
+            # Nothing else is there: no queue, no task pages, no intake, and no way in with
+            # the main site's cookie.
+            for path in ("/tasks", f"/t/{self.done}", "/dashboard.json"):
+                self.assertEqual(lan(path, headers={"Cookie": seen})[0], 404, path)
+            self.assertEqual(lan("/tasks", b"prompt=x&token=view-token-1234", form)[0], 404)
+            self.assertIn("View token", lan("/dashboard", headers={"Cookie": cookie})[1])
+            self.assertEqual(main("/dashboard", headers={"Cookie": seen})[0], 303)
+            self.assertEqual(lan("/login", b"token=view-token-1234",
+                                 {**form, "Origin": "http://evil.example"})[0], 401)
+        with mock.patch.dict(os.environ, {"ELVES_VIEW_TOKEN": "v"}):
+            self.assertNotIn("ELVES_VIEW_TOKEN", backends.environ({}, None))
 
 def multipart(fields: dict, files: list[tuple[str, bytes]], field="files") -> tuple[bytes, str]:
     b = "XyZboundary"
