@@ -17,6 +17,21 @@ Standard library only. Python 3.11 or newer.
                                                  manager of the local agent)
 ```
 
+What happens to a task, step by step, is drawn on the site's **Explain
+workflow?** page (`/workflow`, linked from the queue and the dashboard), where
+the boxes name the backends and models your own `config.toml` routes to. The
+same three figures for the setup described here:
+
+![How a queued task reaches the written-answer path or the agent path](assets/workflow-routing.svg)
+
+![How a written answer is produced, reviewed, retried and escalated](assets/workflow-answers.svg)
+
+![How an agent task is worked, checked, reviewed, retried and escalated](assets/workflow-agents.svg)
+
+Green runs on the Mac and is free, blue is a flat-rate plan (claude.ai or
+ChatGPT), yellow is the Claude API and is billed, red is a failure.
+`python -m elves.workflow assets` redraws the files.
+
 Every model call is written to a `spend` ledger. The API credit is paced from
 that ledger, so the dispatcher always knows how much is left and how many days
 remain.

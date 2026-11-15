@@ -7,7 +7,7 @@ from pathlib import Path
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from urllib.parse import parse_qs, quote, unquote, urlparse
 import threading
-from . import attachments, dash, db, guide, pages, policy, when
+from . import attachments, dash, db, guide, pages, policy, when, workflow
 
 MAX_BODY = 64 * 1024
 MAX_FIELD = 1024 * 1024  # a non-file field of a multipart upload (the prompt)
@@ -364,6 +364,10 @@ def make_handler(cfg: dict, token: str):
                     return self._send(200, pages.home(rows, msg, use, q, found, old), HTML)
                 finally:
                     conn.close()
+            if u.path == "/workflow":  # the flowcharts of how a task is worked
+                if not self._cookie_ok():
+                    return self._redirect("/")
+                return self._send(200, workflow.render(cfg), HTML)
             if u.path in ("/dashboard", "/dashboard.json"):
                 as_json = u.path.endswith(".json")
                 if not (self._token_ok(None) if as_json else self._cookie_ok()):
@@ -538,10 +542,12 @@ def make_view_handler(cfg: dict, token: str):
             if path in ICON_PATHS:
                 return self._send(200, ICON.read_bytes(), "image/png")
             m = re.fullmatch(r"/t/(\d+)", path) if tasks else None
-            if path not in ("/", "/dashboard") and not m:
+            if path not in ("/", "/dashboard", "/workflow") and not m:
                 return self._send(404, "not found", "text/plain")
             if not self._signed_in():
                 return self._send(200, dash.login())
+            if path == "/workflow":
+                return self._send(200, workflow.render(cfg, links=False))
             conn = db.connect(cfg["paths"]["db"])
             try:
                 if m:  # one task, to read: nothing here can change or queue anything

@@ -3,7 +3,7 @@ import urllib.error, urllib.request
 from unittest import mock
 from datetime import date, datetime, timedelta, timezone
 from http.server import ThreadingHTTPServer
-from elves import attachments, backends, cli, config, dash, db, guide, notify, pages, policy, research, web, webtools, when
+from elves import attachments, backends, cli, config, dash, db, guide, notify, pages, policy, research, web, webtools, when, workflow
 from elves.backends import BackendError, Command, Result, SpentError, TimedOut
 from elves.dispatcher import Night, passed, plan_criteria
 
@@ -907,6 +907,47 @@ PNG = (b"\x89PNG\r\n\x1a\n\x00\x00\x00\rIHDR\x00\x00\x00\x01\x00\x00\x00\x01\x08
        b"\x00\x1f\x15\xc4\x89\x00\x00\x00\rIDATx\x9cc\xf8\xff\xff?\x00\x05\xfe\x02\xfe\xa75\x81"
        b"\x84\x00\x00\x00\x00IEND\xaeB`\x82")  # 1x1
 
+class WorkflowTests(Base):
+    def fits(self, cfg):
+        figs = workflow.figures(cfg)
+        for fig, _, _ in figs:
+            self.assertEqual([line for line, w, room in fig.fits if w > room], [], fig.ident)
+        return figs
+
+    def test_figures_name_the_configured_backends_and_fit_their_boxes(self):
+        cfg = workflow.example()
+        page = workflow.render(cfg)
+        for part in ("local (gpt-oss-120b)", "claude_api (claude-opus-5-5)", "claude_cli when the API",
+                     "local_agent (qwen3.8-27b)", "claude_agent (Claude Code)", "01:00-07:00, 3 runs a night",
+                     "codex reads the workspace", "codex leaves a handoff note;", "STATUS: DONE?",
+                     "Priority 1-3, or", "after 3 failed attempts", "When something goes wrong",
+                     "tonight&#x27;s API allowance", "billed per token"):
+            self.assertIn(part, page, part)
+        self.assertEqual(page.count("<svg"), 3)
+        self.assertNotIn("<script", page)
+        self.fits(cfg)
+        # A file on its own carries its colours with it.
+        static = workflow.figures(cfg)[2][0].svg(static=True)
+        self.assertNotIn("var(--", static)
+        self.assertNotIn("class=", static)
+        self.assertIn('xmlns="http://www.w3.org/2000/svg"', static)
+
+    def test_figures_follow_a_bare_setup_and_changed_limits(self):
+        self.cfg["limits"].update(escalate_after=1, max_attempts=4, hard_priority=2, max_timeouts=6)
+        self.cfg["roles"]["classifier"] = "off"
+        page = workflow.render(self.cfg)  # no agents, no vision model, no manager
+        for part in ("No local agent is set up", "No Claude agent is set up", "No second reader",
+                     "Claude reads them", "the classifier is off", "Priority 1-2, or",
+                     "1 failed attempt?", "after 4 failed attempts", "(6 time-outs fail it)",
+                     "the 4th time"):
+            self.assertIn(part, page, part)
+        self.fits(self.cfg)
+        self.cfg["backends"]["a-backend-with-a-very-long-name-indeed"] = {
+            "type": "openai_compat", "model": "some/extremely-long-model-name-that-goes-on-and-on"}
+        self.cfg["roles"].update(local="a-backend-with-a-very-long-name-indeed",
+                                 local_vision="a-backend-with-a-very-long-name-indeed")
+        self.fits(self.cfg)
+
 class DashboardTests(Base):
     def setUp(self):
         super().setUp()
@@ -1138,6 +1179,15 @@ class DashboardTests(Base):
                               {**form, "Cookie": cookie})
             self.assertEqual((code, db.get(self.conn, self.done)["status"]), (303, "queued"))
             self.assertIn("shorter please", db.get(self.conn, self.done)["prompt"])
+            # Explain workflow: linked from the dashboard and the queue, served to both.
+            self.assertIn("href=/workflow>Explain workflow?", page)
+            self.assertIn("href=/workflow>Explain workflow?", main("/", headers={"Cookie": cookie})[1])
+            self.assertEqual(main("/workflow")[0], 303)
+            self.assertIn("<svg", main("/workflow", headers={"Cookie": cookie})[1])
+            self.assertIn("View token", lan("/workflow")[1])
+            flow = lan("/workflow", headers={"Cookie": seen})[1]
+            self.assertIn("How a task is worked", flow)
+            self.assertNotIn("href=/dashboard", flow)
             self.cfg["web"]["view_tasks"] = False
             off = start(web.make_view_handler(self.cfg, "view-token-1234"))
             self.assertEqual(off(f"/t/{self.done}", headers={"Cookie": seen})[0], 404)

@@ -450,7 +450,7 @@ def render(d: dict, links: bool = True, msg: str | None = None, tasks: bool = Tr
         return f"<div class='tile{click}><div class=k>{e(k)}</div>{v}</div>"
     body = ["<div class=bar><h1 style='margin:0;flex:1'>night-elves dashboard</h1>",
             f"<span>as of {now:%a %b} {now.day}, {now:%H:%M:%S}</span>",
-            "<a href=/>Queue</a>" if links else "", "</div>",
+            "<a href=/workflow>Explain workflow?</a>", "<a href=/>Queue</a>" if links else "", "</div>",
             "<div class=tiles style='margin-top:12px'>" + "".join(tile(*t) for t in tiles) + "</div>"]
     dialogs = [
         _dialog("dlg-api", f"API credit used this cycle: {_money(st.spent)}", _items(
