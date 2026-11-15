@@ -1,0 +1,27 @@
+{
+  "network": {
+    "allowedDomains": [
+      "chatgpt.com",
+      "*.chatgpt.com",
+      "api.openai.com",
+      "auth.openai.com"
+    ],
+    "deniedDomains": []
+  },
+  "filesystem": {
+    "denyRead": [
+      "~/.ssh",
+      "~/.gnupg",
+      "~/.aws",
+      "~/.config",
+      "~/.night-elves/env",
+      "~/.night-elves/queue.db",
+      "~/Library/Keychains",
+      "~/Library/Messages"
+    ],
+    "allowWrite": [
+      "~/.codex"
+    ],
+    "denyWrite": []
+  }
+}

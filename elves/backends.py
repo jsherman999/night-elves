@@ -232,8 +232,9 @@ class Command:
 
 def parse_output(kind: str, out: str) -> Result:
     """A command's stdout as a Result. "claude-json" is `claude -p --output-format json`;
-    "opencode-json" is `opencode run --format json` (one event per line). Their token counts
-    and API-price estimates are recorded; a flat-rate tool bills nothing (usd 0)."""
+    "opencode-json" is `opencode run --format json` and "codex-json" is `codex exec --json`
+    (both one event per line). Their token counts and API-price estimates are recorded; a
+    flat-rate tool bills nothing (usd 0)."""
     if kind == "claude-json":
         try:
             d = json.loads(out.strip().splitlines()[-1])
@@ -265,6 +266,26 @@ def parse_output(kind: str, out: str) -> Result:
             elif ev.get("type") == "error":
                 texts.append(f"Error: {json.dumps(ev.get('error') or ev)[:500]}")
         return Result("\n\n".join(texts + other).strip(), tin, tout, 0.0, cost)
+    if kind == "codex-json":
+        said, errors, tin, tout, other = "", [], 0, 0, []
+        for line in out.splitlines():
+            try:
+                ev = json.loads(line)
+            except ValueError:
+                if line.strip():
+                    other.append(line)
+                continue
+            item = ev.get("item") or {}
+            if ev.get("type") == "item.completed" and item.get("type") == "agent_message":
+                said = str(item.get("text") or "").strip() or said  # the last message is the answer
+            elif ev.get("type") == "turn.completed":
+                u = ev.get("usage") or {}
+                tin += u.get("input_tokens", 0)
+                tout += u.get("output_tokens", 0)
+            elif ev.get("type") in ("error", "turn.failed"):
+                msg = ev.get("message") or (ev.get("error") or {}).get("message") or json.dumps(ev)
+                errors.append(f"Error: {str(msg)[:500]}")
+        return Result("\n\n".join([said, *errors, *other]).strip(), tin, tout)
     return Result(out.strip())
 
 def environ(c: dict, cwd: str | None) -> dict:

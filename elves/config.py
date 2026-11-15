@@ -25,6 +25,10 @@ DEFAULTS = {
               "local_vision": "",  # a local model that sees images, e.g. "local_vision"
               "local_review": "",  # reviews local answers; "" = the local model itself
               "local_agent": "",  # agent tasks try this first, e.g. "local_agent" (opencode)
+              # A manager for the local agent, e.g. "codex" for each: it reads the workspace.
+              "agent_plan": "",     # writes the plan the local agent follows
+              "agent_review": "",   # reads work whose check passed, before it is accepted
+              "agent_handoff": "",  # writes a note for the next run when one stops unfinished
               "classifier": ""},  # sizes up auto tasks (agent, web or answer); "" = local, "off"
     "push": {"owners": []},  # GitHub owners an agent's PUSH may go to; [] = no pushes
     "backends": {},

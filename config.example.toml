@@ -114,12 +114,20 @@ PIP_CACHE_DIR = "{cwd}/.cache/pip"
 npm_config_cache = "{cwd}/.cache/npm"
 CARGO_HOME = "{cwd}/.cache/cargo"
 
-[backends.codex]                         # ChatGPT plan via Codex CLI, as a second-opinion reviewer
-type = "command"
-enabled = false
-argv = ["codex", "exec", "{prompt}"]
-window = [1, 5]
-max_runs_per_night = 3
+[backends.codex]                          # ChatGPT plan via Codex CLI: reviews local answers, and
+type = "command"                          # manages the local agent (see "A manager for the local
+enabled = false                           # agent"). Sign in first: codex login --device-auth
+argv = ["srt", "--settings", "~/.night-elves/srt-codex.json", "--",  # copy of srt-codex.example.json:
+        "codex", "exec", "--json",        # it may read, but not write, and reach only OpenAI
+        "--dangerously-bypass-approvals-and-sandbox",  # srt is the sandbox; macOS can't nest Codex's
+        "--skip-git-repo-check", "--ephemeral", "--ignore-user-config", "--color", "never"]
+output = "codex-json"                     # records its token counts; add "-m", "<model>" to pick one
+max_runs_per_night = 30                   # the plan's limits aren't read, so this is the brake
+timeout = 300                             # its calls take under a minute; one that runs out of
+                                          # time takes it out of use for the rest of the run
+
+[backends.codex.env]
+SSL_CERT_FILE = "/etc/ssl/cert.pem"       # in the sandbox Codex can't ask macOS which CAs to trust
 
 [roles]
 local = "local"
@@ -130,6 +138,9 @@ agent = "claude_agent"
 local_vision = ""            # "local_vision" to use the block above
 local_review = ""            # reviews local answers when no other reviewer is free; "" = local itself
 local_agent = ""             # "local_agent": agent tasks try it first (see Agent tier)
+agent_review = ""            # "codex": reads the local agent's work before it is accepted
+agent_handoff = ""           # "codex": leaves the next run a note when a local agent run stops
+agent_plan = ""              # "codex": writes the plan the local agent follows
 classifier = ""              # sizes up auto tasks as agent / web / answer; "" = local, "off"
 
 [push]

@@ -13,7 +13,8 @@ Standard library only. Python 3.11 or newer.
  CLI ──┐                          ┌─ local      (Ollama / LM Studio / MLX)
  web ──┼─► SQLite queue ─► nightly ┼─ claude_api (monthly API credit, metered)
  SMS ──┘                  run     ├─ claude_cli (`claude -p`, subscription limits)
-                                  └─ codex      (`codex exec`, optional reviewer)
+                                  └─ codex      (`codex exec`, optional reviewer and
+                                                 manager of the local agent)
 ```
 
 Every model call is written to a `spend` ledger. The API credit is paced from
@@ -425,7 +426,7 @@ failure is logged, and the digest is still written to the results folder.
 |---|---|---|
 | `openai_compat` | any OpenAI-compatible local server | tokens only |
 | `anthropic_api` | Claude API key | dollars, from token counts and your prices |
-| `command` | any CLI that takes a prompt and prints an answer | runs per night; tokens and API-price estimates with `output = "claude-json"` or `"opencode-json"` |
+| `command` | any CLI that takes a prompt and prints an answer | runs per night; tokens (and API-price estimates, where the tool gives them) with `output = "claude-json"`, `"opencode-json"` or `"codex-json"` |
 
 Every call's time, tokens and cost go in the ledger, and each finished or failed
 task shows them in the web UI: wall-clock time over all attempts, tokens in and
@@ -574,6 +575,60 @@ compaction is rare: load it in LM Studio with at least the `limit.context` in
 131072`). opencode trusts that number, and a model loaded with less fails
 part-way through long tasks.
 
+### A manager for the local agent
+
+A local model working as an agent fails in ways its own check doesn't catch: it
+reports DONE on work that misses half the task, or it works for its whole time
+limit without finishing. A stronger model can watch over it for a fraction of
+what doing the work would cost. Three roles name that manager, each off until
+set, and each used only for the local agent's tasks (Claude's agent is the
+stronger model, so nobody manages it):
+
+| Role | When | What the manager does |
+|---|---|---|
+| `agent_review` | the agent said DONE and its check passed | Reads the workspace and the check, and replies PASS or FAIL. A FAIL is a failed attempt: the agent's next run gets the faults to fix. |
+| `agent_handoff` | a run stopped at its time limit, or crashed part-way | Reads the workspace and the end of what the agent printed, and writes the next run a note: what works, what is left, the next steps. |
+| `agent_plan` | before the agent's first run | Writes a plan of small steps and a "Done when" list, which the reviewer checks too. Written once per task (again if the task is edited) and kept in `work/<id>.plan.md`. |
+
+So the layers are: the local agent does the work, the manager plans, checks
+and unsticks it, and after `escalate_after` failed attempts the task goes to
+Claude's agent as before.
+
+The manager never holds a task up. If it isn't set, is out of runs for the
+night, or fails, the task goes on as it would without one. After three
+failures in a row, or one call that runs out of time, the manager is left
+alone for the rest of the run. The same
+goes for the reviewer of a local answer: when it fails, the local reviewer
+reviews instead, and the task doesn't lose an attempt.
+
+To use Codex on a ChatGPT plan as the manager:
+
+```sh
+npm i -g @openai/codex                    # not the Homebrew cask: see below
+codex login --device-auth                 # prints a code to enter in any browser
+cp srt-codex.example.json ~/.night-elves/srt-codex.json
+```
+
+Then copy the `[backends.codex]` block from `config.example.toml` without
+`enabled = false`, and set the roles to `"codex"`. Codex runs inside srt with
+its own settings file: it can read the workspace but write only its own
+`~/.codex`, can't read the secrets the agents can't, and reaches only OpenAI.
+Codex's own sandbox is switched off, because macOS can't start one sandbox
+inside another, and its read-only mode would still let it read `~/.ssh`.
+`SSL_CERT_FILE` is set because the sandbox stops Codex asking macOS which
+certificates to trust. The task, the end of the agent's reply and whatever the
+manager reads in the workspace go to OpenAI.
+
+Install Codex with npm on a Mac that runs unattended. Homebrew's cask marks the
+binary as downloaded, so Gatekeeper assesses it at every launch, and on the
+Studio one of those assessments never finished: after that, every `codex`
+started from that path hung before its first instruction (`log stream` showed
+syspolicyd "waiting on another evaluation"), until the cask was removed.
+
+`scripts/agent-bench.py <model> --manager codex --plan` measures what a manager
+adds on this Mac: the same hidden-test tasks through the dispatcher with the
+model alone, with review and handoff, and with the plan too.
+
 ### Setting up the local agent
 
 On the Studio this needs opencode, LM Studio with the model loaded, and
@@ -634,7 +689,8 @@ measure how much traffic each device sends; that needs your router's stats.
   agent's check actually runs anything.
 - **A check is only as good as the agent makes it.** night-elves runs it and
   believes its exit code; a weak check (`CHECK: test -f README.md`) passes weak
-  work. `--done-when` is the way to say what the check should prove.
+  work. `--done-when` is the way to say what the check should prove, and a
+  manager (`roles.agent_review`) reads the local agent's work as well.
 - **Subscription usage is not measured.** Neither Claude nor ChatGPT plan
   limits are read; those backends are held back by a time window and a run
   count. Only the API credit is paced in dollars.

@@ -8,15 +8,21 @@ after the agent has exited. Models must already be loaded in the model server.
 
   agent-bench.py qwen3.8-27b:131072 ornith-1.5-35b-a3b-mlx:131072   # model[:context]
   agent-bench.py --reference        # score the built-in solutions: checks the tests themselves
+  agent-bench.py openai/gpt-oss-120b --manager codex --plan     # what a manager adds
+
+With --manager, each task goes through the dispatcher itself (check, retries, time limits),
+once for the model alone and once with that backend as its manager (roles.agent_review and
+agent_handoff; --plan adds a third arm with roles.agent_plan too). Nothing is escalated to
+Claude, so the arms differ only in the manager. The manager's calls use its real plan or quota.
 
 Run it with the Python that has night-elves installed. Results go to --out as runs.jsonl.
 """
 from __future__ import annotations
-import argparse, json, re, shutil, sys, time, uuid
+import argparse, copy, json, re, shutil, sys, time, uuid
 from pathlib import Path
-from elves import backends, config, verify
+from elves import backends, config, db, verify
 from elves.backends import BackendError, Command, TimedOut
-from elves.dispatcher import AGENT_SYS, CONTRACT
+from elves.dispatcher import AGENT_SYS, CONTRACT, Night
 
 TASKS = {}
 
@@ -586,6 +592,51 @@ def score(cfg, c, work: Path, tests: str) -> tuple[int, int, str]:
     return max(total - bad, 0), total, out[-600:]
 
 
+def pipeline(cfg, name, c, manager, roles, task, root: Path, attempts: int) -> dict:
+    """One task through the dispatcher, in a queue and workspace of its own under root.
+    roles: the manager roles that are on in this arm. Returns the row's fields and the
+    workspace."""
+    cfg = copy.deepcopy(cfg)
+    cfg["paths"] = {"db": str(root / "queue.db"), "results": str(root / "results"),
+                    "work": str(root / "work"), "attachments": str(root / "attachments")}
+    cfg["backends"] = {name: {**c, "max_runs_per_night": 999, "window": None}}
+    if roles:
+        cfg["backends"][manager] = {**cfg_backend(manager), "max_runs_per_night": 999,
+                                    "window": None}
+    cfg["roles"].update({"local_agent": name, "agent": "", "classifier": "off", "agent_plan": "",
+                         "agent_review": "", "agent_handoff": "", **{r: manager for r in roles}})
+    cfg["limits"]["max_attempts"] = attempts
+    cfg["push"] = {"owners": []}
+    conn = db.connect(cfg["paths"]["db"])
+    tid = db.add_task(conn, task["prompt"], tier="agent")
+    work = root / "work" / str(tid)
+    work.mkdir(parents=True)
+    for rel, text in task["files"].items():
+        (work / rel).write_text(text)
+    log = open(root / "night.log", "a")
+    Night(cfg, conn, backends.build(cfg), log=lambda m: print(m, file=log, flush=True)).run()
+    t = db.get(conn, tid)
+    calls = {}
+    for backend, role, n, tin, tout in conn.execute(
+            "SELECT backend, role, COUNT(*), SUM(tokens_in), SUM(tokens_out) FROM spend "
+            "GROUP BY backend, role"):
+        calls[f"{'manager' if backend == manager and roles else 'agent'}.{role}"] = [n, tin, tout]
+    log.close()
+    lost = (root / "night.log").read_text().count("going on without it")
+    return {"secs": t["secs"] or 0.0, "ended": t["status"], "attempts": t["attempts"],
+            "timeouts": t["timeouts"], "calls": calls, "manager_lost": lost,
+            "tokens_out": sum(v[2] or 0 for k, v in calls.items() if k.startswith("agent.")),
+            "tokens_in": sum(v[1] or 0 for k, v in calls.items() if k.startswith("agent.")),
+            "work": work}
+
+
+def cfg_backend(name):
+    c = config.load()["backends"].get(name)
+    if not c or not c.get("enabled", True):
+        sys.exit(f"--manager {name}: no such backend in config.toml, or it is not enabled")
+    return c
+
+
 def main():
     ap = argparse.ArgumentParser(description=__doc__.split("\n\n")[0])
     ap.add_argument("models", nargs="*", help="model id as the model server names it, "
@@ -595,6 +646,11 @@ def main():
     ap.add_argument("--reps", type=int, default=2)
     ap.add_argument("--timeout", type=int, default=1500, help="seconds per run")
     ap.add_argument("--backend", default=None, help="config backend to copy (roles.local_agent)")
+    ap.add_argument("--manager", default=None, help="a backend to try as the model's manager: "
+                    "runs each task through the dispatcher with and without it")
+    ap.add_argument("--plan", action="store_true", help="with --manager: a third arm where "
+                    "the manager also plans")
+    ap.add_argument("--attempts", type=int, default=3, help="with --manager: limits.max_attempts")
     ap.add_argument("--out", default="~/.night-elves/bench")
     a = ap.parse_args()
     if not a.models and not a.reference:
@@ -617,10 +673,39 @@ def main():
 
     rows = []
     arms = [("reference", 0)] if a.reference else models
+    managed = bool(a.manager) and not a.reference
+    if managed:
+        cfg_backend(a.manager)
+        kinds = [("", ()), (f"+{a.manager}", ("agent_review", "agent_handoff"))]
+        if a.plan:
+            kinds.append((f"+{a.manager}+plan", ("agent_plan", "agent_review", "agent_handoff")))
+        arms = [(m + k, 0) for m, _ in models for k, _ in kinds]
     for rep in range(1, (1 if a.reference else a.reps) + 1):
         for tname in a.tasks:
             task = TASKS[tname]
-            for model, _ in arms:
+            for model, _ in (models if managed else ()):
+                for kind, roles in kinds:
+                    root = out / re.sub(r"[^A-Za-z0-9._+-]", "_", model + kind) / f"{tname}-{rep}"
+                    root.mkdir(parents=True)
+                    argv = list(base["argv"])
+                    argv[argv.index("-m") + 1] = f"lmstudio/{model}"
+                    c = {**base, "argv": argv, "timeout": a.timeout,
+                         "env": {**base.get("env", {}), "OPENCODE_CONFIG": str(out / "opencode.json")}}
+                    row = {"model": model + kind, "task": tname, "rep": rep,
+                           **pipeline(cfg, name, c, a.manager, roles, task, root, a.attempts)}
+                    work = row.pop("work")
+                    row["said"] = (f"tries={row['attempts'] + (row['ended'] == 'done')} "
+                                   f"timeouts={row['timeouts']}")
+                    row["passed"], row["total"], row["tests_tail"] = score(cfg, c, work, task["tests"])
+                    rows.append(row)
+                    with open(out / "runs.jsonl", "a") as f:
+                        f.write(json.dumps(row) + "\n")
+                    mgr = sum(v[0] for k, v in row["calls"].items() if k.startswith("manager."))
+                    print(f"{model + kind:36} {tname:8} #{rep} {row['passed']:>2}/{row['total']:<2} "
+                          f"{row['secs']:>7.0f}s {row['ended']:7} {row['said']} manager calls={mgr}"
+                          f"{' lost=' + str(row['manager_lost']) if row['manager_lost'] else ''}",
+                          flush=True)
+            for model, _ in (() if managed else arms):
                 work = out / re.sub(r"[^A-Za-z0-9._-]", "_", model) / f"{tname}-{rep}"
                 work.mkdir(parents=True)
                 for rel, text in task["files"].items():
@@ -662,6 +747,21 @@ def main():
                       f"{row['secs']:>7.0f}s out={row['tokens_out']:<6} {row['ended'][:40]} "
                       f"{row['said']}", flush=True)
 
+    if managed:
+        # accepted = the dispatcher called it done; wrong = done, but the hidden tests disagree
+        print(f"\n{'arm':36} {'solved':>7} {'tests':>9} {'accepted':>8} {'wrong':>6} {'mean s':>7} "
+              f"{'manager calls':>13}")
+        for arm, _ in arms:
+            mine = [r for r in rows if r["model"] == arm]
+            full = lambda r: r["total"] > 0 and r["passed"] == r["total"]
+            done = [r for r in mine if r["ended"] == "done"]
+            mgr = sum(v[0] for r in mine for k, v in r["calls"].items() if k.startswith("manager."))
+            print(f"{arm:36} {sum(map(full, mine)):>3}/{len(mine):<3} "
+                  f"{sum(r['passed'] for r in mine):>4}/{sum(r['total'] for r in mine):<4} "
+                  f"{len(done):>8} {sum(not full(r) for r in done):>6} "
+                  f"{sum(r['secs'] for r in mine) / len(mine):>7.0f} {mgr:>13}")
+        print(f"\nruns: {out}/runs.jsonl")
+        return
     print(f"\n{'model':28} {'solved':>7} {'tests':>9} {'mean s':>7} {'tok out':>8} {'out tok/s':>9}")
     for model, _ in arms:
         mine = [r for r in rows if r["model"] == model]

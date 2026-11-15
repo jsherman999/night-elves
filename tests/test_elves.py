@@ -364,6 +364,121 @@ class DispatchTests(Base):
         self.assertIsNotNone(la.calls[0][1])  # a new session gets the instructions again
         self.assertIn("Earlier attempts left their files", la.calls[0][0])
 
+    def managed_cfg(self, *roles):
+        self.local_agent_cfg()
+        self.cfg["backends"]["codex"] = {"type": "command", "argv": ["x"]}
+        for role in roles:
+            self.cfg["roles"][role] = "codex"
+
+    def test_manager_reads_local_agent_work_before_it_is_accepted(self):
+        self.managed_cfg("agent_review")
+        tid = db.add_task(self.conn, "build it", tier="agent", criteria="it has tests")
+        verdicts = iter(["FAIL\nlogsum.py ignores --top", "PASS\nall there"])
+        codex, la = Fake(lambda p, s: next(verdicts)), Fake("built\nSTATUS: DONE\nCHECK: true")
+        claude = Fake("STATUS: DONE\nCHECK: true")
+        stats = self.night(18, hour=2, local_agent=la, codex=codex, claude_agent=claude).run()
+        t = db.get(self.conn, tid)
+        self.assertEqual((stats["done"], t["backend"], t["attempts"]), (1, "local_agent", 1))
+        self.assertEqual(codex.cwd, os.path.join(self.tmp, "work", str(tid)))
+        self.assertIn("checking work", codex.calls[0][1])
+        for part in ("build it", "it has tests", "built", "`true` exited 0"):
+            self.assertIn(part, codex.calls[0][0])
+        # The agent's second run was told what the reviewer found.
+        self.assertIn("rejected by the reviewer (codex)", la.calls[1][0])
+        self.assertIn("logsum.py ignores --top", la.calls[1][0])
+        self.assertIn("## Review (codex)\n\nPASS", open(t["result_path"]).read())
+        # Claude's agent is the stronger model: nobody reviews it.
+        hard = db.add_task(self.conn, "hard", tier="agent", priority=1)
+        self.night(18, hour=2, local_agent=la, codex=codex, claude_agent=claude).run()
+        self.assertEqual((db.get(self.conn, hard)["backend"], len(codex.calls)),
+                         ("claude_agent", 2))
+
+    def test_manager_is_not_asked_when_the_check_fails_and_never_holds_up_a_task(self):
+        self.managed_cfg("agent_review", "agent_plan", "agent_handoff")
+        del self.cfg["backends"]["claude_agent"]
+        bad = db.add_task(self.conn, "bad", tier="agent")
+        codex = Fake(fail=99)  # out of quota: every call fails
+        replies = iter(["STATUS: DONE\nCHECK: false", "STATUS: DONE\nCHECK: true"])
+        la = Fake(lambda p, s: next(replies))
+        n = self.night(18, hour=2, local_agent=la, codex=codex)
+        stats = n.run()
+        self.assertEqual((stats["done"], db.get(self.conn, bad)["attempts"]), (1, 1))
+        self.assertEqual(n.down, {"codex"})  # after three failures it is left alone
+        self.assertNotIn("Review", open(db.get(self.conn, bad)["result_path"]).read())
+
+    def test_manager_that_hangs_is_not_asked_again_in_the_run(self):
+        self.managed_cfg("agent_review")
+        del self.cfg["backends"]["claude_agent"]
+        ids = [db.add_task(self.conn, t, tier="agent") for t in "abc"]
+        def hang(prompt, system):
+            raise TimedOut("codex: timed out after 300 s", Result(""))
+        codex = Fake(hang)
+        n = self.night(18, hour=2, local_agent=Fake("STATUS: DONE\nCHECK: true"), codex=codex)
+        self.assertEqual((n.run()["done"], len(codex.calls), n.down), (3, 1, {"codex"}))
+
+    def test_manager_leaves_a_note_for_the_run_after_one_that_stopped(self):
+        self.managed_cfg("agent_handoff")
+        del self.cfg["backends"]["claude_agent"]
+        tid = db.add_task(self.conn, "long job", tier="agent")
+        def work(prompt, system):
+            if len(la.calls) == 1:
+                raise TimedOut("local_agent: timed out after 5400 s",
+                               Result("wrote inv.py, now running the tests again", 900, 30))
+            return "STATUS: DONE\nCHECK: true"
+        la, codex = Fake(work), Fake("inv.py is finished. Run the tests once, then report.")
+        self.night(18, hour=2, local_agent=la, codex=codex).run()
+        self.assertEqual(db.get(self.conn, tid)["status"], "done")
+        self.assertEqual(len(codex.calls), 1)
+        self.assertIn("stopped before", codex.calls[0][1])
+        for part in ("long job", "timed out after 5400 s", "now running the tests again"):
+            self.assertIn(part, codex.calls[0][0])
+        self.assertIn("This continues your earlier work", la.calls[1][0])
+        self.assertIn("left you this note:\ninv.py is finished.", la.calls[1][0])
+        self.assertEqual(os.listdir(os.path.join(self.tmp, "work")), [str(tid)])  # note used up
+
+    def test_manager_plans_once_and_its_conditions_reach_the_review(self):
+        self.managed_cfg("agent_plan", "agent_review")
+        del self.cfg["backends"]["claude_agent"]
+        tid = db.add_task(self.conn, "make a tool", tier="agent")
+        def manager(prompt, system):
+            if "planning" in system:
+                return "1. write tool.py\nDone when:\n- tool.py prints 42"
+            return "FAIL\nprints 41" if sum("checking" in s for _, s in codex.calls) == 1 else "PASS"
+        codex, la = Fake(manager), Fake("STATUS: DONE\nCHECK: true")
+        self.night(18, hour=2, local_agent=la, codex=codex).run()
+        self.assertEqual(db.get(self.conn, tid)["status"], "done")
+        kinds = ["plan" if "planning" in s else "review" for _, s in codex.calls]
+        self.assertEqual(kinds, ["plan", "review", "review"])  # the retry reused the plan
+        self.assertIn("A plan to follow, written for this task:\n1. write tool.py", la.calls[0][0])
+        self.assertIn("1. write tool.py", la.calls[1][0])
+        self.assertIn("Done when:\n- tool.py prints 42", codex.calls[1][0])
+        roles = [r[0] for r in self.conn.execute(
+            "SELECT role FROM spend WHERE backend='codex' ORDER BY rowid")]
+        self.assertEqual(roles, ["plan", "review", "review"])
+
+    def test_reviewer_that_fails_is_stood_in_for(self):
+        self.cfg["backends"]["codex"] = {"type": "command", "argv": ["x"]}
+        tid = db.add_task(self.conn, "summarise logs")
+        local = Fake(lambda p, s: "PASS" if "reviewing" in s else "answer")
+        self.night(5, hour=12, local=local, codex=Fake(fail=1)).run()
+        t = db.get(self.conn, tid)
+        self.assertEqual((t["status"], t["attempts"]), ("done", 0))
+        self.assertIn("## Review (local)", open(t["result_path"]).read())
+
+    def test_codex_json_output(self):
+        out = "\n".join(json.dumps(e) for e in (
+            {"type": "thread.started", "thread_id": "t"},
+            {"type": "item.completed", "item": {"type": "agent_message", "text": "Reading."}},
+            {"type": "item.completed", "item": {"type": "command_execution", "command": "ls"}},
+            {"type": "item.completed", "item": {"type": "agent_message", "text": "FAIL\nwhy"}},
+            {"type": "turn.completed", "usage": {"input_tokens": 100, "cached_input_tokens": 80,
+                                                 "output_tokens": 7}}))
+        r = backends.parse_output("codex-json", out)
+        self.assertEqual((r.text, r.tokens_in, r.tokens_out), ("FAIL\nwhy", 100, 7))
+        r = backends.parse_output("codex-json", json.dumps(
+            {"type": "turn.failed", "error": {"message": "usage limit reached"}}))
+        self.assertEqual(r.text, "Error: usage limit reached")
+
     def test_passed(self):
         self.assertTrue(passed("PASS\nok") and passed("\n pass") and passed("`PASS`"))
         self.assertTrue(passed("Looks fine to me."))  # no verdict at all: don't fail the work
