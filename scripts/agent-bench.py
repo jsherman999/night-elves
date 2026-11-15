@@ -647,7 +647,8 @@ def main():
     ap.add_argument("--timeout", type=int, default=1500, help="seconds per run")
     ap.add_argument("--backend", default=None, help="config backend to copy (roles.local_agent)")
     ap.add_argument("--manager", default=None, help="a backend to try as the model's manager: "
-                    "runs each task through the dispatcher with and without it")
+                    "runs each task through the dispatcher with and without it (\"none\": "
+                    "through the dispatcher, without a manager)")
     ap.add_argument("--plan", action="store_true", help="with --manager: a third arm where "
                     "the manager also plans")
     ap.add_argument("--attempts", type=int, default=3, help="with --manager: limits.max_attempts")
@@ -662,12 +663,22 @@ def main():
     out.mkdir(parents=True)
     models = [(m.partition(":")[0], int(m.partition(":")[2] or 65536)) for m in a.models]
 
-    # opencode needs every model listed, with the context it was loaded with.
-    oc = json.loads(Path(base["env"]["OPENCODE_CONFIG"]).expanduser().read_text())
-    prov = oc["providers"]["lmstudio"]
-    prov["models"] = {m: {"name": m, "limit": {"context": ctx, "output": 16384}}
-                      for m, ctx in models}
-    (out / "opencode.json").write_text(json.dumps(oc, indent=2))
+    # A backend that drives opencode runs models from the local server: opencode needs every
+    # model listed, with the context it was loaded with. Any other agent CLI (--backend) is
+    # given the model's name as it is, after its own -m.
+    local = "OPENCODE_CONFIG" in base.get("env", {})
+    if local:
+        oc = json.loads(Path(base["env"]["OPENCODE_CONFIG"]).expanduser().read_text())
+        prov = oc["providers"]["lmstudio"]
+        prov["models"] = {m: {"name": m, "limit": {"context": ctx, "output": 16384}}
+                          for m, ctx in models}
+        (out / "opencode.json").write_text(json.dumps(oc, indent=2))
+
+    def for_model(model: str) -> dict:
+        argv = list(base["argv"])
+        argv[argv.index("-m") + 1] = f"lmstudio/{model}" if local else model
+        env = {**base.get("env", {}), **({"OPENCODE_CONFIG": str(out / "opencode.json")} if local else {})}
+        return {**base, "argv": argv, "timeout": a.timeout, "env": env}
     contract = CONTRACT.format(minutes=max(cfg["limits"]["check_timeout"] // 60, 1))
     system = AGENT_SYS + (f" {base['notes']}" if base.get("notes") else "") + "\n\n" + contract
 
@@ -675,9 +686,11 @@ def main():
     arms = [("reference", 0)] if a.reference else models
     managed = bool(a.manager) and not a.reference
     if managed:
-        cfg_backend(a.manager)
-        kinds = [("", ()), (f"+{a.manager}", ("agent_review", "agent_handoff"))]
-        if a.plan:
+        kinds = [("", ())]  # "--manager none": through the dispatcher, with no manager arm
+        if a.manager != "none":
+            cfg_backend(a.manager)
+            kinds.append((f"+{a.manager}", ("agent_review", "agent_handoff")))
+        if a.plan and a.manager != "none":
             kinds.append((f"+{a.manager}+plan", ("agent_plan", "agent_review", "agent_handoff")))
         arms = [(m + k, 0) for m, _ in models for k, _ in kinds]
     for rep in range(1, (1 if a.reference else a.reps) + 1):
@@ -687,10 +700,7 @@ def main():
                 for kind, roles in kinds:
                     root = out / re.sub(r"[^A-Za-z0-9._+-]", "_", model + kind) / f"{tname}-{rep}"
                     root.mkdir(parents=True)
-                    argv = list(base["argv"])
-                    argv[argv.index("-m") + 1] = f"lmstudio/{model}"
-                    c = {**base, "argv": argv, "timeout": a.timeout,
-                         "env": {**base.get("env", {}), "OPENCODE_CONFIG": str(out / "opencode.json")}}
+                    c = for_model(model)
                     row = {"model": model + kind, "task": tname, "rep": rep,
                            **pipeline(cfg, name, c, a.manager, roles, task, root, a.attempts)}
                     work = row.pop("work")
@@ -717,10 +727,7 @@ def main():
                     for rel, text in task["solution"].items():
                         (work / rel).write_text(text)
                 else:
-                    argv = list(base["argv"])
-                    argv[argv.index("-m") + 1] = f"lmstudio/{model}"
-                    c.update(argv=argv, timeout=a.timeout,
-                             env={**base.get("env", {}), "OPENCODE_CONFIG": str(out / "opencode.json")})
+                    c = for_model(model)
                     sid = uuid.uuid4().hex
                     args = [x.replace("{session_hex}", sid).replace("{session}", sid)
                             for x in base.get("session_args", [])]

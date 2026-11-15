@@ -117,6 +117,26 @@ PIP_CACHE_DIR = "{cwd}/.cache/pip"
 npm_config_cache = "{cwd}/.cache/npm"
 CARGO_HOME = "{cwd}/.cache/cargo"
 
+[backends.cmd_agent]                      # a hosted open model as the first-try agent, through
+type = "command"                          # Command Code's CLI (see "A hosted model as the first agent")
+enabled = false
+argv = ["srt", "--settings", "~/.night-elves/srt-cmd.json", "--",   # copy of srt-cmd.example.json
+        "cmd", "-p", "--output-format", "json", "--yolo",   # srt is the sandbox, so nothing asks
+        "--skip-onboarding", "--no-auto-update", "--max-turns", "200",
+        "-m", "qwen/qwen3.7-max"]         # cmd --list-models
+output = "cmd-json"                       # records its token counts
+session_args = ["-n", "elf-{session}"]    # a named session the first time,
+resume_args = ["-r", "elf-{session}"]     # continued by name after
+max_runs_per_night = 6                    # it spends the plan's credit: this is the brake
+timeout = 3600
+
+[backends.cmd_agent.env]
+NODE_USE_ENV_PROXY = "1"                  # without it cmd can't reach its API through the sandbox proxy
+UV_CACHE_DIR = "{cwd}/.cache/uv"
+PIP_CACHE_DIR = "{cwd}/.cache/pip"
+npm_config_cache = "{cwd}/.cache/npm"
+XDG_CACHE_HOME = "{cwd}/.cache"
+
 [backends.codex]                          # ChatGPT plan via Codex CLI: reviews local answers, and
 type = "command"                          # manages the local agent (see "A manager for the local
 enabled = false                           # agent"). Sign in first: codex login --device-auth

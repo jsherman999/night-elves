@@ -769,6 +769,36 @@ syspolicyd "waiting on another evaluation"), until the cask was removed.
 adds on this Mac: the same hidden-test tasks through the dispatcher with the
 model alone, with review and handoff, and with the plan too.
 
+### A hosted model as the first agent
+
+`roles.local_agent` is whichever agent is tried first, before Claude's; it
+doesn't have to run on the Mac. `[backends.cmd_agent]` in `config.example.toml`
+drives a hosted open model through [Command Code](https://commandcode.ai)'s
+`cmd` CLI, inside srt with `srt-cmd.example.json`. Set `roles.local_agent =
+"cmd_agent"` to use it; the manager roles then review and unstick its work as
+they would the local agent's, and Claude's agent still takes over after
+`escalate_after` failures.
+
+A probe on 2026-11-15 found that inside srt `cmd` can write in the workspace and
+reach its API, and is refused `~/.ssh`, writes elsewhere, unlisted sites and
+`sudo`. `NODE_USE_ENV_PROXY=1` is needed, or it can't connect at all. It signs
+in with `cmd login` in a real terminal (its key expires and needs renewing), or
+with `COMMAND_CODE_API_KEY`.
+
+The same hidden-test tasks as the local models, through the dispatcher with no
+manager, twice each (`agent-bench.py <model> --backend cmd_agent --manager none`):
+
+| Model | Passed all hidden tests | Mean time | Tokens read, 6 runs |
+|---|---|---|---|
+| `qwen/qwen3.7-max` | 6 of 6 | 91 s | 1.4M |
+| `deepseek/deepseek-v4.1-flash` | 5 of 6 | 196 s | 2.7M |
+| `zai-org/glm-5.2` | 4 of 6 | 228 s | 1.4M |
+
+Every run finished on its first attempt. On the Studio the day before, local
+gpt-oss-120b passed 3 of 8 the same way, and local qwen3.8-27b ran out of a
+900-second limit on every run. The task and everything the agent reads go to
+Command Code and the model's host, and each run spends the plan's credit.
+
 ### Setting up the local agent
 
 On the Studio this needs opencode, LM Studio with the model loaded, and

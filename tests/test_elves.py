@@ -493,6 +493,25 @@ class DispatchTests(Base):
             {"type": "turn.failed", "error": {"message": "usage limit reached"}}))
         self.assertEqual(r.text, "Error: usage limit reached")
 
+    def test_cmd_json_output(self):
+        out = "\n".join(json.dumps(e) for e in (
+            {"type": "event", "event": {"type": "run_start", "sessionId": "s"}},
+            {"type": "event", "event": {"type": "model_request_start", "model": "m"}},
+            {"type": "result", "subtype": "success", "finalText": "done\nSTATUS: DONE", "usage": {
+                "inputTokens": 100, "outputTokens": 9, "cacheReadTokens": 50, "cacheWriteTokens": 5}}))
+        r = backends.parse_output("cmd-json", out)
+        self.assertEqual((r.text, r.tokens_in, r.tokens_out), ("done\nSTATUS: DONE", 100, 9))
+        cut = "\n".join(json.dumps({"type": "event", "event": e}) for e in (
+            {"type": "text_delta", "delta": "Reading"}, {"type": "text_delta", "delta": " the files."},
+            {"type": "message_end"}, {"type": "text_delta", "delta": "Now the tests"}))
+        self.assertEqual(backends.parse_output("cmd-json", cut).text, "Reading the files.\n\nNow the tests")
+        out = "\n".join(json.dumps(e) for e in (
+            {"type": "event", "event": {"type": "run_error", "error": {"message": "401: key expired"}}},
+            {"type": "result", "subtype": "error", "finalText": "", "usage": {},
+             "error": "Error: Authentication failed."}))
+        r = backends.parse_output("cmd-json", out)
+        self.assertEqual(r.text, "Error: 401: key expired\n\nError: Authentication failed.")
+
     def test_passed(self):
         self.assertTrue(passed("PASS\nok") and passed("\n pass") and passed("`PASS`"))
         self.assertTrue(passed("Looks fine to me."))  # no verdict at all: don't fail the work

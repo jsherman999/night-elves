@@ -232,8 +232,8 @@ class Command:
 
 def parse_output(kind: str, out: str) -> Result:
     """A command's stdout as a Result. "claude-json" is `claude -p --output-format json`;
-    "opencode-json" is `opencode run --format json` and "codex-json" is `codex exec --json`
-    (both one event per line). Their token counts and API-price estimates are recorded; a
+    "opencode-json" is `opencode run --format json`, "codex-json" is `codex exec --json` and
+    "cmd-json" is Command Code's `cmd -p --output-format json` (all one event per line). Their token counts and API-price estimates are recorded; a
     flat-rate tool bills nothing (usd 0)."""
     if kind == "claude-json":
         try:
@@ -266,6 +266,33 @@ def parse_output(kind: str, out: str) -> Result:
             elif ev.get("type") == "error":
                 texts.append(f"Error: {json.dumps(ev.get('error') or ev)[:500]}")
         return Result("\n\n".join(texts + other).strip(), tin, tout, 0.0, cost)
+    if kind == "cmd-json":
+        final, said, errors, tin, tout, other = "", [], [], 0, 0, []
+        for line in out.splitlines():
+            try:
+                ev = json.loads(line)
+            except ValueError:
+                if line.strip():
+                    other.append(line)
+                continue
+            if not isinstance(ev, dict):
+                continue
+            inner = ev.get("event") or {}
+            if ev.get("type") == "result":  # the last line: the answer and the run's totals
+                u = ev.get("usage") or {}
+                tin, tout = u.get("inputTokens", 0), u.get("outputTokens", 0)  # cached ones included
+                final = str(ev.get("finalText") or "").strip()
+                if ev.get("error"):
+                    errors.append(str(ev["error"])[:500])
+            elif inner.get("type") == "text_delta":
+                said.append(str(inner.get("delta") or ""))
+            elif inner.get("type") == "message_end":
+                said.append("\n\n")
+            elif inner.get("type") == "run_error":
+                errors.append(f"Error: {str((inner.get('error') or {}).get('message') or inner)[:500]}")
+        # A run stopped at its time limit has no result line: what it had said by then stands in.
+        final = final or "".join(said).strip()
+        return Result("\n\n".join([final, *dict.fromkeys(errors), *other]).strip(), tin, tout)
     if kind == "codex-json":
         said, errors, tin, tout, other = "", [], 0, 0, []
         for line in out.splitlines():
