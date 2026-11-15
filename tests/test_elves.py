@@ -1013,7 +1013,7 @@ class DashboardTests(Base):
         t = db.get(self.conn, tid)
         detail = web.task_detail(self.cfg, self.conn, tid)
         page = pages.task(t, None, detail=detail)
-        for part in ("Model calls", "<td>codex</td><td>review</td>", "inv.py ignores --low",
+        for part in ("Model calls", "<b>codex</b> review", "inv.py ignores --low",
                      "rest of that error", "name=action value=resubmit", "name=action value=guide",
                      "Resubmit with these instructions", "href=/dashboard"):
             self.assertIn(part, page, part)
