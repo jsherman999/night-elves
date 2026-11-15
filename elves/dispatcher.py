@@ -390,12 +390,16 @@ class Night:
         return review, name if review else None
 
     def _keep_transcript(self, tid, executor, e) -> None:
-        """Save what a stopped run had printed, for the handoff note (see _handoff)."""
-        said = getattr(getattr(e, "result", None), "text", "")
-        if said.strip() and self.cfg["roles"].get("agent_handoff") \
-                and executor == self.cfg["roles"].get("local_agent"):
-            why = " ".join(str(e).split())[:500]  # one line: _handoff splits on the blank line
-            self._side(tid, "last-run").write_text(f"{why}\n\n{said[-6000:]}")
+        """After a run that was working and then stopped (out of time, or failed part-way),
+        save why and what it had printed, for the handoff note (see _handoff). A run that
+        never got going has left nothing to hand over."""
+        c = self.cfg["backends"].get(executor, {})
+        if not self.cfg["roles"].get("agent_handoff") or outage(c.get("type"), e) \
+                or executor != self.cfg["roles"].get("local_agent"):
+            return
+        said = getattr(getattr(e, "result", None), "text", "").strip() or "(nothing)"
+        why = " ".join(str(e).split())[:500]  # one line: _handoff splits on the blank line
+        self._side(tid, "last-run").write_text(f"{why}\n\n{said[-6000:]}")
 
     def _handoff(self, task, executor, work) -> str:
         """After a run that stopped unfinished (out of time, or crashed part-way), the manager

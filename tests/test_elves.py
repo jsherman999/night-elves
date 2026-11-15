@@ -435,6 +435,20 @@ class DispatchTests(Base):
         self.assertIn("This continues your earlier work", la.calls[1][0])
         self.assertIn("left you this note:\ninv.py is finished.", la.calls[1][0])
         self.assertEqual(os.listdir(os.path.join(self.tmp, "work")), [str(tid)])  # note used up
+        # A run that printed nothing before it stopped is handed over too; one that never
+        # started (no tokens, not a timeout) is not.
+        quiet = db.add_task(self.conn, "quiet job", tier="agent")
+        errors = iter([TimedOut("local_agent: timed out after 5400 s", Result("", 900, 3)),
+                       SpentError("local_agent: exit 127: opencode: not found", Result(""))])
+        def stop(prompt, system):
+            if e := next(errors, None):
+                raise e
+            return "STATUS: DONE\nCHECK: true"
+        self.night(19, hour=2, local_agent=Fake(stop), codex=codex).run()
+        self.assertEqual(len(codex.calls), 2)
+        self.assertIn("printed:\n(nothing)", codex.calls[1][0])
+        self.night(20, hour=2, local_agent=Fake(stop), codex=codex).run()
+        self.assertEqual((db.get(self.conn, quiet)["status"], len(codex.calls)), ("done", 2))
 
     def test_manager_plans_once_and_its_conditions_reach_the_review(self):
         self.managed_cfg("agent_plan", "agent_review")
