@@ -166,7 +166,7 @@ def cost(u) -> str:
     if u["usd"] >= 0.005:
         parts.append(f"${u['usd']:.2f} API credit")
     if u["est"] - u["usd"] >= 0.005:
-        parts.append(f"≈${u['est'] - u['usd']:.2f} at API prices (subscription, not billed)")
+        parts.append(f"${u['est'] - u['usd']:.2f} unbilled (a subscription run, at API prices)")
     return " + ".join(parts) or "$0 (local)"
 
 def usage_line(t, u, short=False) -> str:
@@ -277,16 +277,16 @@ def run_record(t, detail: dict) -> str:
         rows = []
         for c in calls:
             est = c["est_usd"] if c["est_usd"] is not None else c["usd"]
-            price = (f"${c['usd']:.2f}" if c["usd"] >= 0.005 else f"≈${est:.2f}" if est and est >= 0.005
-                     else "")
+            price = (f"${c['usd']:.2f} billed" if c["usd"] >= 0.005
+                     else f"${est:.2f} unbilled" if est and est >= 0.005 else "")
             took = duration(c["secs"])
             rows.append(f"<li><div class=l1><div><b>{e(c['backend'])}</b> {e(c['role'] or '')}</div>"
                         f"<span>{e(price)}</span></div><div class=l2>{local(c['ts']):%a %b %d %H:%M}"
                         + (f", {e(took)}" if took else "")
                         + f", {tokens(c['tokens_in'])} tokens in, {tokens(c['tokens_out'])} out</div></li>")
         out += (f"<div class='card list'><ul class=calls aria-label='Model calls'>{''.join(rows)}</ul></div>"
-                "<p class=hint>Model calls, oldest first. A plain cost was billed to the API "
-                "credit; ≈ is what a subscription run would have cost at API prices, not billed.</p>")
+                "<p class=hint>Model calls, oldest first. Billed was charged to the API credit; "
+                "unbilled is what a subscription run would have cost at API prices.</p>")
     else:
         out += "<p class=hint>No model has worked on this task yet.</p>"
     if t["feedback"]:

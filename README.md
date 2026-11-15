@@ -244,7 +244,7 @@ Three things open a breakdown when clicked:
 
 There are two kinds of cost on the page, and only one of them is money you
 paid. A plain figure was billed to the API credit; only the `anthropic_api`
-backend (`claude_api`) does that. A figure marked "unbilled" or "≈" is what a
+backend (`claude_api`) does that. A figure marked "unbilled" is what a
 run on a flat-rate plan (`claude -p` on the claude.ai subscription) would have
 cost at API prices, worked out from its token counts; nobody was charged it.
 Local models cost nothing.

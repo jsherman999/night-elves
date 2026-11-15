@@ -954,7 +954,8 @@ class DashboardTests(Base):
         page = dash.render(d)
         for part in (f"#{self.busy} running", "1 waiting", "$0.25", "summarise &lt;b&gt;logs&lt;/b&gt;",
                      "-&gt; &lt;failed&gt;: boom", f"<a href=/t/{self.done}>", "<svg", "claude_agent: 10m",
-                     "✓ ready", "… waiting", "≈$1.50"):
+                     "✓ ready", "… waiting", "<th class=n>Billed<th class=n>Unbilled",
+                     "<td class=n>-</td><td class=n>$1.50</td>", "<td class=n>$0.25</td><td class=n>-</td>"):
             self.assertIn(part, page, part)
         self.assertNotIn("<b>logs", page)
         view = dash.render(d, links=False, tasks=False)
@@ -1603,7 +1604,7 @@ class SizeUpAndUsageTests(Base):
         self.assertIn("30 tok · $0.50", pages.row(t, u))
         db.record_spend(self.conn, "claude_agent", tid, "execute", 1000, 50, 0.0, est_usd=1.25)
         u = db.usage(self.conn, [tid])[tid]
-        self.assertIn("≈$1.25 at API prices", pages.cost(u))
+        self.assertIn("$1.25 unbilled", pages.cost(u))
         self.assertEqual(pages.cost({"usd": 0.0, "est": 0.0}), "$0 (local)")
         self.assertEqual((pages.duration(59), pages.duration(754), pages.duration(4000)),
                          ("59s", "12m 34s", "1h 06m"))

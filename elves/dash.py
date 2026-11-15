@@ -368,12 +368,12 @@ def chart(d: dict, key: str, title: str, sub: str, fmt, div: float = 1) -> str:
 def _money(v: float) -> str:
     return f"${v:,.2f}" if v >= 0.005 or v == 0 else "<$0.01"
 
-def _task_cost(u: dict | None) -> str:
-    if not u:
-        return "-"
-    sub = u["est"] - u["usd"]
-    parts = ([_money(u["usd"])] if u["usd"] >= 0.005 else []) + ([f"≈{_money(sub)}"] if sub >= 0.005 else [])
-    return " + ".join(parts) or "-"
+def _split(usd: float | None, est: float | None) -> str:
+    """Two cells: what was billed to the API credit, and what was not (est is the whole cost
+    at API prices)."""
+    usd, sub = usd or 0.0, (est or 0.0) - (usd or 0.0)
+    return (f"<td class=n>{e(_money(usd)) if usd >= 0.005 else '-'}</td>"
+            f"<td class=n>{e(_money(sub)) if sub >= 0.005 else '-'}</td>")
 
 def _mins(secs: float) -> str:
     return pages.duration(secs) or "0s"
@@ -546,28 +546,28 @@ def render(d: dict, links: bool = True, msg: str | None = None, tasks: bool = Tr
                     f"</span></td><td>{e(t['tier'])}</td><td>{e(t['backend'] or '-')}</td>"
                     f"<td>{pages.local(t['updated_at']):%a %H:%M}</td><td class=n>{e(tries or '-')}</td>"
                     f"<td class=n>{e(pages.duration(t['secs']) or '-')}</td>"
-                    f"<td class=n>{e(_task_cost(u))}</td>"
+                    f"{_split(u['usd'], u['est']) if u else _split(0, 0)}"
                     f"<td class=w>{e(' '.join(t['prompt'].split())[:110])}{err}</td></tr>")
     body.append("<h2>Tasks, most recently changed</h2><div class='card scroll'><table class=d><tr><th>Task"
                 "<th>Status<th>Tier<th>Backend<th>Changed<th class=n>Failed tries<th class=n>Time"
-                "<th class=n>Cost<th>Prompt and last error</tr>" + "".join(rows) + "</table></div>"
-                "<p class=hint>Cost: a plain figure was billed to the API credit; ≈ marks what "
-                "subscription runs would have cost at API prices, which was not billed."
+                "<th class=n>Billed<th class=n>Unbilled<th>Prompt and last error</tr>"
+                + "".join(rows) + "</table></div>"
+                "<p class=hint>Billed was charged to the API credit. Unbilled is what subscription "
+                "runs would have cost at API prices; nobody was charged it."
                 + (" Click a task's number for its details." if tasks else "") + "</p>")
 
     rows = []
     for r in d["runs"]:
         est = r["est_usd"] if r["est_usd"] is not None else r["usd"]
-        price = (_money(r["usd"]) if r["usd"] >= 0.005 else f"≈{_money(est)}" if est and est >= 0.005 else "-")
         rows.append(f"<tr><td>{pages.local(r['ts']):%a %H:%M:%S}</td><td>{task_ref(r['task_id'])}</td>"
                     f"<td><i class=sw style='background:var(--s{_slot(names, r['backend'])})'></i>{e(r['backend'])}</td>"
                     f"<td>{e(r['role'] or '')}</td><td class=n>{r['tokens_in']:,}</td>"
                     f"<td class=n>{r['tokens_out']:,}</td><td class=n>{e(pages.duration(r['secs']) or '-')}</td>"
-                    f"<td class=n>{e(price)}</td><td class=w>{e(' '.join((r['prompt'] or '').split())[:70])}</td></tr>")
+                    f"{_split(r['usd'], est)}<td class=w>{e(' '.join((r['prompt'] or '').split())[:70])}</td></tr>")
     body.append(f"<h2>Model calls, latest {RUNS}</h2><div class='card scroll'><table class=d><tr><th>Ended"
                 "<th>Task<th>Backend<th>Role<th class=n>Tokens in<th class=n>Tokens out<th class=n>Time"
-                "<th class=n>Cost<th>Task prompt</tr>" + "".join(rows) + "</table></div>"
-                "<p class=hint>≈ marks a cost at API prices that was not billed.</p>")
+                "<th class=n>Billed<th class=n>Unbilled<th>Task prompt</tr>" + "".join(rows)
+                + "</table></div>")
 
     logs = "".join(f"<details{' open' if n == 'nightly' else ''}><summary>{n}.log</summary>"
                    f"<pre>{e(text) or '(empty)'}</pre></details>" for n, text in d["logs"].items())
