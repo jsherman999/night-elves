@@ -290,6 +290,39 @@ addresses, redirects included, so a page can't steer a fetch into this Mac's own
 services or the LAN. Files that aren't text (archives, PDFs) count as existing
 but aren't read.
 
+#### Pages that need a browser
+
+The plain fetch gets nothing from a page that is drawn by JavaScript. Point the
+backend at a [Jev browser service](https://github.com/jsherman999/jev_local_web_seatch-)
+and those pages are read in a real, headless Chrome instead:
+
+```toml
+[backends.local]
+reader_url = "http://127.0.0.1:8776"
+reader_pages = 4      # browser reads per task
+reader_timeout = 90   # seconds each
+```
+
+The browser is tried only when the plain fetch is refused (HTTP 401, 403, 429
+and the like) or an HTML page comes back with under 400 characters of text, and
+never for the link probes of stage 5. It is asked to dismiss a consent banner
+and stop: no following links, no forms. What it read goes through the same
+stages as any page, and the research record says which pages were read that
+way and why. The service's bearer token is read from `$ELVES_READER_TOKEN`
+(put it in `~/.night-elves/env`); it is removed from what agents and their
+checks are given, so a check, which may reach localhost, can't use the browser
+to reach the internet.
+
+What it doesn't do: get past a bot check. Cloudflare and its like turn a
+headless browser away too, and on the Studio Stack Overflow, Reddit and npm all
+answered with a "verify you are human" page. Those reads are refused (the
+record says "the site's bot check stopped the browser too"), so such a page is
+never handed to the model as the page. And the browser, unlike the plain fetch,
+is not held to the public internet: the URL is checked before it is sent, and a
+read that passed through a private address is thrown away, which keeps that
+page's text from the model but can't stop the request being made. Each read
+sends the page to TypeSafe (Jev's model) and costs a fraction of a cent.
+
 Two limits remain. The checks catch invented links, misquoted pages and claims
 the notes don't support; they can't tell whether the right pages were found or
 whether a page is itself wrong, so a local model's research is still a draft.

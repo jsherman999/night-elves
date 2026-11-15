@@ -427,7 +427,7 @@ class Night:
             prompt, task["prompt"],
             lambda p, system: self.call(executor, tid, "execute", p, system, files=files),
             lambda p, system: self.call(checker, tid, "review", p, system),
-            webtools.Session(c["search_url"]), research.Opts.of(c),
+            webtools.Session(c["search_url"], webtools.Reader.of(c)), research.Opts.of(c),
             must=task["needs"] == "web", checker=checker)
         if out is not None:
             return out

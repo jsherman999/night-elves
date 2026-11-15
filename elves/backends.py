@@ -291,7 +291,7 @@ def parse_output(kind: str, out: str) -> Result:
 def environ(c: dict, cwd: str | None) -> dict:
     """The environment a command backend (and an agent's check) runs with: env_unset removed,
     then the backend's env table added, with "{cwd}" replaced by the task's workspace."""
-    drop = set(c.get("env_unset", ["ANTHROPIC_API_KEY", "ELVES_TOKEN"]))
+    drop = set(c.get("env_unset", ["ANTHROPIC_API_KEY", "ELVES_TOKEN", "ELVES_READER_TOKEN"]))
     env = {k: v for k, v in os.environ.items() if k not in drop}
     for k, v in c.get("env", {}).items():
         if "{cwd}" not in v or cwd:

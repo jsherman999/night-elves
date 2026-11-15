@@ -1569,7 +1569,7 @@ class Web(webtools.Session):
         hits = [{"title": t, "url": u, "snippet": ""} for t, u in self.results.get(query, [])]
         self.seen.update(webtools.norm(h["url"]) for h in hits)
         return hits
-    def open(self, url):
+    def open(self, url, browse=True):
         if url in self.pages:
             return self.pages[url]
         if url in self.canned_files:
@@ -1639,6 +1639,103 @@ class LocalSearchTests(Base):
             with self.assertRaises(webtools.Refused):  # each redirect is checked too
                 webtools._Redirects().redirect_request(None, None, 302, "", {}, "http://10.0.0.5/")
         chk.assert_called_once_with("http://10.0.0.5/")
+
+    def jev(self, pages, token="tok"):
+        """A stand-in for the Jev browser service: pages maps a URL to the job it ends as."""
+        from http.server import BaseHTTPRequestHandler
+        log, jobs = [], {}
+        class H(BaseHTTPRequestHandler):
+            def reply(self, code, body=None):
+                raw = json.dumps(body).encode() if body is not None else b""
+                self.send_response(code)
+                self.send_header("Content-Length", str(len(raw)))
+                self.end_headers()
+                self.wfile.write(raw)
+            def handle_it(self):
+                n = int(self.headers.get("Content-Length") or 0)
+                body = json.loads(self.rfile.read(n)) if n else None
+                log.append((self.command, self.path, body))
+                if self.headers.get("Authorization") != f"Bearer {token}":
+                    return self.reply(401, {"detail": "no"})
+                if self.command == "POST" and self.path == "/v1/jobs":
+                    jobs["j1"] = pages[body["url"]]
+                    return self.reply(202, {"id": "j1", "status": "queued"})
+                if self.command == "GET":
+                    return self.reply(200, {"id": "j1", **jobs["j1"]})
+                self.reply(204)
+            do_GET = do_POST = do_DELETE = handle_it
+            def log_message(self, *a):
+                pass
+        srv = ThreadingHTTPServer(("127.0.0.1", 0), H)
+        threading.Thread(target=srv.serve_forever, daemon=True).start()
+        self.addCleanup(srv.shutdown)
+        return f"http://127.0.0.1:{srv.server_port}", log
+
+    def test_browser_reads_pages_the_plain_fetch_cannot(self):
+        base, seen = self.serve({
+            "/blocked": (403, "text/html", b"<p>robots go away</p>"),
+            "/app": (200, "text/html", b"<div id=root></div><script>render()</script>"),
+            "/fine": (200, "text/html", ("<p>" + "plenty of text " * 40 + "</p>").encode()),
+            "/short.txt": (200, "text/plain", b"v1.2"),
+            "/inside": (403, "text/html", b""),
+            "/dud": (403, "text/html", b""),
+            "/wall": (403, "text/html", b""),
+        })
+        PRICE = "The price is $459.99. " + "It is a big black tower. " * 20
+        def done(text, visited=(), links=()):
+            return {"status": "completed", "result": {
+                "page": {"url": visited[-1] if visited else base, "text": text,
+                         "links": [{"text": "the  manual", "url": u} for u in links]},
+                "visited_urls": list(visited)}}
+        jev, log = self.jev({
+            base + "/blocked": done(PRICE, links=["https://ex.org/manual", "ftp://x/y"]),
+            base + "/app": done("Rendered: 5,471 pieces. " + PRICE),
+            base + "/wall": done("example.org Performing security verification. " * 9),
+            base + "/inside": done("router admin password", visited=[base + "/inside", "http://10.0.0.1/"]),
+            base + "/dud": {"status": "failed", "error": "Browser worker failed", "result": None},
+        })
+        with mock.patch.dict(os.environ, {"ELVES_READER_TOKEN": "tok"}):
+            reader = webtools.Reader.of({"reader_url": jev, "reader_pages": 5})
+        self.assertIsNone(webtools.Reader.of({}))
+        s = webtools.Session(base, reader)
+        real = webtools.check_url
+        def check(u):  # the test servers are local; 10.x stays private
+            return u if u.startswith("http://127.0.0.1") else real(u)
+        with mock.patch.object(webtools, "check_url", check), mock.patch.object(webtools.time, "sleep"):
+            self.assertEqual(s.open(base + "/blocked"),
+                             PRICE.strip() + "\n\nLinks on the page:\n- [the manual](https://ex.org/manual)")
+            self.assertTrue(s.open(base + "/app").startswith("Rendered: 5,471 pieces"))
+            self.assertTrue(s.open(base + "/fine").startswith("plenty"))  # no browser needed
+            self.assertEqual(s.open(base + "/short.txt"), "v1.2")  # short, but not a web page
+            self.assertIsNone(s.open(base + "/inside"))
+            self.assertIsNone(s.open(base + "/dud"))
+            self.assertIsNone(s.open(base + "/wall"))  # a bot check's page is not the page
+            self.assertIsNone(s.open(base + "/blocked2"))  # 404: gone, not worth a browser
+            posts = [b["url"] for m, p, b in log if m == "POST" and p == "/v1/jobs"]
+            self.assertEqual(posts, [base + p for p in ("/blocked", "/app", "/inside", "/dud", "/wall")])
+            self.assertFalse(reader.available())  # five reads for this task, all used
+            self.assertIsNone(s.open(base + "/blocked?again"))
+        job = next(b for m, p, b in log if m == "POST")
+        self.assertEqual((job["isolate_browser"], job["max_steps"]), (True, 6))
+        self.assertIn("Do not follow links", job["goal"])
+        self.assertEqual(sum(m == "DELETE" for m, _, _ in log), 5)
+        self.assertIn("bot check stopped the browser too", s.errors[base + "/wall"])  # nothing left in the service
+        self.assertEqual(s.browsed, {base + "/blocked": "HTTP 403",
+                                     base + "/app": "no readable text (it may need JavaScript)"})
+        self.assertIn("not on the public internet", s.errors[base + "/inside"])
+        self.assertIn("HTTP 403; in the browser: the browser got nothing (failed", s.errors[base + "/dud"])
+        self.assertEqual(s.errors[base + "/blocked2"], "HTTP 404")
+        self.assertIn("ex.org/manual", s.seen)  # its links can be followed and cited
+        rec = research.record(s, {base + "/blocked": ["- n"]}, 0, research.Links([], [], [], [], []), [], None)
+        self.assertIn(f"Read in the browser, because the plain fetch got HTTP 403: <{base}/blocked>", rec)
+        # A probe for whether a link is alive never uses the browser.
+        s2 = webtools.Session(base, webtools.Reader(jev, "tok"))
+        with mock.patch.object(webtools, "ALLOW_PRIVATE", True):
+            self.assertFalse(s2.exists(base + "/blocked"))
+        self.assertEqual(s2.reader.left, 4)
+        # The token stays out of what agents and their checks are given.
+        with mock.patch.dict(os.environ, {"ELVES_READER_TOKEN": "tok"}):
+            self.assertNotIn("ELVES_READER_TOKEN", backends.environ({}, None))
 
     def test_html_becomes_text_with_links(self):
         text = webtools.html_text(
@@ -1857,7 +1954,7 @@ class LocalSearchTests(Base):
                      else "TCP is a protocol.")
         checker = Fake(lambda p, s: "OK" if "checking a research result" in s else "PASS")
         made = []
-        def session(url):
+        def session(url, reader=None):
             made.append(url)
             return Web(self.RESULTS, self.PAGES)
         researched = db.add_task(self.conn, "where is the 3b2 emulator?", tier="local")
@@ -1882,7 +1979,7 @@ class LocalSearchTests(Base):
         self.cfg["backends"]["claude_cli"]["window"] = [1, 2]
         later = db.add_task(self.conn, "more news about the 3b2")
         db.update(self.conn, later, needs="web")
-        with mock.patch.object(webtools, "Session", lambda url: Web({"more news about the 3b2": self.RESULTS["3b2 emulator"]}, self.PAGES)):
+        with mock.patch.object(webtools, "Session", lambda url, reader=None: Web({"more news about the 3b2": self.RESULTS["3b2 emulator"]}, self.PAGES)):
             self.night(3, hour=9, local=local, local_vision=checker).run()
         t = db.get(self.conn, later)
         self.assertEqual((t["status"], t["backend"]), ("done", "local"))
@@ -1891,7 +1988,7 @@ class LocalSearchTests(Base):
         self.cfg["backends"]["local"]["min_pages"] = 3
         thin = db.add_task(self.conn, "where is the 3b2 emulator, again?", tier="local")
         m.replies["plan"] = ["3b2 emulator"]
-        with mock.patch.object(webtools, "Session", lambda url: Web(self.RESULTS, {})):
+        with mock.patch.object(webtools, "Session", lambda url, reader=None: Web(self.RESULTS, {})):
             self.night(3, hour=9, local=local, local_vision=checker).run()
         t = db.get(self.conn, thin)
         self.assertEqual((t["status"], t["attempts"]), ("queued", 1))

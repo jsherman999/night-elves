@@ -274,6 +274,9 @@ def record(s, notes, dropped, links: Links, flagged, checker, given_to_read=(), 
     empty = [u for u in given_to_read if u not in notes]
     if empty:
         out.append("- Read, but nothing useful for the task: " + ", ".join(f"<{u}>" for u in empty))
+    if s.browsed:
+        out.append("- Read in the browser, because the plain fetch got "
+                   + "; ".join(f"{w}: <{u}>" for u, w in s.browsed.items()))
     bad = [(u, w) for u, w in s.errors.items()]
     if bad:
         out.append("- Couldn't open: " + "; ".join(f"{u if u.startswith('search: ') else f'<{u}>'} ({w})"

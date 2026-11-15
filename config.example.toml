@@ -34,6 +34,9 @@ timeout = 3600
 # search_url = "http://127.0.0.1:8888"   # a SearXNG instance (JSON output on): tasks are then
 # max_pages = 10                         # researched on the web in stages (README, Local web
 # min_pages = 2                          # search); fewer useful pages than min_pages fails
+# reader_url = "http://127.0.0.1:8776"   # a Jev browser service, for pages the plain fetch
+# reader_pages = 4                       # can't read (JavaScript pages); at most this many a
+                                         # task. Its token goes in $ELVES_READER_TOKEN
 # [backends.local.extra]                 # added to each request as it is, e.g. for gpt-oss:
 # reasoning_effort = "high"
 
