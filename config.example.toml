@@ -137,6 +137,20 @@ PIP_CACHE_DIR = "{cwd}/.cache/pip"
 npm_config_cache = "{cwd}/.cache/npm"
 XDG_CACHE_HOME = "{cwd}/.cache"
 
+[backends.cmd_review]                     # the same CLI as a second reviewer: roles.stand_in
+type = "command"                          # (see "A stand-in for the manager")
+enabled = false
+argv = ["srt", "--settings", "~/.night-elves/srt-cmd-review.json", "--",  # copy of
+        "cmd", "-p", "--output-format", "json", "--yolo",   # srt-cmd-review.example.json: it may
+        "--skip-onboarding", "--no-auto-update", "--max-turns", "40",  # read, but not write
+        "-m", "qwen/qwen3.7-max"]
+output = "cmd-json"
+max_runs_per_night = 15                   # a review costs a few cents of the plan's credit
+timeout = 300
+
+[backends.cmd_review.env]
+NODE_USE_ENV_PROXY = "1"
+
 [backends.codex]                          # ChatGPT plan via Codex CLI: reviews local answers, and
 type = "command"                          # manages the local agent (see "A manager for the local
 enabled = false                           # agent"). Sign in first: codex login --device-auth
@@ -164,6 +178,8 @@ local_agent = ""             # "local_agent": agent tasks try it first (see Agen
 agent_review = ""            # "codex": reads the local agent's work before it is accepted
 agent_handoff = ""           # "codex": leaves the next run a note when a local agent run stops
 agent_plan = ""              # "codex": writes the plan the local agent follows
+stand_in = ""                # "cmd_review": reviews and manages when the one named above (or
+                             # second_opinion) is out of runs, down, or fails
 classifier = ""              # sizes up auto tasks as agent / web / answer; "" = local, "off"
 guide = ""                   # writes a task's Guide / fix; "" = frontier_sub, else frontier_api
 

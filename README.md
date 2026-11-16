@@ -741,6 +741,33 @@ alone for the rest of the run. The same
 goes for the reviewer of a local answer: when it fails, the local reviewer
 reviews instead, and the task doesn't lose an attempt.
 
+#### A stand-in for the manager
+
+A flat-rate plan runs out: Codex stops at its `max_runs_per_night`, or its
+weekly limit, or it hangs once and is left alone for the rest of the run.
+`roles.stand_in` names a backend that takes the call instead:
+
+- for the manager roles that are set (`agent_review`, `agent_handoff`,
+  `agent_plan`), when the manager can't run now, or its call fails;
+- for the review of a local answer, when `second_opinion` can't run or fails.
+  The order is `second_opinion`, then `stand_in`, then the local reviewer.
+
+It is asked only when the one named for the job couldn't do it, and a role that
+is off stays off. If the stand-in fails too, the task goes on as before: an
+answer is reviewed locally, and an agent's work is accepted on its check. The
+result file and the task's page name whoever gave the review.
+
+`[backends.cmd_review]` in `config.example.toml` is Command Code's `cmd` in that
+role, with `srt-cmd-review.example.json`: it can read the workspace, write only
+its own `~/.commandcode`, and reach only Command Code. Shown a `slugify` that
+passed its one weak test but left doubled and trailing hyphens, `qwen/qwen3.7-max`
+replied FAIL and named both faults and the thin test; shown the fixed one, PASS.
+The two reviews took 14 and 23 seconds and read 32K and 114K tokens. At the
+plan's rate (about $0.40 per million tokens read, measured on 2026-11-15) that
+is 1 to 5 cents a review, against the Go plan's caps of $3 per five hours and
+$6 per week. The task and what it reads in the workspace go to Command Code and
+the model's host.
+
 To use Codex on a ChatGPT plan as the manager:
 
 ```sh

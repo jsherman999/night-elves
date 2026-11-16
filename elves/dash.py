@@ -31,6 +31,7 @@ ROLE_TEXT = {
     "agent_review": "reads the local agent's work before it is accepted",
     "agent_handoff": "leaves the next run a note when the local agent stops unfinished",
     "agent_plan": "plans the local agent's work",
+    "stand_in": "reviews and manages when the backend named for that can't",
     "classifier": "sizes up auto tasks as agent, web or answer",
     "guide": "writes the guide when you press Guide / fix on a task",
 }

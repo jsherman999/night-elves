@@ -479,6 +479,47 @@ class DispatchTests(Base):
         self.assertEqual((t["status"], t["attempts"]), ("done", 0))
         self.assertIn("## Review (local)", open(t["result_path"]).read())
 
+    def test_stand_in_reviews_and_manages_when_the_one_named_cannot(self):
+        self.managed_cfg("agent_review", "agent_handoff")
+        del self.cfg["backends"]["claude_agent"]
+        self.cfg["backends"]["cmd_review"] = {"type": "command", "argv": ["x"]}
+        self.cfg["roles"]["stand_in"] = "cmd_review"
+        agent = db.add_task(self.conn, "build it", tier="agent")
+        verdicts = iter(["FAIL\nno tests", "PASS"])
+        spare, la = Fake(lambda p, s: next(verdicts)), Fake("STATUS: DONE\nCHECK: true")
+        n = self.night(18, hour=2, local_agent=la, codex=Fake(fail=99), cmd_review=spare)
+        n.run()
+        t = db.get(self.conn, agent)
+        self.assertEqual((t["status"], t["attempts"], len(spare.calls)), ("done", 1, 2))
+        self.assertEqual(spare.cwd, os.path.join(self.tmp, "work", str(agent)))
+        self.assertIn("rejected by the reviewer (cmd_review)", la.calls[1][0])
+        self.assertIn("## Review (cmd_review)\n\nPASS", open(t["result_path"]).read())
+        # an answer's reviewer: codex is out of runs, so the stand-in reads it, not the local model
+        self.cfg["backends"]["codex"]["max_runs_per_night"] = 0
+        tid = db.add_task(self.conn, "summarise logs")
+        local, spare = Fake("answer"), Fake("PASS")
+        self.night(5, hour=12, local=local, codex=Fake("PASS"), cmd_review=spare).run()
+        t = db.get(self.conn, tid)
+        self.assertEqual((t["status"], len(spare.calls), len(local.calls)), ("done", 1, 1))
+        self.assertIn("## Review (cmd_review)", open(t["result_path"]).read())
+        # when the stand-in fails too, an answer falls to the local reviewer and an agent's
+        # work is accepted on its check, as it would be with no manager
+        tid = db.add_task(self.conn, "summarise more logs")
+        other = db.add_task(self.conn, "build another", tier="agent")
+        local = Fake(lambda p, s: "PASS" if "reviewing" in s else "answer")
+        self.night(6, hour=2, local=local, local_agent=Fake("STATUS: DONE\nCHECK: true"),
+                   codex=Fake("PASS"), cmd_review=Fake(fail=99)).run()
+        self.assertIn("## Review (local)", open(db.get(self.conn, tid)["result_path"]).read())
+        t = db.get(self.conn, other)
+        self.assertEqual((t["status"], t["attempts"]), ("done", 0))
+        self.assertNotIn("## Review", open(t["result_path"]).read())
+        # a manager role that isn't set stays off: the stand-in doesn't take it up
+        self.cfg["roles"]["agent_review"] = ""
+        quiet = db.add_task(self.conn, "build a third", tier="agent")
+        spare = Fake("PASS")
+        self.night(21, hour=2, local_agent=Fake("STATUS: DONE\nCHECK: true"), cmd_review=spare).run()
+        self.assertEqual((db.get(self.conn, quiet)["status"], len(spare.calls)), ("done", 0))
+
     def test_codex_json_output(self):
         out = "\n".join(json.dumps(e) for e in (
             {"type": "thread.started", "thread_id": "t"},
@@ -944,6 +985,11 @@ class WorkflowTests(Base):
             self.assertIn(part, page, part)
         self.assertEqual(page.count("<svg"), 3)
         self.assertNotIn("<script", page)
+        cfg["backends"]["cmd_review"] = {"type": "command", "argv": ["cmd", "-m", "qwen/qwen3.7-max"]}
+        cfg["roles"]["stand_in"] = "cmd_review"
+        page = "".join(fig.svg() for fig, _, _ in self.fits(cfg))
+        for part in ("codex, then cmd_review, ", "cmd_review if it can&#x27;t"):
+            self.assertIn(part, page, part)
         self.fits(cfg)
         # A file on its own carries its colours with it.
         static = workflow.figures(cfg)[2][0].svg(static=True)

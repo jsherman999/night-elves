@@ -1,0 +1,25 @@
+{
+  "network": {
+    "allowedDomains": [
+      "api.commandcode.ai",
+      "commandcode.ai"
+    ],
+    "deniedDomains": []
+  },
+  "filesystem": {
+    "denyRead": [
+      "~/.ssh",
+      "~/.gnupg",
+      "~/.aws",
+      "~/.config",
+      "~/.night-elves/env",
+      "~/.night-elves/queue.db",
+      "~/Library/Keychains",
+      "~/Library/Messages"
+    ],
+    "allowWrite": [
+      "~/.commandcode"
+    ],
+    "denyWrite": []
+  }
+}

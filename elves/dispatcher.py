@@ -318,11 +318,12 @@ class Night:
 
     def _review(self, task, r, crit, answer) -> tuple[str, str | None]:
         """The reviewer's reply and who gave it. A reviewer that can't answer (a flat-rate
-        plan out of quota, say) doesn't cost the task an attempt: the local reviewer stands
-        in, and only its failure is the task's."""
+        plan out of quota, say) doesn't cost the task an attempt: roles.stand_in reviews
+        instead, then the local reviewer, and only the last one's failure is the task's."""
         roles, tid = self.cfg["roles"], task["id"]
         spare = roles.get("local_review") or roles["local"]
-        names = [n for n in dict.fromkeys((r.reviewer, spare) if r.reviewer else ()) if self.ok(n)]
+        after = (roles.get("stand_in"), spare) if r.reviewer else ()
+        names = [n for n in dict.fromkeys((r.reviewer, *after)) if n and self.ok(n)]
         done_when = f"\n\nDone when:\n{crit}" if crit else ""
         prompt = f"Task:\n{task['prompt']}{done_when}\n\nResult:\n{answer}"
         for i, name in enumerate(names):
@@ -343,24 +344,28 @@ class Night:
         agent's reach: work/<id>.plan.md, work/<id>.last-run.md."""
         return Path(self.cfg["paths"]["work"]) / f"{tid}.{kind}.md"
 
-    def _manage(self, role, executor, task, kind, prompt, system, work) -> str:
+    def _manage(self, role, executor, task, kind, prompt, system, work) -> tuple[str, str | None]:
         """One call to the local agent's manager (roles.agent_plan, agent_review or
-        agent_handoff), run in the workspace. Only the local agent is managed: Claude's agent
-        is the stronger model. A manager that isn't set, can't run now, or fails returns "",
-        so the task goes on as it would without one."""
+        agent_handoff), run in the workspace. Returns its reply and who gave it. Only the
+        local agent is managed: Claude's agent is the stronger model. When the manager can't
+        run now, or fails, roles.stand_in is asked instead. A role that isn't set, or one
+        nobody could do, returns "", so the task goes on as it would without a manager."""
         roles, tid = self.cfg["roles"], task["id"]
-        name = roles.get(role)
-        if not name or executor != roles.get("local_agent") or name == executor or not self.ok(name):
-            return ""
-        in_work = self.cfg["backends"].get(name, {}).get("type") == "command"
-        try:
-            return self.call(name, tid, kind, prompt, system, cwd=str(work) if in_work else None)
-        except BackendError as e:
-            self.log(f"  #{tid}: {name} couldn't {kind} ({str(e)[:100]}); going on without it")
-            if isinstance(e, TimedOut):  # a manager's calls are short: one that hangs would
-                self.down.add(name)      # cost every task after this its whole time limit
-                self.log(f"  {name} marked down for this run")
-            return ""
+        if not roles.get(role) or executor != roles.get("local_agent"):
+            return "", None
+        for name in dict.fromkeys((roles[role], roles.get("stand_in"))):
+            if not name or name == executor or not self.ok(name):
+                continue
+            in_work = self.cfg["backends"].get(name, {}).get("type") == "command"
+            try:
+                return self.call(name, tid, kind, prompt, system,
+                                 cwd=str(work) if in_work else None), name
+            except BackendError as e:
+                self.log(f"  #{tid}: {name} couldn't {kind} ({str(e)[:100]})")
+                if isinstance(e, TimedOut):  # a manager's calls are short: one that hangs would
+                    self.down.add(name)      # cost every task after this its whole time limit
+                    self.log(f"  {name} marked down for this run")
+        return "", None
 
     def _agent_plan(self, task, executor, prompt, work) -> str:
         """The manager's plan for this task, written once and kept for its later attempts
@@ -371,23 +376,21 @@ class Night:
             first, _, plan = side.read_text().partition("\n")
             if first == mark and plan.strip():
                 return plan
-        plan = self._manage("agent_plan", executor, task, "plan", prompt, AGENT_PLAN_SYS, work)
+        plan, _ = self._manage("agent_plan", executor, task, "plan", prompt, AGENT_PLAN_SYS, work)
         if plan:
             side.write_text(f"{mark}\n{plan}")
         return plan
 
     def _agent_review(self, task, executor, work, answer, check, crit) -> tuple[str, str | None]:
         """The manager reads work whose check passed. Returns its reply and its name."""
-        name = self.cfg["roles"].get("agent_review")
-        if not name:
+        if not self.cfg["roles"].get("agent_review"):
             return "", None
         done_when = f"\n\nDone when:\n{crit}" if crit else ""
         prompt = (f"Task:\n{task['prompt']}{done_when}\n\nThe end of the agent's reply:\n"
                   f"{answer.strip()[-3000:]}\n\nIts check, as night-elves ran it:\n{check}")
         db.update(self.conn, task["id"], status="review")
-        review = self._manage("agent_review", executor, task, "review", prompt,
-                              AGENT_REVIEW_SYS, work)
-        return review, name if review else None
+        return self._manage("agent_review", executor, task, "review", prompt,
+                            AGENT_REVIEW_SYS, work)
 
     def _keep_transcript(self, tid, executor, e) -> None:
         """After a run that was working and then stopped (out of time, or failed part-way),
@@ -409,9 +412,9 @@ class Night:
             return ""
         why, _, said = side.read_text().partition("\n\n")
         side.unlink()
-        note = self._manage("agent_handoff", executor, task, "handoff",
-                            f"Task:\n{task['prompt']}\n\nWhy the run stopped: {why}\n\n"
-                            f"The end of what the agent printed:\n{said}", HANDOFF_SYS, work)
+        note, _ = self._manage("agent_handoff", executor, task, "handoff",
+                               f"Task:\n{task['prompt']}\n\nWhy the run stopped: {why}\n\n"
+                               f"The end of what the agent printed:\n{said}", HANDOFF_SYS, work)
         return ("Someone with more experience read your workspace after that run stopped, and "
                 f"left you this note:\n{note}") if note else ""
 

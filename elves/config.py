@@ -29,6 +29,7 @@ DEFAULTS = {
               "agent_plan": "",     # writes the plan the local agent follows
               "agent_review": "",   # reads work whose check passed, before it is accepted
               "agent_handoff": "",  # writes a note for the next run when one stops unfinished
+              "stand_in": "",       # reviews or manages when the backend named for it can't
               "classifier": "",  # sizes up auto tasks (agent, web or answer); "" = local, "off"
               "guide": ""},  # writes a task's Guide / fix; "" = frontier_sub, else frontier_api
     "push": {"owners": []},  # GitHub owners an agent's PUSH may go to; [] = no pushes

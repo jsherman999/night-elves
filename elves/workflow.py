@@ -178,7 +178,8 @@ def answers(s: Setup) -> Fig:
     local, api, sub = s.name("local"), s.name("frontier_api"), s.name("frontier_sub")
     vision = s.name("local_vision")
     claude = api or sub
-    second = s.name("second_opinion")
+    second, stand_in = s.name("second_opinion"), s.name("stand_in")
+    second, stand_in = (second, stand_in) if second else (stand_in, "")
     spare = s.name("local_review") or local
     f.box(300, 34, 280, 42, ["A written-answer task", "tier auto, local or frontier"], "end")
     f.ask(300, 128, 250, 90, ["Frontier tier, or", "needs the web?"])
@@ -195,7 +196,9 @@ def answers(s: Setup) -> Fig:
         f.box(700, 250, 300, 52, ["Claude reads them", "no local vision model is set up"],
               s.kind(claude) if claude else "fail")
     f.box(300, 366, 300, 52, ["The local model answers", s.tag(local) if local else "none set up"], "local")
-    if second:
+    if stand_in:
+        who = f"{second[:12]}, then {stand_in[:12]}, {spare[:12]}"
+    elif second:
         who = f"{second[:16]}; {spare[:16]} if it can't"
     else:
         who = spare[:30]
@@ -233,6 +236,10 @@ def agents(s: Setup) -> Fig:
     f = Fig("wf3", 920, 1010, "How an agent task is worked, checked, reviewed, retried and escalated")
     la, ca = s.name("local_agent"), s.name("agent")
     review, handoff = s.name("agent_review"), s.name("agent_handoff")
+    stand_in = s.name("stand_in")
+    if stand_in:  # it does a manager's job when that one can't, or isn't switched on
+        review = review or (stand_in if s.roles.get("agent_review") else "")
+        handoff = handoff or (stand_in if s.roles.get("agent_handoff") else "")
     lim = s.cfg["limits"]
     hard, after, most, outs = (lim["hard_priority"], lim["escalate_after"], lim["max_attempts"],
                                lim["max_timeouts"])
@@ -259,8 +266,9 @@ def agents(s: Setup) -> Fig:
     f.box(450, 588, 280, 52, ["night-elves runs its CHECK command", "in a sandbox with no network"])
     f.ask(450, 684, 220, 80, ["Did it exit 0?"])
     if review:
-        f.box(450, 782, 280, 52, [f"{review[:18]} reads the workspace", "the local agent's work only"],
-              s.kind(review))
+        f.box(450, 782, 280, 52, [f"{review[:18]} reads the workspace",
+                                  f"{stand_in[:18]} if it can't" if stand_in not in ("", review)
+                                  else "the local agent's work only"], s.kind(review))
     else:
         f.box(450, 782, 280, 52, ["No second reader", "roles.agent_review is not set"])
     f.ask(450, 878, 220, 80, ["PASS?"])
@@ -311,7 +319,8 @@ FAILURES = (
     ("The task reaches its API spending limit",
      "Failed at once, since trying again would be refused again ([budget] max_usd_per_task)."),
     ("A reviewer or the agent's manager can't answer",
-     "The task carries on without it: the local reviewer stands in, or the step is skipped."),
+     "The task carries on without it: roles.stand_in does the job if one is set, then the "
+     "local reviewer for an answer; a manager's step nobody can do is skipped."),
     ("A task failed, or its result isn't what you wanted",
      "On the task's page: Run again, or add instructions and resubmit. Guide / fix has a "
      "frontier model read the run and write those instructions for you to edit."),
