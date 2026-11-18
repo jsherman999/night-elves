@@ -455,7 +455,9 @@ class Night:
 
     def _agent(self, task, executor, prompt, cwd) -> str:
         """Run an agent, continuing its earlier session when the backend can (session_args in
-        its config) and this task has one, so a retry picks up where the last run stopped."""
+        its config) and this task has one, so a retry picks up where the last run stopped.
+        session_args = [] is a backend that names its sessions itself and continues the
+        workspace's last one (agy's resume_args = ["--continue"])."""
         c, tid = self.cfg["backends"].get(executor, {}), task["id"]
         contract = CONTRACT.format(minutes=max(self.cfg["limits"]["check_timeout"] // 60, 1))
         if push.asked(task["prompt"]):
@@ -485,7 +487,7 @@ class Night:
                     raise
                 self.log(f"  #{tid}: session {sid} is gone, starting a new one")
         args = []
-        if fresh:
+        if fresh is not None:
             sid = str(uuid.uuid4())
             db.update(self.conn, tid, session=f"{executor} {sid}")  # before: a timeout keeps it
             args = fill(fresh, sid)

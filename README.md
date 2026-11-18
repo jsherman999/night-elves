@@ -843,6 +843,55 @@ gpt-oss-120b passed 3 of 8 the same way, and local qwen3.8-27b ran out of a
 900-second limit on every run. The task and everything the agent reads go to
 Command Code and the model's host, and each run spends the plan's credit.
 
+### Gemini, through Antigravity
+
+A Google AI plan reaches Gemini through the Antigravity CLI, `agy` (Gemini CLI
+stopped serving personal plans on 2026-06-18). `[backends.gemini]` in
+`config.example.toml` is a reviewer and writer of answers; `[backends.gemini_agent]`
+is an agent. Install it with Google's script
+(`curl -fsSL https://antigravity.google/cli/install.sh | bash`), then run `agy`
+once in a terminal to sign in; over SSH it prints an address and takes the code
+you paste back. Put either backend in a role, alone or in a list after the one
+you prefer: `agent_review = ["codex", "gemini"]`.
+
+`agy` differs from the other CLIs in ways the two sandbox files allow for:
+
+- It keeps its sign-in in the macOS Keychain, not in a file, so the sandbox
+  can't deny `~/Library/Keychains`, and it needs `enableWeakerNetworkIsolation`
+  to check certificates. It also listens on a local port.
+- It exits 0 when it couldn't sign in or the model failed; `output = "agy-json"`
+  reads the status it reports instead.
+- It names its conversations itself. `session_args = []` with `resume_args =
+  ["--continue"]` continues the last one of the task's workspace.
+
+**As a reviewer** (`srt-agy-review.example.json`) it is as contained as Codex:
+without a terminal of its own `agy` can't run any command, so it reads files
+and nothing else, writes only `~/.gemini`, and reaches only Google. A probe on
+2026-11-18 confirmed each of those. Shown the `slugify` that passed its one
+weak test, Gemini 4 Argon and Gemini 3.8 Flash both replied FAIL and named the
+faults; shown the fixed one, PASS; 20 to 33 seconds and 19K to 39K tokens each.
+
+**As an agent** (`srt-agy.example.json`) it needs a terminal, and then a
+command it runs can ask the Keychain for any entry that doesn't require
+approval. In the probe a command inside the sandbox could read Claude Code's
+sign-in and GitHub's token as well as `agy`'s own. The rest held: no writing
+outside the workspace, no `~/.ssh`, no site off the list, no `sudo`. `agy`'s own
+`--sandbox` is no substitute: it kept commands from the Keychain and `~/.ssh`,
+but let them write in the home folder and reach any site. Use the agent backend
+only on a Mac whose Keychain holds nothing you would mind an agent reading.
+
+The hidden-test tasks, through the dispatcher with no manager, twice each
+(`agent-bench.py <model> --backend gemini_agent --manager none`):
+
+| Model | Passed all hidden tests | Mean time | Tokens read, 6 runs |
+|---|---|---|---|
+| `gemini-4-hydrogen-high` | 6 of 6 | 106 s | 1.0M |
+| `gemini-4-argon-medium` | 6 of 6 | 163 s | 0.6M |
+
+Every run finished on its first attempt. The plan's quota refreshes every five
+hours up to a weekly limit; night-elves can't read it, so `max_runs_per_night`
+is the brake. The task and what the model reads go to Google.
+
 ### Setting up the local agent
 
 On the Studio this needs opencode, LM Studio with the model loaded, and

@@ -676,7 +676,8 @@ def main():
 
     def for_model(model: str) -> dict:
         argv = list(base["argv"])
-        argv[argv.index("-m") + 1] = f"lmstudio/{model}" if local else model
+        flag = "-m" if "-m" in argv else "--model"  # agy has only the long one
+        argv[argv.index(flag) + 1] = f"lmstudio/{model}" if local else model
         env = {**base.get("env", {}), **({"OPENCODE_CONFIG": str(out / "opencode.json")} if local else {})}
         return {**base, "argv": argv, "timeout": a.timeout, "env": env}
     contract = CONTRACT.format(minutes=max(cfg["limits"]["check_timeout"] // 60, 1))

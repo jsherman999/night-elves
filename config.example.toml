@@ -151,6 +151,36 @@ timeout = 300
 [backends.cmd_review.env]
 NODE_USE_ENV_PROXY = "1"
 
+[backends.gemini]                         # Google AI plan via the Antigravity CLI: a reviewer and
+type = "command"                          # a writer of answers (see "Gemini, through Antigravity")
+enabled = false                           # Sign in first: run agy once in a terminal
+argv = ["srt", "--settings", "~/.night-elves/srt-agy-review.json", "--",  # copy of
+        "agy", "-p", "{prompt}", "--output-format", "json",  # srt-agy-review.example.json: it can
+        "--dangerously-skip-permissions",  # read files, but not write them or run a command
+        "--print-timeout", "280s", "--model", "gemini-4-argon-medium"]   # agy models
+output = "agy-json"                       # records its token counts
+max_runs_per_night = 30                   # the plan's quota isn't read, so this is the brake
+timeout = 300
+
+[backends.gemini_agent]                   # the same CLI as an agent. Read the README first: its
+type = "command"                          # sandbox has to let commands reach the macOS Keychain
+enabled = false
+argv = ["srt", "--settings", "~/.night-elves/srt-agy.json", "--",   # copy of srt-agy.example.json
+        "agy", "-p", "{prompt}", "--output-format", "json",
+        "--dangerously-skip-permissions", "--print-timeout", "3500s",
+        "--model", "gemini-4-argon-medium"]
+output = "agy-json"
+session_args = []                         # agy names its conversations itself, and
+resume_args = ["--continue"]              # --continue takes up the workspace's last one
+max_runs_per_night = 4
+timeout = 3600
+
+[backends.gemini_agent.env]
+UV_CACHE_DIR = "{cwd}/.cache/uv"
+PIP_CACHE_DIR = "{cwd}/.cache/pip"
+npm_config_cache = "{cwd}/.cache/npm"
+XDG_CACHE_HOME = "{cwd}/.cache"
+
 [backends.codex]                          # ChatGPT plan via Codex CLI: reviews local answers, and
 type = "command"                          # manages the local agent (see "A manager for the local
 enabled = false                           # agent"). Sign in first: codex login --device-auth

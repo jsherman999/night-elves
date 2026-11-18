@@ -553,6 +553,18 @@ class DispatchTests(Base):
             open(path, "w").write('[roles]\nlocal = ["a", "b"]\n')
             config.load(path)
 
+    def test_backend_that_names_its_own_sessions_continues_the_workspace(self):
+        self.local_agent_cfg()
+        del self.cfg["backends"]["claude_agent"]
+        self.cfg["backends"]["local_agent"].update(session_args=[], resume_args=["--continue"])
+        tid = db.add_task(self.conn, "build it", tier="agent")
+        replies = iter(["STATUS: DONE\nCHECK: false", "STATUS: DONE\nCHECK: true"])
+        seen = []
+        la = Fake(lambda p, s: (seen.append(la.args), next(replies))[1])
+        self.night(18, hour=2, local_agent=la).run()
+        self.assertEqual(db.get(self.conn, tid)["status"], "done")
+        self.assertEqual(seen, [[], ["--continue"]])
+
     def test_agy_json_output(self):
         ok = json.dumps({"conversation_id": "c1", "status": "SUCCESS", "response": " PASS\n",
                          "duration_seconds": 3, "num_turns": 2, "usage": {

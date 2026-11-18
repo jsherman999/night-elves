@@ -1,0 +1,37 @@
+{
+  "network": {
+    "allowedDomains": [
+      "*.googleapis.com",
+      "accounts.google.com",
+      "antigravity.google",
+      "*.antigravity.google",
+      "pypi.org",
+      "files.pythonhosted.org",
+      "registry.npmjs.org",
+      "github.com",
+      "api.github.com",
+      "codeload.github.com",
+      "raw.githubusercontent.com"
+    ],
+    "deniedDomains": [],
+    "allowLocalBinding": true
+  },
+  "filesystem": {
+    "denyRead": [
+      "~/.ssh",
+      "~/.gnupg",
+      "~/.aws",
+      "~/.config",
+      "~/.night-elves/env",
+      "~/.night-elves/queue.db",
+      "~/Library/Messages"
+    ],
+    "allowWrite": [
+      ".",
+      "~/.gemini"
+    ],
+    "denyWrite": []
+  },
+  "enableWeakerNetworkIsolation": true,
+  "allowPty": true
+}

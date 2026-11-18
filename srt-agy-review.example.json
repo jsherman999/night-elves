@@ -1,0 +1,28 @@
+{
+  "network": {
+    "allowedDomains": [
+      "*.googleapis.com",
+      "accounts.google.com",
+      "antigravity.google",
+      "*.antigravity.google"
+    ],
+    "deniedDomains": [],
+    "allowLocalBinding": true
+  },
+  "filesystem": {
+    "denyRead": [
+      "~/.ssh",
+      "~/.gnupg",
+      "~/.aws",
+      "~/.config",
+      "~/.night-elves/env",
+      "~/.night-elves/queue.db",
+      "~/Library/Messages"
+    ],
+    "allowWrite": [
+      "~/.gemini"
+    ],
+    "denyWrite": []
+  },
+  "enableWeakerNetworkIsolation": true
+}
