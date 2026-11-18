@@ -887,6 +887,7 @@ The hidden-test tasks, through the dispatcher with no manager, twice each
 |---|---|---|---|
 | `gemini-4-hydrogen-high` | 6 of 6 | 106 s | 1.0M |
 | `gemini-4-argon-medium` | 6 of 6 | 163 s | 0.6M |
+| `gemini-3.8-flash-medium` | 6 of 6 | 443 s | 8.8M |
 
 Every run finished on its first attempt. The plan's quota refreshes every five
 hours up to a weekly limit; night-elves can't read it, so `max_runs_per_night`
