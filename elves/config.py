@@ -43,6 +43,11 @@ DEFAULTS = {
     "notify": {"argv": []},
 }
 
+# Roles that may name several backends, the preferred first: the first that can run now does
+# the job (see policy.names).
+ROLE_LISTS = ("frontier_sub", "agent", "second_opinion", "stand_in", "agent_plan",
+              "agent_review", "agent_handoff", "guide")
+
 def _merge(base: dict, over: dict) -> dict:
     out = copy.deepcopy(base)
     for k, v in over.items():
@@ -60,6 +65,11 @@ def load(path: str | None = None) -> dict:
     cfg = _merge(DEFAULTS, tomllib.loads(p.read_text()) if p else {})
     for k in ("db", "results", "work", "attachments"):
         cfg["paths"][k] = str(Path(cfg["paths"][k]).expanduser())
+    for role, v in cfg["roles"].items():
+        if not isinstance(v, str) and not (role in ROLE_LISTS and isinstance(v, list)
+                                           and all(isinstance(n, str) for n in v)):
+            raise ValueError(f"roles.{role} must be a backend's name"
+                             + (", or a list of them" if role in ROLE_LISTS else ""))
     day = cfg["budget"]["cycle_day"]
     if not 1 <= day <= 28:
         raise ValueError("budget.cycle_day must be between 1 and 28")

@@ -27,6 +27,7 @@ class Result:
     tokens_out: int = 0
     usd: float = 0.0          # billed against the API credit (anthropic_api only)
     est_usd: float | None = None  # what the work would cost at API prices; None = usd
+    error: str = ""           # a failure the tool reported in its output, whatever its exit code
 
 SERVER_TOOLS = {"web_search": "web_search_20260209", "web_fetch": "web_fetch_20260209"}
 SEARCH_USD = 0.01  # per web search request
@@ -226,15 +227,38 @@ class Command:
             pass
         res = parse_output(self.c.get("output", "text"), out)
         if p.returncode != 0:  # `claude -p` prints some errors ("Reached max turns") on stdout
-            detail = (err.strip() or res.text.strip() or out.strip())[-500:]
+            detail = (err.strip() or res.error or res.text.strip() or out.strip())[-500:]
             raise SpentError(f"{self.name}: exit {p.returncode}: {detail}", res)
+        if res.error:  # `agy -p` exits 0 when it couldn't sign in, or the model failed
+            raise SpentError(f"{self.name}: {res.error[-500:]}", res)
         return res
 
 def parse_output(kind: str, out: str) -> Result:
     """A command's stdout as a Result. "claude-json" is `claude -p --output-format json`;
     "opencode-json" is `opencode run --format json`, "codex-json" is `codex exec --json` and
-    "cmd-json" is Command Code's `cmd -p --output-format json` (all one event per line). Their token counts and API-price estimates are recorded; a
-    flat-rate tool bills nothing (usd 0)."""
+    "cmd-json" is Command Code's `cmd -p --output-format json` (all one event per line), and
+    "agy-json" is Antigravity's `agy -p --output-format json` (one object when the run ends).
+    Their token counts and API-price estimates are recorded; a flat-rate tool bills nothing
+    (usd 0)."""
+    if kind == "agy-json":
+        d = None
+        for line in reversed(out.strip().splitlines()):  # sign-in prompts come before it
+            try:
+                d = json.loads(line)
+            except ValueError:
+                continue
+            if isinstance(d, dict) and "status" in d:
+                break
+            d = None
+        if d is None:
+            return Result(out.strip())
+        u = d.get("usage") or {}
+        text = str(d.get("response") or "").strip()
+        error = ""
+        if d.get("status") != "SUCCESS" or d.get("error"):
+            error = f"{d.get('status')}: {d.get('error') or 'the run did not finish'}"
+        return Result(text, u.get("input_tokens", 0) + u.get("cache_read_tokens", 0),
+                      u.get("output_tokens", 0) + u.get("thinking_tokens", 0), error=error)
     if kind == "claude-json":
         try:
             d = json.loads(out.strip().splitlines()[-1])

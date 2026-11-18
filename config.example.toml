@@ -166,7 +166,9 @@ timeout = 300                             # its calls take under a minute; one t
 [backends.codex.env]
 SSL_CERT_FILE = "/etc/ssl/cert.pem"       # in the sandbox Codex can't ask macOS which CAs to trust
 
-[roles]
+[roles]                      # frontier_sub, agent, second_opinion, guide, stand_in and the agent_*
+                             # roles also take a list, e.g. agent = ["claude_agent", "other"]:
+                             # the first one that can run now does the job
 local = "local"
 frontier_api = "claude_api"
 frontier_sub = "claude_cli"

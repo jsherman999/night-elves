@@ -7,7 +7,7 @@ frontier model do the hard tasks outright.
 from __future__ import annotations
 from dataclasses import dataclass
 from datetime import date, datetime
-from . import attachments, db
+from . import attachments, config, db
 
 MIN_USD = 0.05  # below this, treat tonight's API allowance as used up
 
@@ -67,6 +67,12 @@ def in_window(window, hour: int) -> bool:
     a, z = window
     return a <= hour < z if a <= z else (hour >= a or hour < z)
 
+def names(cfg: dict, role: str) -> list[str]:
+    """The backends named for a role, in order of preference: a role is a name or, for the
+    roles in config.ROLE_LISTS, a list of them, and the first one that can run now does the job."""
+    v = cfg["roles"].get(role) or []
+    return [v] if isinstance(v, str) else [n for n in v if n]
+
 def available(name, cfg, conn, state: State, run_start: str, now: datetime, down=()) -> bool:
     c = cfg["backends"].get(name)
     if not c or not c.get("enabled", True) or name in down:
@@ -87,8 +93,9 @@ def route(task, cfg: dict, state: State, ok) -> Route | None:
     """ok(name) says whether a backend can be used right now. None = leave queued."""
     r, lim = cfg["roles"], cfg["limits"]
     local = r["local"] if ok(r["local"]) else None
-    frontier = next((n for n in (r["frontier_api"], r["frontier_sub"]) if ok(n)), None)
-    second = next((n for n in (r["second_opinion"], r.get("stand_in")) if n and ok(n)), None)
+    frontiers = [r["frontier_api"], *names(cfg, "frontier_sub")]
+    frontier = next((n for n in frontiers if n and ok(n)), None)
+    second = next((n for n in names(cfg, "second_opinion") + names(cfg, "stand_in") if ok(n)), None)
 
     if task["tier"] == "agent":  # opt-in only: these backends can run commands
         return agent_route(task, cfg, ok)
@@ -103,7 +110,7 @@ def route(task, cfg: dict, state: State, ok) -> Route | None:
             return Route(None, frontier, None)
         if not (local and local_search(cfg, local)) and any(
                 cfg["backends"].get(n, {}).get("enabled", True) and n in cfg["backends"]
-                for n in (r["frontier_api"], r["frontier_sub"])):
+                for n in frontiers):
             return None
     if "data" in kinds:  # only the agent can work on these; intake already insists on it
         return None
@@ -137,15 +144,17 @@ def route(task, cfg: dict, state: State, ok) -> Route | None:
 
 def agent_route(task, cfg: dict, ok) -> Route | None:
     """The local agent (when roles.local_agent names one) goes first, like the local model for
-    text; Claude's agent takes over after escalate_after runs that failed or ran out of time, and
-    takes hard tasks (priority <= hard_priority) from the start. Without a Claude agent, the
-    local one keeps them."""
+    text; a frontier agent (roles.agent: Claude's, or the first in the list that can run now)
+    takes over after escalate_after runs that failed or ran out of time, and takes hard tasks
+    (priority <= hard_priority) from the start. Without a frontier agent, the local one keeps
+    them."""
     r, lim = cfg["roles"], cfg["limits"]
     tried = task["attempts"] + ((task["timeouts"] or 0) if "timeouts" in task.keys() else 0)
-    claude, la = r.get("agent"), r.get("local_agent")
-    has_claude = bool(claude) and cfg["backends"].get(claude, {}).get("enabled", True) \
-        and claude in cfg["backends"]
-    if la and ok(la) and (not has_claude or (tried < lim["escalate_after"]
-                                             and task["priority"] > lim["hard_priority"])):
+    la = r.get("local_agent")
+    strong = [n for n in names(cfg, "agent")
+              if n in cfg["backends"] and cfg["backends"][n].get("enabled", True)]
+    if la and ok(la) and (not strong or (tried < lim["escalate_after"]
+                                         and task["priority"] > lim["hard_priority"])):
         return Route(None, la, None)
-    return Route(None, claude, None) if claude and ok(claude) else None
+    first = next((n for n in strong if ok(n)), None)
+    return Route(None, first, None) if first else None

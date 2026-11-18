@@ -741,6 +741,23 @@ alone for the rest of the run. The same
 goes for the reviewer of a local answer: when it fails, the local reviewer
 reviews instead, and the task doesn't lose an attempt.
 
+#### More than one backend in a role
+
+`frontier_sub`, `agent`, `second_opinion`, `guide`, `stand_in` and the three
+`agent_*` manager roles take either a backend's name or a list of them, the
+preferred first:
+
+```toml
+[roles]
+agent = ["claude_agent", "other_agent"]   # the second works when Claude's is outside its hours
+agent_review = ["codex", "another"]       # the second reads the work when Codex can't
+```
+
+The first backend in the list that can run now does the job: one that is
+switched off, outside its `window`, out of runs for the night, or marked down
+for the run is passed over. For a review or a manager's call, a backend whose
+call fails is also followed by the next. The other roles name one backend.
+
 #### A stand-in for the manager
 
 A flat-rate plan runs out: Codex stops at its `max_runs_per_night`, or its

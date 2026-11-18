@@ -520,6 +520,58 @@ class DispatchTests(Base):
         self.night(21, hour=2, local_agent=Fake("STATUS: DONE\nCHECK: true"), cmd_review=spare).run()
         self.assertEqual((db.get(self.conn, quiet)["status"], len(spare.calls)), ("done", 0))
 
+    def test_roles_that_list_several_backends_use_the_first_that_can_run(self):
+        self.managed_cfg("agent_review")
+        for name in ("gemini", "gemini_agent"):
+            self.cfg["backends"][name] = {"type": "command", "argv": ["x"]}
+        self.cfg["backends"]["claude_agent"]["window"] = [1, 7]
+        self.cfg["roles"].update(agent=["claude_agent", "gemini_agent"], frontier_sub=["claude_cli", "gemini"],
+                                 agent_review=["codex", "gemini"], second_opinion=["codex", "gemini"])
+        # a hard agent task at noon: Claude's agent is outside its hours, so Gemini's takes it
+        hard = db.add_task(self.conn, "hard", tier="agent", priority=1)
+        ga, ca = Fake("STATUS: DONE\nCHECK: true"), Fake("STATUS: DONE\nCHECK: true")
+        self.night(18, hour=12, local_agent=Fake("x"), gemini_agent=ga, claude_agent=ca).run()
+        self.assertEqual((db.get(self.conn, hard)["backend"], len(ca.calls)), ("gemini_agent", 0))
+        # at night Claude's agent is first again
+        hard = db.add_task(self.conn, "hard too", tier="agent", priority=1)
+        self.night(19, hour=2, local_agent=Fake("x"), gemini_agent=ga, claude_agent=ca).run()
+        self.assertEqual(db.get(self.conn, hard)["backend"], "claude_agent")
+        # the local agent's work: Codex fails, so the next reviewer in the list reads it
+        easy = db.add_task(self.conn, "easy", tier="agent")
+        gem = Fake("PASS")
+        self.night(20, hour=2, local_agent=Fake("STATUS: DONE\nCHECK: true"), codex=Fake(fail=99),
+                   gemini=gem, claude_agent=ca).run()
+        self.assertIn("## Review (gemini)", open(db.get(self.conn, easy)["result_path"]).read())
+        # a frontier answer with no API allowance and no Claude subscription backend running
+        self.cfg["budget"]["monthly_credit_usd"] = 0
+        tid = db.add_task(self.conn, "think hard", tier="frontier")
+        gem = Fake("an answer")
+        self.night(21, hour=12, local=Fake("x"), gemini=gem).run()
+        self.assertEqual((db.get(self.conn, tid)["backend"], len(gem.calls)), ("gemini", 1))
+        with self.assertRaisesRegex(ValueError, "roles.local must be a backend's name$"):
+            path = os.path.join(self.tmp, "bad.toml")
+            open(path, "w").write('[roles]\nlocal = ["a", "b"]\n')
+            config.load(path)
+
+    def test_agy_json_output(self):
+        ok = json.dumps({"conversation_id": "c1", "status": "SUCCESS", "response": " PASS\n",
+                         "duration_seconds": 3, "num_turns": 2, "usage": {
+                             "input_tokens": 900, "output_tokens": 40, "thinking_tokens": 60,
+                             "cache_read_tokens": 100, "total_tokens": 1100}})
+        r = backends.parse_output("agy-json", ok)
+        self.assertEqual((r.text, r.tokens_in, r.tokens_out, r.error), ("PASS", 1000, 100, ""))
+        bad = ("Authentication required. Please visit the URL to log in:\n  https://x\n"
+               + json.dumps({"conversation_id": "", "status": "ERROR", "response": "",
+                             "error": "authentication failed or timed out", "usage": {}}))
+        r = backends.parse_output("agy-json", bad)
+        self.assertEqual(r.error, "ERROR: authentication failed or timed out")
+        self.assertEqual(backends.parse_output("agy-json", "not json").text, "not json")
+        with tempfile.TemporaryDirectory() as d:  # it exits 0 on those, so the output decides
+            c = backends.Command("gemini", {"argv": ["sh", "-c", "cat >/dev/null; echo '" + bad.splitlines()[-1] + "'"],
+                                            "output": "agy-json"})
+            with self.assertRaisesRegex(BackendError, "gemini: ERROR: authentication failed"):
+                c.run("hi", cwd=d)
+
     def test_codex_json_output(self):
         out = "\n".join(json.dumps(e) for e in (
             {"type": "thread.started", "thread_id": "t"},

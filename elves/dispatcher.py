@@ -322,7 +322,7 @@ class Night:
         instead, then the local reviewer, and only the last one's failure is the task's."""
         roles, tid = self.cfg["roles"], task["id"]
         spare = roles.get("local_review") or roles["local"]
-        after = (roles.get("stand_in"), spare) if r.reviewer else ()
+        after = (*policy.names(self.cfg, "stand_in"), spare) if r.reviewer else ()
         names = [n for n in dict.fromkeys((r.reviewer, *after)) if n and self.ok(n)]
         done_when = f"\n\nDone when:\n{crit}" if crit else ""
         prompt = f"Task:\n{task['prompt']}{done_when}\n\nResult:\n{answer}"
@@ -351,10 +351,11 @@ class Night:
         run now, or fails, roles.stand_in is asked instead. A role that isn't set, or one
         nobody could do, returns "", so the task goes on as it would without a manager."""
         roles, tid = self.cfg["roles"], task["id"]
-        if not roles.get(role) or executor != roles.get("local_agent"):
+        managers = policy.names(self.cfg, role)
+        if not managers or executor != roles.get("local_agent"):
             return "", None
-        for name in dict.fromkeys((roles[role], roles.get("stand_in"))):
-            if not name or name == executor or not self.ok(name):
+        for name in dict.fromkeys(managers + policy.names(self.cfg, "stand_in")):
+            if name == executor or not self.ok(name):
                 continue
             in_work = self.cfg["backends"].get(name, {}).get("type") == "command"
             try:
@@ -383,7 +384,7 @@ class Night:
 
     def _agent_review(self, task, executor, work, answer, check, crit) -> tuple[str, str | None]:
         """The manager reads work whose check passed. Returns its reply and its name."""
-        if not self.cfg["roles"].get("agent_review"):
+        if not policy.names(self.cfg, "agent_review"):
             return "", None
         done_when = f"\n\nDone when:\n{crit}" if crit else ""
         prompt = (f"Task:\n{task['prompt']}{done_when}\n\nThe end of the agent's reply:\n"
@@ -397,7 +398,7 @@ class Night:
         save why and what it had printed, for the handoff note (see _handoff). A run that
         never got going has left nothing to hand over."""
         c = self.cfg["backends"].get(executor, {})
-        if not self.cfg["roles"].get("agent_handoff") or outage(c.get("type"), e) \
+        if not policy.names(self.cfg, "agent_handoff") or outage(c.get("type"), e) \
                 or executor != self.cfg["roles"].get("local_agent"):
             return
         said = getattr(getattr(e, "result", None), "text", "").strip() or "(nothing)"

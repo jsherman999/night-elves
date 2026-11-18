@@ -57,7 +57,7 @@ def about(cfg: dict, name: str, roles: list[str]) -> str:
         what = ("The Codex CLI on your ChatGPT plan. Nothing is billed per call: the plan's own "
                 "limits apply, and a run count here.")
     elif "claude" in argv:
-        tools = "with tools, in a sandbox, " if name == cfg["roles"].get("agent") else ""
+        tools = "with tools, in a sandbox, " if name in policy.names(cfg, "agent") else ""
         what = (f"Claude Code run from the command line {tools}on your claude.ai subscription. "
                 "Nothing is billed per call: “unbilled” is what its tokens would have cost at API "
                 "prices. Its hours and a run count hold it back instead.")
@@ -218,11 +218,12 @@ def gather(cfg: dict, conn, now: datetime | None = None, ping=True) -> dict:
     items = {"api": itemize(state.cycle_start, "s.usd"),
              "sub": itemize(today, "(COALESCE(s.est_usd, s.usd) - s.usd)")}
     roles: dict[str, list[str]] = {}
-    for role, name in cfg["roles"].items():
-        if role == "classifier":  # "" = the local model sizes tasks up; "off" = nobody does
-            name = None if name == "off" else name or cfg["roles"]["local"]
-        if name:
-            roles.setdefault(name, []).append(role)
+    for role in cfg["roles"]:
+        for name in policy.names(cfg, role) or [""]:
+            if role == "classifier":  # "" = the local model sizes tasks up; "off" = nobody does
+                name = None if name == "off" else name or cfg["roles"]["local"]
+            if name:
+                roles.setdefault(name, []).append(role)
     by_role: dict[str, list] = {}
     for r in conn.execute(
             "SELECT backend, COALESCE(role, '') AS role, COUNT(*) AS calls, SUM(secs) AS secs, "

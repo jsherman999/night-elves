@@ -56,7 +56,8 @@ def pick(cfg: dict, conn, built: dict, now: datetime | None = None) -> str | Non
     now = now or datetime.now().astimezone()
     r = cfg["roles"]
     midnight = db.iso(now.replace(hour=0, minute=0, second=0, microsecond=0))
-    for name in ([r["guide"]] if r.get("guide") else [r.get("frontier_sub"), r.get("frontier_api")]):
+    for name in (policy.names(cfg, "guide")
+                 or [*policy.names(cfg, "frontier_sub"), r.get("frontier_api")]):
         if not name or name not in built:
             continue
         if cfg["backends"][name].get("type") == "anthropic_api" and \

@@ -11,7 +11,7 @@ from __future__ import annotations
 import re, sys
 from html import escape as e
 from pathlib import Path
-from . import pages
+from . import pages, policy
 
 # Who pays for a step decides its colour; the pairs are the page's own status colours.
 KINDS = {"step": ("var(--card)", "var(--edge)"), "local": ("var(--done-bg)", "var(--done)"),
@@ -112,10 +112,13 @@ class Setup:
         self.cfg, self.roles, self.backends = cfg, cfg["roles"], cfg["backends"]
 
     def name(self, role: str) -> str:
-        """The backend in a role, if it is configured and switched on; else ""."""
-        n = self.roles.get(role) or ""
-        c = self.backends.get(n)
-        return n if c and c.get("enabled", True) else ""
+        """The backend in a role, if it is configured and switched on; else "". For a role
+        that lists several, the first of them that is."""
+        return next(iter(self.all(role)), "")
+
+    def all(self, role: str) -> list[str]:
+        return [n for n in policy.names(self.cfg, role)
+                if n in self.backends and self.backends[n].get("enabled", True)]
 
     def model(self, backend: str) -> str:
         c = self.backends.get(backend) or {}
